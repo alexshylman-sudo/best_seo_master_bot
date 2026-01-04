@@ -21,22 +21,22 @@ logger = logging.getLogger(__name__)
 # Настройка Telegram бота
 bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
 
-# Проверка API-ключа (автоматически из env)
+# Проверка API-ключа
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    logger.error("GEMINI_API_KEY не задан в окружении!")
+    logger.error("GEMINI_API_KEY не задан!")
     raise ValueError("GEMINI_API_KEY не задан!")
 
-# Создание клиента Gemini (ключ берётся из env автоматически)
+# Создание клиента Gemini
 client = genai.Client()
 
 # Отладка: Вывод списка доступных моделей (проверьте в логах Render)
 try:
-    for model in client.models.list_models():
-        if 'generateContent' in model.supported_generation_methods:
-            logger.info(f"Доступная модель: {model.name}")
+    for m in client.models.list():
+        if 'generateContent' in m.supported_actions:
+            logger.info(f"Доступная модель: {m.name}")
 except Exception as e:
-    logger.error(f"Ошибка при получении списка моделей: {str(e)}")
+    logger.error(f"Ошибка списка моделей: {str(e)}")
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message: Message):
@@ -59,14 +59,14 @@ def send_help(message: Message):
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message: Message):
     try:
-        # Улучшенный системный промпт для SEO-эксперта (с трендами 2026)
+        # Улучшенный системный промпт
         system_prompt = (
             "Ты профессиональный SEO-эксперт с 10+ лет опыта в 2026 году. Учитывай тренды: AI-powered search (SGE+), voice SEO, zero-click, E-E-A-T 2.0. "
             "Анализируй запрос: ключи, семантика, on-page/off-page, структура, мобильность, скорость. "
             "Предлагай улучшения для Google/Yandex/Bing. Ответь кратко, структурировано, на русском. Если не SEO, перенаправь."
         )
 
-        # Подготовка контента (мультимодал для фото)
+        # Подготовка контента
         content = [system_prompt]
         if message.photo:
             file_info = bot.get_file(message.photo[-1].file_id)
@@ -80,7 +80,7 @@ def handle_message(message: Message):
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
-                    model="gemini-3-flash",  # Новая версия; альтернатива: "gemini-2.5-flash"
+                    model="gemini-2.5-flash",  # Актуальная модель; альтернатива: "gemini-3-flash"
                     contents=content
                 )
                 break
@@ -91,12 +91,9 @@ def handle_message(message: Message):
             raise Exception("Не удалось сгенерировать после 3 попыток")
 
         # Обработка ответа
-        if response.candidates:
-            text = response.candidates[0].content.parts[0].text.strip()
-        else:
-            text = response.text.strip() if hasattr(response, 'text') else ""
-            if not text and response.prompt_feedback.block_reason:
-                text = f"⚠️ Заблокировано: {response.prompt_feedback.block_reason}. Уточните."
+        text = response.text.strip()
+        if not text and hasattr(response.prompt_feedback, 'block_reason'):
+            text = f"⚠️ Заблокировано: {response.prompt_feedback.block_reason}. Уточните запрос."
 
         if text:
             for i in range(0, len(text), 4000):
