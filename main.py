@@ -8,9 +8,9 @@ load_dotenv()
 # Настройка ключей
 bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
 model = genai.GenerativeModel(
-    model_name="models/gemini-1.5-flash",
-    generation_config={"top_p": 0.95, "top_k": 64, "temperature": 1.0}
+    model_name="models/gemini-1.5-flash"
 )
 
 # Системная инструкция для ИИ, чтобы он вел себя как SEO-эксперт
