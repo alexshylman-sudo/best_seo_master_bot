@@ -1,6 +1,6 @@
 import os
 import logging
-import google.generativeai as genai  # Правильный импорт без подчёркивания
+from google import genai  # Новый импорт для SDK 2026
 import telebot
 from telebot.types import Message
 from dotenv import load_dotenv
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Настройка Telegram бота
 bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
 
-# Настройка Gemini API
+# Настройка Gemini API (автоматически берёт ключ из env)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Отладка: Вывод списка доступных моделей (проверьте в логах Render)
@@ -53,65 +53,61 @@ def send_help(message: Message):
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message: Message):
     try:
-        # Инициализация модели (актуальная стабильная версия)
-        model = genai.GenerativeModel('gemini-2.5-flash')  # Или 'gemini-3-flash-preview' для новейшей
+        # Инициализация модели (актуальная версия на 2026)
+        model = genai.GenerativeModel('gemini-3-flash')  # Новая, стабильная; альтернатива: 'gemini-2.5-flash'
 
-        # Улучшенный системный промпт для SEO-эксперта (с учётом трендов 2026: AI-search, SGE, voice)
+        # Улучшенный системный промпт для SEO-эксперта (с трендами 2026)
         system_prompt = (
-            "Ты профессиональный SEO-эксперт с 10+ лет опыта в 2026 году. Учитывай тренды: AI-powered search (SGE), voice SEO, zero-click searches, E-E-A-T. "
-            "Анализируй запрос: ключевые слова, семантика, on-page/off-page оптимизация, структура контента, мобильность, скорость. "
-            "Предлагай улучшения для Google/Yandex. Ответь кратко, структурировано, на русском. Если запрос не о SEO, перенаправь."
+            "Ты профессиональный SEO-эксперт с 10+ лет опыта в 2026 году. Учитывай тренды: AI-powered search (SGE+), voice SEO, zero-click, E-E-A-T 2.0. "
+            "Анализируй запрос: ключи, семантика, on-page/off-page, структура, мобильность, скорость. "
+            "Предлагай улучшения для Google/Yandex/Bing. Ответь кратко, структурировано, на русском. Если не SEO, перенаправь."
         )
 
-        # Подготовка контента (поддержка фото для анализа, напр. скрина сайта)
+        # Подготовка контента (мультимодал для фото)
         content = [system_prompt]
         if message.photo:
-            # Скачиваем фото
             file_info = bot.get_file(message.photo[-1].file_id)
             downloaded_file = bot.download_file(file_info.file_path)
-            content.append({"mime_type": "image/jpeg", "data": downloaded_file})  # Мультимодальный ввод
+            content.append({"mime_type": "image/jpeg", "data": downloaded_file})
             content.append(message.caption or "Анализируй это изображение в контексте SEO")
         else:
             content.append(message.text)
 
-        # Генерация контента с ретраями (на случай сетевых ошибок)
-        for attempt in range(3):  # 3 попытки
+        # Генерация с ретраями
+        for attempt in range(3):
             try:
                 response = model.generate_content(content)
                 break
             except RequestException as re:
                 logger.warning(f"Сетевая ошибка, попытка {attempt+1}: {str(re)}")
-                time.sleep(2 ** attempt)  # Экспоненциальный бэкофф
+                time.sleep(2 ** attempt)
         else:
-            raise Exception("Не удалось сгенерировать ответ после 3 попыток")
+            raise Exception("Не удалось сгенерировать после 3 попыток")
 
-        # Обработка ответа (учитываем candidates и safety blocks)
+        # Обработка ответа
         if response.candidates:
             text = response.candidates[0].content.parts[0].text.strip()
         else:
             text = response.text.strip() if hasattr(response, 'text') else ""
             if not text and response.prompt_feedback.block_reason:
-                text = f"⚠️ Ответ заблокирован по причине: {response.prompt_feedback.block_reason}. Уточните запрос."
+                text = f"⚠️ Заблокировано: {response.prompt_feedback.block_reason}. Уточните."
 
         if text:
-            # Разбиение длинного текста на части (лимит Telegram ~4096 символов)
             for i in range(0, len(text), 4000):
                 bot.reply_to(message, text[i:i+4000])
         else:
-            bot.reply_to(message, "⚠️ ИИ вернул пустой ответ. Попробуйте перефразировать запрос.")
+            bot.reply_to(message, "⚠️ Пустой ответ. Перефразируйте.")
 
     except Exception as e:
-        logger.error(f"Ошибка при обработке сообщения: {str(e)}")
-        bot.reply_to(message, f"❌ Ошибка API: {str(e)}. Проверьте ключ или модель.")
+        logger.error(f"Ошибка: {str(e)}")
+        bot.reply_to(message, f"❌ Ошибка API: {str(e)}.")
 
 if __name__ == "__main__":
-    # Сброс вебхука (на случай конфликтов)
     bot.remove_webhook()
     logger.info("Бот запущен...")
-    # Polling с none_stop=True и таймаутом для стабильности на Render
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=20)
         except Exception as e:
-            logger.error(f"Ошибка polling: {str(e)}. Перезапуск через 5 сек...")
+            logger.error(f"Polling ошибка: {str(e)}. Перезапуск...")
             time.sleep(5)
