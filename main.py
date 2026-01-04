@@ -1,6 +1,6 @@
 import os
 import logging
-from google import genai  # Новый импорт для SDK 2026
+from google import genai  # Импорт для SDK 2026
 import telebot
 from telebot.types import Message
 from dotenv import load_dotenv
@@ -21,12 +21,18 @@ logger = logging.getLogger(__name__)
 # Настройка Telegram бота
 bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
 
-# Настройка Gemini API (автоматически берёт ключ из env)
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Проверка API-ключа (автоматически из env)
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    logger.error("GEMINI_API_KEY не задан в окружении!")
+    raise ValueError("GEMINI_API_KEY не задан!")
+
+# Создание клиента Gemini (ключ берётся из env автоматически)
+client = genai.Client()
 
 # Отладка: Вывод списка доступных моделей (проверьте в логах Render)
 try:
-    for model in genai.list_models():
+    for model in client.models.list_models():
         if 'generateContent' in model.supported_generation_methods:
             logger.info(f"Доступная модель: {model.name}")
 except Exception as e:
@@ -53,9 +59,6 @@ def send_help(message: Message):
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message: Message):
     try:
-        # Инициализация модели (актуальная версия на 2026)
-        model = genai.GenerativeModel('gemini-3-flash')  # Новая, стабильная; альтернатива: 'gemini-2.5-flash'
-
         # Улучшенный системный промпт для SEO-эксперта (с трендами 2026)
         system_prompt = (
             "Ты профессиональный SEO-эксперт с 10+ лет опыта в 2026 году. Учитывай тренды: AI-powered search (SGE+), voice SEO, zero-click, E-E-A-T 2.0. "
@@ -76,7 +79,10 @@ def handle_message(message: Message):
         # Генерация с ретраями
         for attempt in range(3):
             try:
-                response = model.generate_content(content)
+                response = client.models.generate_content(
+                    model="gemini-3-flash",  # Новая версия; альтернатива: "gemini-2.5-flash"
+                    contents=content
+                )
                 break
             except RequestException as re:
                 logger.warning(f"Сетевая ошибка, попытка {attempt+1}: {str(re)}")
