@@ -1,3 +1,3 @@
 pyTelegramBotAPI
-google-genai
+google-genai  # Новый пакет для Gemini API
 python-dotenv  # Опционально для локального dev
