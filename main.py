@@ -41,5 +41,5 @@ def handle_message(message):
         bot.edit_message_text(f"❌ Произошла ошибка: {str(e)}", chat_id=sent_message.chat.id, message_id=sent_message.message_id)
 
 if __name__ == "__main__":
-bot.remove_webhook() # Очищает старые зависшие соединения
-bot.polling(none_stop=True, skip_pending=True) # Игнорирует старые сообщения при запуске
+    bot.remove_webhook()  # Теперь здесь есть отступ
+    bot.polling(none_stop=True, skip_pending=True)  # Игнорирует старые сообщения при запуске
