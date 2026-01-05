@@ -3,3 +3,4 @@ google-genai
 psycopg2-binary
 flask
 python-dotenv
+schedule
