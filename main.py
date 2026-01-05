@@ -34,26 +34,39 @@ def get_db_connection():
         print(f"❌ Ошибка БД: {e}")
         return None
 
-def patch_db_schema():
-    """Добавляет недостающие колонки в существующие таблицы без потери данных"""
+def cleanup_duplicates():
+    """Удаляет дубликаты проектов, оставляя только последний добавленный"""
     conn = get_db_connection()
     if not conn: return
     cur = conn.cursor()
     try:
-        # Добавляем last_active в users, если нет
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        # Оставляем только запись с максимальным ID для каждой пары user_id + url
+        cur.execute("""
+            DELETE FROM projects a USING projects b
+            WHERE a.id < b.id AND a.url = b.url;
+        """)
         conn.commit()
+        print("🧹 Дубликаты проектов очищены.")
     except Exception as e:
-        print(f"Schema patch warning: {e}")
+        print(f"Cleanup error: {e}")
     finally:
         cur.close(); conn.close()
+
+def patch_db_schema():
+    conn = get_db_connection()
+    if not conn: return
+    cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        conn.commit()
+    except: pass
+    finally: cur.close(); conn.close()
 
 def init_db():
     conn = get_db_connection()
     if not conn: return
     cur = conn.cursor()
 
-    # 1. Таблица пользователей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -69,7 +82,6 @@ def init_db():
         )
     """)
     
-    # 2. Таблица проектов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
@@ -87,7 +99,6 @@ def init_db():
         )
     """)
     
-    # 3. Таблица статей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS articles (
             id SERIAL PRIMARY KEY,
@@ -101,7 +112,6 @@ def init_db():
         )
     """)
 
-    # 4. Таблица платежей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
@@ -113,14 +123,13 @@ def init_db():
         )
     """)
 
-    # Предустановка Админа
     cur.execute("INSERT INTO users (user_id, is_admin, tariff, gens_left) VALUES (%s, TRUE, 'GOD_MODE', 9999) ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE", (ADMIN_ID,))
     
     conn.commit(); cur.close(); conn.close()
     
-    # Применяем патчи (если база уже создана)
     patch_db_schema()
-    print("✅ БД инициализирована и обновлена.")
+    cleanup_duplicates() # Чистим дубли при запуске
+    print("✅ БД инициализирована.")
 
 def update_last_active(user_id):
     try:
@@ -135,7 +144,6 @@ def escape_md(text):
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
 
 def send_long_message(chat_id, text, parse_mode=None):
-    """Разбивает длинные сообщения на части по 4000 символов"""
     if len(text) <= 4000:
         bot.send_message(chat_id, text, parse_mode=parse_mode)
     else:
@@ -151,9 +159,24 @@ def get_gemini_response(prompt):
     except Exception as e:
         return f"Ошибка AI: {e}"
 
-def validate_input(text):
+def validate_input(text, question_context):
+    """Строгая проверка ответа"""
     try:
-        prompt = f"Проанализируй ответ: '{text}'. Если это мат, бессмыслица или оскорбление, ответь BAD. Иначе OK."
+        prompt = f"""
+        Ты модератор бизнес-опроса. 
+        Вопрос пользователю: "{question_context}"
+        Ответ пользователя: "{text}"
+        
+        Твоя задача: Оценить адекватность ответа.
+        Верни 'BAD', если ответ:
+        1. Содержит нецензурную лексику.
+        2. Бессмысленный набор букв или цифр (например "1", "ывап", ")").
+        3. Не отвечает на вопрос (например "не знаю", "кто-то").
+        4. Слишком короткий (менее 2 букв), если это не аббревиатура.
+        
+        Верни 'OK', если ответ похож на правду.
+        ОТВЕТЬ ТОЛЬКО ОДНИМ СЛОВОМ: OK или BAD.
+        """
         res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt]).text.strip()
         return "BAD" not in res.upper()
     except: return True
@@ -270,35 +293,36 @@ def new_site_start(call):
 def check_url_step(message):
     url = message.text.strip()
     if not url.startswith("http"):
-        msg = bot.send_message(message.chat.id, "❌ Нужен URL с http:// или https://. Попробуйте:")
+        msg = bot.send_message(message.chat.id, "❌ Нужен URL с http:// или https://. Попробуйте снова:")
         bot.register_next_step_handler(msg, check_url_step)
         return
     
-    msg_check = bot.send_message(message.chat.id, "⏳ Проверяю доступность и наличие в базе...")
+    msg_check = bot.send_message(message.chat.id, "⏳ Проверяю доступность и базу данных...")
     
-    # 1. ГЛОБАЛЬНАЯ ПРОВЕРКА НА ДУБЛИКАТЫ (Среди всех пользователей)
+    # ПРОВЕРКА НА ДУБЛИКАТЫ
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT user_id FROM projects WHERE url = %s", (url,))
     exists = cur.fetchone()
     if exists:
         cur.close(); conn.close()
         bot.delete_message(message.chat.id, msg_check.message_id)
-        bot.send_message(message.chat.id, f"⛔ Этот сайт ({url}) уже добавлен в систему (возможно, другим пользователем). Дублирование запрещено.")
+        # Сразу просим ввести новый URL
+        msg = bot.send_message(message.chat.id, f"⛔ Сайт {url} уже есть в системе.\n👇 **Введите другой URL:**")
+        bot.register_next_step_handler(msg, check_url_step)
         return
 
-    # 2. ПРОВЕРКА ДОСТУПНОСТИ
+    # ПРОВЕРКА ДОСТУПНОСТИ
     if not check_site_availability(url):
         cur.close(); conn.close()
-        bot.edit_message_text("❌ Сайт недоступен (код не 200). Проверьте ссылку.", message.chat.id, msg_check.message_id)
+        msg = bot.edit_message_text("❌ Сайт недоступен (код не 200). Проверьте ссылку и введите снова:", message.chat.id, msg_check.message_id)
+        bot.register_next_step_handler(msg, check_url_step)
         return
     
-    # 3. ДОБАВЛЕНИЕ
     cur.execute("INSERT INTO projects (user_id, type, url, info, progress) VALUES (%s, 'site', %s, '{}', '{}') RETURNING id", (message.from_user.id, url))
     pid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
     bot.delete_message(message.chat.id, msg_check.message_id)
-    # Открываем меню
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
 def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
@@ -362,53 +386,62 @@ def back_main(call):
 
 # --- 6. ФУНКЦИОНАЛ ---
 
-# ОПРОСНИК
+# ОПРОСНИК (С УМНОЙ ВАЛИДАЦИЕЙ)
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
 def start_survey_5q(call):
     pid = call.data.split("_")[1]
-    msg = bot.send_message(call.message.chat.id, "❓ Вопрос 1/5:\nКакая главная цель вашего сайта? (Продажи, Трафик, Бренд?)")
-    bot.register_next_step_handler(msg, q2, {"pid": pid, "answers": []})
+    q_text = "Какая главная цель вашего сайта? (Продажи, Трафик, Бренд?)"
+    msg = bot.send_message(call.message.chat.id, f"❓ Вопрос 1/5:\n{q_text}")
+    bot.register_next_step_handler(msg, q2, {"pid": pid, "answers": []}, q_text)
 
-def q2(m, d): 
-    if not validate_input(m.text):
-        msg = bot.send_message(m.chat.id, "⛔ Пожалуйста, отвечайте честно и без нецензурной лексики.\n\n❓ Вопрос 1/5:\nКакая главная цель вашего сайта?")
-        bot.register_next_step_handler(msg, q2, d)
+def q2(m, d, prev_q): 
+    if not validate_input(m.text, prev_q):
+        msg = bot.send_message(m.chat.id, f"⛔ Это не похоже на честный ответ. Попробуйте еще раз.\n\n❓ {prev_q}")
+        bot.register_next_step_handler(msg, q2, d, prev_q)
         return
     d["answers"].append(f"Цель: {m.text}")
-    msg = bot.send_message(m.chat.id, "❓ Вопрос 2/5:\nКто ваша целевая аудитория? (Пол, возраст, интересы)")
-    bot.register_next_step_handler(msg, q3, d)
+    
+    q_text = "Кто ваша целевая аудитория? (Пол, возраст, интересы)"
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 2/5:\n{q_text}")
+    bot.register_next_step_handler(msg, q3, d, q_text)
 
-def q3(m, d): 
-    if not validate_input(m.text):
-        msg = bot.send_message(m.chat.id, "⛔ Некорректный ответ.\n\n❓ Вопрос 2/5:\nКто ваша целевая аудитория?")
-        bot.register_next_step_handler(msg, q3, d)
+def q3(m, d, prev_q): 
+    if not validate_input(m.text, prev_q):
+        msg = bot.send_message(m.chat.id, f"⛔ Некорректный ответ.\n\n❓ {prev_q}")
+        bot.register_next_step_handler(msg, q3, d, prev_q)
         return
     d["answers"].append(f"ЦА: {m.text}")
-    msg = bot.send_message(m.chat.id, "❓ Вопрос 3/5:\nНазовите ваших главных конкурентов:")
-    bot.register_next_step_handler(msg, q4, d)
+    
+    q_text = "Назовите ваших главных конкурентов:"
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 3/5:\n{q_text}")
+    bot.register_next_step_handler(msg, q4, d, q_text)
 
-def q4(m, d): 
-    if not validate_input(m.text):
-        msg = bot.send_message(m.chat.id, "⛔ Некорректный ответ.\n\n❓ Вопрос 3/5:\nНазовите ваших главных конкурентов:")
-        bot.register_next_step_handler(msg, q4, d)
+def q4(m, d, prev_q): 
+    if not validate_input(m.text, prev_q):
+        msg = bot.send_message(m.chat.id, f"⛔ Некорректный ответ.\n\n❓ {prev_q}")
+        bot.register_next_step_handler(msg, q4, d, prev_q)
         return
     d["answers"].append(f"Конкуренты: {m.text}")
-    msg = bot.send_message(m.chat.id, "❓ Вопрос 4/5:\nВ чем ваше главное преимущество (УТП)?")
-    bot.register_next_step_handler(msg, q5, d)
+    
+    q_text = "В чем ваше главное преимущество (УТП)?"
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 4/5:\n{q_text}")
+    bot.register_next_step_handler(msg, q5, d, q_text)
 
-def q5(m, d): 
-    if not validate_input(m.text):
-        msg = bot.send_message(m.chat.id, "⛔ Некорректный ответ.\n\n❓ Вопрос 4/5:\nВ чем ваше главное преимущество (УТП)?")
-        bot.register_next_step_handler(msg, q5, d)
+def q5(m, d, prev_q): 
+    if not validate_input(m.text, prev_q):
+        msg = bot.send_message(m.chat.id, f"⛔ Некорректный ответ.\n\n❓ {prev_q}")
+        bot.register_next_step_handler(msg, q5, d, prev_q)
         return
     d["answers"].append(f"УТП: {m.text}")
-    msg = bot.send_message(m.chat.id, "❓ Вопрос 5/5:\nГеография продвижения (Город, Страна):")
-    bot.register_next_step_handler(msg, finish_survey, d)
+    
+    q_text = "География продвижения (Город, Страна):"
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 5/5:\n{q_text}")
+    bot.register_next_step_handler(msg, finish_survey, d, q_text)
 
-def finish_survey(m, d):
-    if not validate_input(m.text):
-        msg = bot.send_message(m.chat.id, "⛔ Некорректный ответ.\n\n❓ Вопрос 5/5:\nГеография продвижения (Город, Страна):")
-        bot.register_next_step_handler(msg, finish_survey, d)
+def finish_survey(m, d, prev_q):
+    if not validate_input(m.text, prev_q):
+        msg = bot.send_message(m.chat.id, f"⛔ Некорректный ответ.\n\n❓ {prev_q}")
+        bot.register_next_step_handler(msg, finish_survey, d, prev_q)
         return
     d["answers"].append(f"Гео: {m.text}")
     
@@ -523,7 +556,7 @@ def generate_keywords_action(call):
     cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (keywords, pid))
     conn.commit(); cur.close(); conn.close()
     
-    # Отправляем сообщение частями
+    # Отправляем сообщение
     send_long_message(call.message.chat.id, keywords, parse_mode='Markdown')
     
     # Кнопки действия ПОСЛЕ ключей
@@ -550,10 +583,11 @@ def download_keywords(call):
         bot.answer_callback_query(call.id, "Ключей нет.")
         return
         
-    # Создаем файл в памяти
     file_data = io.BytesIO(res[0].encode('utf-8'))
     file_data.name = f"keywords_{pid}.txt"
     bot.send_document(call.message.chat.id, file_data, caption=f"Ключевые слова для {res[1]}")
+    # Возврат в меню после скачивания
+    open_project_menu(call.message.chat.id, pid, mode="management")
 
 # СТРАТЕГИЯ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
@@ -585,7 +619,12 @@ def cms_ask(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cms_set_"))
 def cms_instruction(call):
-    _, pid, platform = call.data.split("_")
+    # Исправлена ошибка распаковки (ValueError)
+    parts = call.data.split("_")
+    # parts: ['cms', 'set', 'PID', 'PLATFORM']
+    pid = parts[2]
+    platform = parts[3]
+
     links = {"wp": "https://wordpress.org/documentation/article/application-passwords/", 
              "tilda": "https://help-ru.tilda.cc/api", 
              "bitrix": "https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=3533"}
