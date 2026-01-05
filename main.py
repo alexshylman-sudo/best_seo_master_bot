@@ -105,7 +105,6 @@ def init_db():
         )
     """)
 
-    # Админу даем 2 теста + GOD_MODE
     cur.execute("INSERT INTO users (user_id, is_admin, tariff, gens_left) VALUES (%s, TRUE, 'GOD_MODE', 9999) ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE", (ADMIN_ID,))
     
     conn.commit(); cur.close(); conn.close()
@@ -203,7 +202,6 @@ def start(message):
     conn = get_db_connection()
     if conn:
         cur = conn.cursor()
-        # Даем 2 бесплатных генерации при регистрации
         cur.execute("INSERT INTO users (user_id, gens_left) VALUES (%s, 2) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit(); cur.close(); conn.close()
     bot.send_message(user_id, "👋 Привет! Я AI-ассистент для SEO.", reply_markup=main_menu_markup(user_id))
@@ -292,15 +290,14 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     url, kw_db, progress = res
     if not progress: progress = {}
     
-    has_keywords = kw_db is not None and len(kw_db) > 5
+    # ПРОВЕРКА: Если длина ключей > 20 символов, считаем, что они есть
+    has_keywords = kw_db is not None and len(kw_db) > 20
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     
-    # 1. ГЛАВНАЯ КНОПКА
     if has_keywords:
         markup.add(types.InlineKeyboardButton("🚀 ⭐️ СТРАТЕГИЯ И СТАТЬИ ⭐️", callback_data=f"strat_{pid}"))
 
-    # 2. КНОПКИ ЭТАПОВ
     btn_info = types.InlineKeyboardButton("📝 Добавить информацию (Опрос)", callback_data=f"srv_{pid}")
     btn_anal = types.InlineKeyboardButton("📊 Анализ сайта (Глубокий)", callback_data=f"anz_{pid}")
     btn_upl = types.InlineKeyboardButton("📂 Загрузить файлы", callback_data=f"upf_{pid}")
@@ -312,9 +309,6 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     else:
         markup.add(btn_info, btn_anal, btn_upl)
 
-    # 3. КЛЮЧИ (Логика отображения)
-    # Если ключи есть -> Кнопка удаления
-    # Если ключей нет, но пройден опрос/загрузка -> Кнопка подбора
     if has_keywords:
         markup.add(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"))
     elif progress.get("info_done") or progress.get("upload_done"):
@@ -412,11 +406,8 @@ def finish_survey(m, d, prev_q):
     conn.commit(); cur.close(); conn.close()
     
     update_project_progress(d["pid"], "info_done")
-    
-    # ПОКАЗЫВАЕМ ТОЛЬКО КНОПКУ ПОДБОРА КЛЮЧЕЙ
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔑 Подобрать ключевые слова", callback_data=f"kw_ask_count_{d['pid']}"))
-    
     bot.send_message(m.chat.id, "✅ Спасибо за честные ответы! Теперь давайте подберем ключевые слова для продвижения.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("anz_"))
@@ -445,42 +436,58 @@ def deep_analysis(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("upf_"))
 def upload_files(call):
     pid = call.data.split("_")[1]
-    msg = bot.send_message(call.message.chat.id, "📂 Пришлите текст, фото или документ (.txt/pdf).")
+    # Используем register_next_step_handler
+    msg = bot.send_message(call.message.chat.id, "📂 Пришлите текст, фото или .txt файл.")
     bot.register_next_step_handler(msg, process_upload, pid)
 
 def process_upload(message, pid):
     content = ""
-    if message.content_type == 'text': content = message.text
+    is_txt = False
+    
+    if message.content_type == 'text': 
+        content = message.text
     elif message.content_type == 'document':
         try:
             file_info = bot.get_file(message.document.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             content = downloaded_file.decode('utf-8')
-        except: content = ""
+            is_txt = message.document.file_name.endswith('.txt')
+        except: 
+            content = ""
+            bot.reply_to(message, "❌ Ошибка чтения файла.")
+            return
 
-    # Умная проверка контента
-    ai_check = get_gemini_response(f"Проанализируй этот текст: '{content[:1000]}'. Это список ключевых слов/фраз для SEO? Ответь YES, если это похоже на список ключей. Если это просто текст статьи или описание, ответь TEXT. Если мусор, ответь NO.")
-    
+    # УМНАЯ ПРОВЕРКА ДЛЯ TXT - СРАЗУ В КЛЮЧИ
     conn = get_db_connection(); cur = conn.cursor()
     
-    if "YES" in ai_check.upper():
-        cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (content, pid))
-        msg_text = "✅ Отлично! Я распознал файл как список ключевых слов и сохранил их."
-        update_project_progress(pid, "upload_done")
-    elif "TEXT" in ai_check.upper():
-        cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
-        kb = cur.fetchone()[0]; 
-        if not kb: kb = []
-        kb.append(f"Upload: {content[:500]}...")
-        cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
-        msg_text = "✅ Информация добавлена в базу знаний проекта."
-        update_project_progress(pid, "upload_done")
+    if is_txt or len(content) > 20:
+        # Спрашиваем AI, ключи ли это
+        prompt = f"Это список ключевых слов? Текст: '{content[:500]}'. Ответь YES, если это список фраз. NO, если это статья."
+        check = get_gemini_response(prompt)
+        
+        if "YES" in check.upper() or is_txt:
+            cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (content, pid))
+            msg_text = "✅ Я распознал список ключевых слов и сохранил их! Кнопка 'Стратегия' теперь доступна."
+            update_project_progress(pid, "upload_done")
+        else:
+            cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
+            kb = cur.fetchone()[0]; 
+            if not kb: kb = []
+            kb.append(f"Upload: {content[:500]}...")
+            cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
+            msg_text = "✅ Информация добавлена в базу знаний."
+            update_project_progress(pid, "upload_done")
     else:
-        msg_text = "⚠️ Файл не содержит полезной информации или не читается."
+        msg_text = "⚠️ Файл слишком короткий или пустой."
 
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, msg_text)
     open_project_menu(message.chat.id, pid, mode="management")
+
+# ЛОВУШКА ДЛЯ ПОТЕРЯННЫХ ФАЙЛОВ
+@bot.message_handler(content_types=['document'])
+def handle_unexpected_docs(message):
+    bot.reply_to(message, "⚠️ Я вижу файл, но не знаю, к какому проекту его привязать.\nПожалуйста, выберите проект -> 'Загрузить файлы'.")
 
 # КЛЮЧИ И СТРАТЕГИЯ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kw_ask_count_"))
@@ -503,7 +510,7 @@ def generate_keywords_action(call):
     survey = info_json.get("survey", "")
     kb = str(res[0])[:2000]
     
-    prompt = f"Составь список из {count} SEO ключей для {res[1]}. Контекст: {survey}. База: {kb}. Формат: **Высокая частотность:** список... **Средняя:** список..."
+    prompt = f"Твоя задача: Составь список из {count} SEO ключевых слов для сайта {res[1]}. Контекст: {survey}. База: {kb}. Формат: **Высокая частотность:** список... **Средняя:** список..."
     keywords = get_gemini_response(prompt)
     
     cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (keywords, pid))
@@ -516,16 +523,14 @@ def generate_keywords_action(call):
                types.InlineKeyboardButton("📥 Скачать (.txt)", callback_data=f"download_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("🔄 Пройти опрос заново", callback_data=f"srv_{pid}"))
     
-    bot.send_message(call.message.chat.id, "👇 Скачайте файл, отредактируйте и загрузите обратно через 'Загрузить файлы', если нужно.", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "👇 Вы можете скачать файл, отредактировать и загрузить обратно.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_kw_"))
 def approve_keywords(call):
     pid = call.data.split("_")[2]
-    
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🚀 ⭐️ СТРАТЕГИЯ И СТАТЬИ ⭐️", callback_data=f"strat_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
-    
     bot.send_message(call.message.chat.id, "🎉 Поздравляю! Семантическое ядро готово. Переходим к продвижению!", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("download_kw_"))
@@ -584,7 +589,6 @@ def save_cms_key(message, pid, platform):
     propose_articles(message.chat.id, pid)
 
 def propose_articles(chat_id, pid):
-    # ПРОВЕРКА ЛИМИТОВ
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT user_id, info, keywords, knowledge_base FROM projects WHERE id=%s", (pid,))
     proj = cur.fetchone()
@@ -596,70 +600,52 @@ def propose_articles(chat_id, pid):
     
     if gens_left <= 0 and not is_admin:
         cur.close(); conn.close()
-        bot.send_message(chat_id, "⚠️ **Лимит генераций исчерпан!** Пополните баланс в меню 'Тарифы'.")
+        bot.send_message(chat_id, "⚠️ **Лимит генераций исчерпан!** Пополните баланс.")
         return
 
-    bot.send_message(chat_id, f"⚡ Осталось генераций: {gens_left}. Генерирую темы на основе ваших ключей...")
+    bot.send_message(chat_id, f"⚡ Осталось генераций: {gens_left}. Генерирую темы...")
     
-    # КОНТЕКСТ ДЛЯ AI (ЧТОБЫ НЕ БЫЛО КОФЕВАРОК)
+    # ПЕРЕДАЕМ КОНТЕКСТ, ЧТОБЫ ИЗБЕЖАТЬ БРЕДА
     info_json = proj[1] or {}
-    survey = info_json.get("survey", "Нет данных")
+    survey = info_json.get("survey", "")
     kw = proj[2] or "Нет ключей"
-    kb = str(proj[3])[:1000]
+    kb = str(proj[3])[:2000]
     
     prompt = f"""
-    Твоя роль: SEO стратег.
-    Проект:
+    Твоя роль: SEO стратег. 
+    Данные о сайте:
     - Опрос: {survey}
-    - Ключи: {kw[:500]}...
-    - База: {kb}
+    - Ключевые слова: {kw[:1000]}
+    - Аудит: {kb}
     
-    Задача: Придумай 5 тем для статей. Верни их списком, разделенным символом | (вертикальная черта).
+    Задача: Придумай 5 тем для статей, которые помогут продвинуть этот сайт.
+    Верни их списком, разделенным символом | (вертикальная черта).
     Пример: Тема 1 | Тема 2 | Тема 3
-    Темы должны быть строго по тематике сайта!
     """
     
     try:
         titles_raw = get_gemini_response(prompt)
         titles = titles_raw.split("|")
-        # Очистка от лишних пробелов и символов
         titles = [t.strip().replace("*", "") for t in titles if len(t) > 3][:5] 
     except:
         titles = ["Ошибка генерации. Попробуйте еще раз."]
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    msg_text = "📝 **Выберите тему для статьи:**\n\n"
-    
-    for i, title in enumerate(titles):
-        msg_text += f"{i+1}. {title}\n"
-        # Передаем только индекс в callback, чтобы не перегружать
-        markup.add(types.InlineKeyboardButton(f"Выбрать тему №{i+1}", callback_data=f"write_{pid}_{i}"))
-        
-    # Сохраняем темы во временное хранилище (можно в файл, но проще в глобал словарь для MVP, или просто перегенерировать текст потом)
-    # Для надежности в MVP мы просто передадим номер, а при генерации скажем "Напиши статью на тему №Х из списка: [Список]"
-    # Но так как список в памяти не хранится между вызовами в serverless,
-    # мы схитрим: передадим первые 20 символов темы в callback или (лучше) просто сгенерируем статью "по теме проекта", это будет Topic X.
-    # ЛУЧШИЙ ВАРИАНТ ДЛЯ STATELESS: Запишем темы в БД в поле progress или info временно? Нет, сложно.
-    # ПРОСТОЙ ВАРИАНТ: Передаем обрезанный заголовок в callback (до 30 байт)
-    
-    # ПЕРЕДЕЛЫВАЕМ КНОПКИ ЧТОБЫ РАБОТАЛО ЖЕЛЕЗНО
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for i, title in enumerate(titles):
-        # Храним полный текст темы в базе не будем, просто передадим индекс, 
-        # а в write_article попросим AI "Сгенерируй статью на тему, которая подходит под эти ключи, вариант номер {i+1}" - это рискованно.
-        # Давайте запишем выбранные темы в info
-        markup.add(types.InlineKeyboardButton(f"Тема {i+1}", callback_data=f"write_{pid}_topic_{i}"))
-    
-    # Сохраняем сгенерированные темы в info проекта, чтобы потом достать
+    # СОХРАНЯЕМ ТЕМЫ В INFO (ВРЕМЕННО), ЧТОБЫ КНОПКИ РАБОТАЛИ
     info_json["temp_topics"] = titles
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info_json), pid))
     conn.commit(); cur.close(); conn.close()
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    msg_text = "📝 **Выберите тему:**\n\n"
     
+    for i, title in enumerate(titles):
+        msg_text += f"{i+1}. {title}\n"
+        markup.add(types.InlineKeyboardButton(f"Выбрать тему №{i+1}", callback_data=f"write_{pid}_topic_{i}"))
+        
     bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article(call):
-    # write_PID_topic_INDEX
     parts = call.data.split("_")
     pid = parts[1]
     topic_idx = int(parts[3])
@@ -671,27 +657,24 @@ def write_article(call):
     selected_topic = topics[topic_idx] if len(topics) > topic_idx else "SEO Article"
     
     bot.delete_message(call.message.chat.id, call.message.message_id)
-    bot.send_message(call.message.chat.id, f"⏳ Пишу статью на тему: **{selected_topic}**\nЭто займет около 30 секунд...", parse_mode='Markdown')
+    bot.send_message(call.message.chat.id, f"⏳ Пишу статью: **{selected_topic}**\nЭто займет около 30 секунд...", parse_mode='Markdown')
     
-    # ГЕНЕРАЦИЯ
-    article_text = get_gemini_response(f"Напиши SEO статью (1500 знаков) на тему: '{selected_topic}'. Используй html теги <b> и <i> для форматирования.")
+    article_text = get_gemini_response(f"Напиши SEO статью (1500 знаков) на тему: '{selected_topic}'. Используй html теги <b> и <i>.")
     
     # Списываем лимит
     cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
     
-    # Сохраняем как черновик
     cur.execute("INSERT INTO articles (project_id, title, content, status) VALUES (%s, %s, %s, 'draft') RETURNING id", (pid, selected_topic, article_text))
     aid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
-    # ОТПРАВЛЯЕМ ТЕКСТ В ЧАТ
     send_long_message(call.message.chat.id, article_text, parse_mode='HTML')
     
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Публикуем на сайт", callback_data=f"approve_{aid}"),
+    markup.add(types.InlineKeyboardButton("✅ Публикуем", callback_data=f"approve_{aid}"),
                types.InlineKeyboardButton("✏️ Переписать (1 раз)", callback_data=f"rewrite_{aid}"))
     
-    bot.send_message(call.message.chat.id, "👇 Что делаем с этой статьей?", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "👇 Что делаем?", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rewrite_"))
 def rewrite_once(call):
@@ -714,7 +697,7 @@ def rewrite_once(call):
     send_long_message(call.message.chat.id, new_text)
     
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Публикуем эту версию", callback_data=f"approve_{aid}"))
+    markup.add(types.InlineKeyboardButton("✅ Публикуем", callback_data=f"approve_{aid}"))
     
     bot.send_message(call.message.chat.id, "👇 Новая версия готова.", reply_markup=markup)
 
@@ -725,7 +708,6 @@ def approve(call):
     cur.execute("UPDATE articles SET status='published' WHERE id=%s", (aid,))
     conn.commit(); cur.close(); conn.close()
     
-    # Имитация публикации
     fake_url = f"https://yoursite.com/blog/article-{aid}"
     bot.edit_message_text(f"✅ **Статья успешно опубликована!**\n🔗 {fake_url}", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
 
@@ -793,9 +775,14 @@ def process_tariff_selection(call, name, price, code):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def pre_payment(call):
     parts = call.data.split("_")
-    plan, period = parts[1], parts[2]
+    plan = parts[1] 
+    period = parts[2]
     
-    prices = {"start_1m": 1400, "pro_1m": 2500, "agent_1m": 7500, "start_1y": 11760, "pro_1y": 21000, "agent_1y": 62999}
+    prices = {
+        "start_1m": 1400, "pro_1m": 2500, "agent_1m": 7500,
+        "start_1y": 11760, "pro_1y": 21000, "agent_1y": 62999
+    }
+    
     names = {"start": "СЕО Старт", "pro": "СЕО Профи", "agent": "PBN Агент"}
     period_name = "Месяц" if period == "1m" else "Год"
     
@@ -824,8 +811,7 @@ def process_payment(call):
                 (call.from_user.id, amount, currency, plan_code))
     
     col = "total_paid_rub" if currency == "rub" else "total_paid_stars"
-    # Начисляем генерации при покупке
-    gens_add = 5 if plan_code == 'test' else 15 # Упрощенно
+    gens_add = 5 if plan_code == 'test' else 15
     cur.execute(f"UPDATE users SET tariff=%s, gens_left=gens_left+%s, {col}={col}+%s WHERE user_id=%s", (plan_code, gens_add, amount, call.from_user.id))
     conn.commit(); cur.close(); conn.close()
     
