@@ -1,21 +1,21 @@
 import os
 import logging
 import threading
-import telebot
 import psycopg2
-from telebot import types
-from google import genai
+from telebot import TeleBot, types
 from flask import Flask
 from dotenv import load_dotenv
 
-# 1. Настройки
+# 1. Настройки и инициализация
 load_dotenv()
-bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
-client = genai.Client()
-DB_URL = os.getenv("DATABASE_URL") # Не забудьте добавить в Environment Variables на Render
+ADMIN_ID = 203473623
+WHITE_LIST_DOMAINS = ["designservice.group", "ecosteni.ru"]
+DB_URL = os.getenv("DATABASE_URL")
 
-# Состояния для квеста (добавление площадки)
-user_states = {} 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = TeleBot(os.getenv("TELEGRAM_TOKEN"))
 
 # 2. База данных
 def get_db_connection():
@@ -24,45 +24,48 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    # Таблица пользователей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
+            free_generations_left INT DEFAULT 2,
             tier TEXT DEFAULT 'Тест',
-            balance INT DEFAULT 0
+            is_admin BOOLEAN DEFAULT FALSE,
+            balance_rub INT DEFAULT 0,
+            balance_stars INT DEFAULT 0
         )
     """)
+    # Таблица проектов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
             user_id BIGINT REFERENCES users(user_id),
             name TEXT,
             url TEXT,
-            platform_type TEXT, -- 'Сайт' или 'Соцсеть'
-            keywords TEXT,
-            target_region TEXT
+            is_white_list BOOLEAN DEFAULT FALSE
         )
     """)
+    # Назначение владельца админом
+    cur.execute("INSERT INTO users (user_id, is_admin) VALUES (%s, TRUE) ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE", (ADMIN_ID,))
     conn.commit()
     cur.close()
     conn.close()
 
-# 3. Навигация (ТЗ: Отсутствие тупиков)
-def get_main_menu():
+# 3. Вспомогательная логика
+def get_main_menu(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("📂 Мои площадки", callback_data="list_projects"),
-        types.InlineKeyboardButton("➕ Новая площадка", callback_data="add_step_1"),
-        types.InlineKeyboardButton("💎 Тарифы", callback_data="show_tiers"),
-        types.InlineKeyboardButton("📖 Инструкция", callback_data="help_data")
+        types.InlineKeyboardButton("➕ Новая площадка", callback_data="add_project"),
+        types.InlineKeyboardButton("📂 Мои проекты", callback_data="list_projects"),
+        types.InlineKeyboardButton("💎 Тарифы", callback_data="show_tiers")
     )
+    if user_id == ADMIN_ID:
+        markup.add(types.InlineKeyboardButton("⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_main"))
     return markup
 
-def back_to_menu_button():
-    return types.InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")
-
-# 4. Обработка команд
+# 4. Обработчики команд
 @bot.message_handler(commands=['start'])
-def start_command(message):
+def start(message):
     user_id = message.from_user.id
     conn = get_db_connection()
     cur = conn.cursor()
@@ -73,63 +76,69 @@ def start_command(message):
     
     bot.send_message(
         message.chat.id, 
-        "🚀 **AI Content-Director 2026**\nДобро пожаловать в систему линейного управления SEO.",
-        reply_markup=get_main_menu(),
+        "🚀 **AI Content-Director 2026**\nВаша система управления SEO готова к работе.",
+        reply_markup=get_main_menu(user_id),
         parse_mode='Markdown'
     )
 
-# 5. Линейный квест: Добавление площадки (ТЗ п.2)
-@bot.callback_query_handler(func=lambda call: call.data.startswith('add_step'))
-def start_add_project(call):
-    if call.data == "add_step_1":
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🌐 Сайт", callback_data="add_type_web"))
-        markup.add(types.InlineKeyboardButton("📱 Соцсеть", callback_data="add_type_social"))
-        markup.add(back_to_menu_button())
-        bot.edit_message_text("Шаг 1: Выберите тип площадки:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+# 5. БЛОК 2: Админ-панель
+@bot.callback_query_handler(func=lambda call: call.data == "admin_main")
+def admin_panel(call):
+    if call.from_user.id != ADMIN_ID:
+        return bot.answer_callback_query(call.id, "Доступ запрещен!")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('add_type'))
-def process_type(call):
-    p_type = "Сайт" if "web" in call.data else "Соцсеть"
-    user_states[call.from_user.id] = {'type': p_type}
-    bot.edit_message_text(f"Шаг 2: Введите URL вашей площадки (например, https://mysite.com):", call.message.chat.id, call.message.message_id)
-
-@bot.message_handler(func=lambda m: m.from_user.id in user_states and 'url' not in user_states[m.from_user.id])
-def process_url(message):
-    url = message.text
-    # Простая валидация (ТЗ п.1)
-    if not url.startswith("http"):
-        bot.reply_to(message, "❌ Неверный формат ссылки. Ссылка должна начинаться с http... Попробуйте еще раз:")
-        return
-    
-    user_states[message.from_user.id]['url'] = url
-    bot.send_message(message.chat.id, "Шаг 3: Введите название проекта (для вашего удобства):")
-
-@bot.message_handler(func=lambda m: m.from_user.id in user_states and 'name' not in user_states[m.from_user.id])
-def process_name(message):
-    u_id = message.from_user.id
-    data = user_states[u_id]
-    
-    # Сохранение в БД
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO projects (user_id, name, url, platform_type) VALUES (%s, %s, %s, %s)",
-        (u_id, message.text, data['url'], data['type'])
-    )
-    conn.commit()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+    cur.execute("SELECT tier, COUNT(*) FROM users GROUP BY tier")
+    tiers = cur.fetchall()
+    cur.execute("SELECT SUM(balance_rub), SUM(balance_stars) FROM users")
+    revenue = cur.fetchone()
     cur.close()
     conn.close()
-    
-    del user_states[u_id]
-    bot.send_message(message.chat.id, f"✅ Проект '{message.text}' успешно добавлен!", reply_markup=get_main_menu())
 
-# 6. Flask (Health Check)
+    res_text = f"⚙️ **Панель управления**\n\n👥 Юзеров: {total_users}\n"
+    res_text += f"💰 Доход: {revenue[0] or 0}₽ | {revenue[1] or 0}⭐\n\n"
+    res_text += "📊 Статистика тарифов:\n"
+    for t, count in tiers:
+        res_text += f"— {t}: {count}\n"
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📢 Рассылка (Retention)", callback_data="admin_broadcast"))
+    markup.add(types.InlineKeyboardButton("🏠 В меню", callback_data="main_menu"))
+    
+    bot.edit_message_text(res_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
+def admin_broadcast(call):
+    msg = bot.send_message(call.message.chat.id, "Введите текст сообщения для рассылки всем пользователям:")
+    bot.register_next_step_handler(msg, send_broadcast_step)
+
+def send_broadcast_step(message):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    success = 0
+    for u in users:
+        try:
+            bot.send_message(u[0], f"📢 **Сообщение от AI-Директора:**\n\n{message.text}", parse_mode='Markdown')
+            success += 1
+        except: continue
+    bot.send_message(ADMIN_ID, f"✅ Рассылка завершена. Успешно: {success}")
+
+# 6. Flask и Запуск
 app = Flask(__name__)
 @app.route('/')
-def home(): return "OK", 200
+def health(): return "OK", 200
 
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    bot.remove_webhook()
+    logger.info("Бот запущен с Блоком 1 и 2!")
     bot.infinity_polling()
