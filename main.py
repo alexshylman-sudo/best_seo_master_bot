@@ -44,6 +44,7 @@ def send_weekly_retention():
     
     # Генерация идеи и картинки через ИИ
     idea = client.models.generate_content(model="gemini-2.0-flash", contents=["Придумай 1 короткую идею для фото SEO-успеха на англ. и мотивирующий текст на рус."]).text
+    # Здесь используется ваш API Nano Banana
     image_url = f"https://api.nanobanana.pro/v1/generate?prompt={idea[:100]}" 
 
     for user in users:
@@ -58,7 +59,7 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(60)
 
-# 4. ГЛАВНОЕ МЕНЮ И КНОПКИ
+# 4. ГЛАВНОЕ МЕНЮ
 def get_main_menu(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -80,7 +81,7 @@ def choose_platform(call):
     )
     bot.edit_message_text("🎯 **Выберите тип площадки:**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
-# 5. РАСШИРЕННЫЙ ОПРОС (8 ШАГОВ)
+# 5. ОПРОС (8 ШАГОВ)
 @bot.callback_query_handler(func=lambda call: call.data.startswith("type_"))
 def start_survey(call):
     data = {"type": call.data.split("_")[1]}
@@ -105,7 +106,7 @@ def finish_survey(message, data):
     bot.send_message(message.chat.id, "🪄 Gemini 2.0 генерирует семантическое ядро...", reply_markup=types.ReplyKeyboardRemove())
     prompt = f"Создай {count} SEO-ключей для {data['url']}. Ниша: {data['biz']}. Продукты: {data['prod']}. Гео: {data['geo']}. ЦА: {data['ca']}. Конкуренты: {data['comp']}. УТП: {data['usp']}. Разбей на кластеры."
     res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
-    bot.send_message(message.chat.id, f"🔍 **Ваш результат:**\n\n{res.text}", parse_mode='Markdown', reply_markup=get_main_menu(message.from_user.id))
+    bot.send_message(message.chat.id, f"🔍 **Результат:**\n\n{res.text}", parse_mode='Markdown', reply_markup=get_main_menu(message.from_user.id))
 
 # 6. ЛИМИТЫ И ЗАПУСК
 @bot.message_handler(commands=['start'])
@@ -120,18 +121,23 @@ def handle_ai(message):
     cur.execute("SELECT free_generations_left, tier, is_admin FROM users WHERE user_id = %s", (user_id,))
     u = cur.fetchone()
     if not u[2] and u[0] <= 0 and u[1] == 'Тест':
+        cur.close(); conn.close()
         return bot.reply_to(message, "⚠️ Лимит исчерпан. Перейдите на тариф.")
     res = client.models.generate_content(model="gemini-2.0-flash", contents=[message.text or "SEO"])
     if not u[2] and u[0] > 0: cur.execute("UPDATE users SET free_generations_left = free_generations_left - 1 WHERE user_id = %s", (user_id,))
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, res.text)
 
+# 7. FLASK И ЗАПУСК ПОТОКОВ
 app = Flask(__name__)
 @app.route('/')
 def h(): return "OK", 200
 
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
     bot.infinity_polling(skip_pending=True)
