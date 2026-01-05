@@ -6,6 +6,26 @@ from telebot.types import Message
 from dotenv import load_dotenv
 from requests.exceptions import RequestException
 import time
+import threading
+from flask import Flask
+import os
+
+# Создаем микро-сервер для "обмана" проверок Render
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot is running!", 200
+
+def run_flask():
+    # Render передает порт в переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Запускаем сервер в фоновом потоке, чтобы он не мешал боту
+threading.Thread(target=run_flask, daemon=True).start()
+
+# ДАЛЕЕ ИДЕТ ВАШ ВЕСЬ ОСТАЛЬНОЙ КОД БОТА...
 
 # Загрузка переменных окружения (для локального тестирования)
 load_dotenv()
