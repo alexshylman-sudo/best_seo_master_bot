@@ -8,24 +8,27 @@ from flask import Flask
 from google import genai
 from dotenv import load_dotenv
 
-# 1. Настройки
+# 1. Настройки и инициализация
 load_dotenv()
 ADMIN_ID = 203473623
 WHITE_LIST_DOMAINS = ["designservice.group", "ecosteni.ru"]
 DB_URL = os.getenv("DATABASE_URL")
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 bot = TeleBot(os.getenv("TELEGRAM_TOKEN"))
 client = genai.Client()
 
-# Конфигурация тарифов (цена за месяц)
+# Конфигурация тарифов
 TIERS = {
     "test": {"name": "Тест-драйв (10 ген.)", "price": 500, "stars": 270, "no_year": True},
     "start": {"name": "SEO Старт", "price": 1500, "stars": 800},
     "pro": {"name": "SEO Профи", "price": 5000, "stars": 2700},
-    "pbn": {"name": "PBN Агент", "price": 15000, "stars": 8000},
+    "pbn": {"name": "PBN Агент (10 площадок)", "price": 15000, "stars": 8000},
 }
 
-# 2. База данных
+# 2. Работа с БД и проверка прав
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
@@ -47,6 +50,9 @@ def init_db():
     cur.close()
     conn.close()
 
+def is_partner_site(url):
+    return any(domain in str(url).lower() for domain in WHITE_LIST_DOMAINS)
+
 # 3. Клавиатуры
 def get_main_menu(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -60,37 +66,31 @@ def get_main_menu(user_id):
         markup.add(types.InlineKeyboardButton("⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_main"))
     return markup
 
-# 4. Обработчики кнопок
+# 4. Логика кнопок (Callback Query)
 @bot.callback_query_handler(func=lambda call: True)
 def callback_listener(call):
     user_id = call.from_user.id
     
-    # Главное меню
     if call.data == "main_menu":
         bot.edit_message_text("🚀 **AI Content-Director 2026**\nВаша система управления SEO готова.", 
-                              call.message.chat.id, call.message.message_id, 
-                              reply_markup=get_main_menu(user_id), parse_mode='Markdown')
+                              call.message.chat.id, call.message.message_id, reply_markup=get_main_menu(user_id), parse_mode='Markdown')
 
-    # Выбор тарифа (Шаг 1)
     elif call.data == "show_tiers":
         markup = types.InlineKeyboardMarkup(row_width=1)
         for key, data in TIERS.items():
             markup.add(types.InlineKeyboardButton(data['name'], callback_data=f"tier_{key}"))
         markup.add(types.InlineKeyboardButton("🏠 Назад", callback_data="main_menu"))
-        bot.edit_message_text("💎 **Выберите подходящий тариф:**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_text("💎 **Выберите тариф:**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
-    # Выбор периода (Шаг 2)
     elif call.data.startswith("tier_"):
         tier = call.data.split("_")[1]
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(types.InlineKeyboardButton("📅 На 1 месяц", callback_data=f"period_{tier}_month"))
         if not TIERS[tier].get("no_year"):
-            markup.add(types.InlineKeyboardButton("Year 📅 На 1 год (-30%)", callback_data=f"period_{tier}_year"))
+            markup.add(types.InlineKeyboardButton("📅 На 1 год (-30%)", callback_data=f"period_{tier}_year"))
         markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="show_tiers"))
-        bot.edit_message_text(f"⏳ Выбрано: **{TIERS[tier]['name']}**\nВыберите период оплаты:", 
-                              call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_text(f"⏳ Выбрано: **{TIERS[tier]['name']}**\nВыберите период:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
-    # Выбор метода оплаты (Шаг 3)
     elif call.data.startswith("period_"):
         _, tier, period = call.data.split("_")
         price = TIERS[tier]['price'] if period == "month" else TIERS[tier]['price'] * 12 * 0.7
@@ -98,26 +98,35 @@ def callback_listener(call):
         
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
-            types.InlineKeyboardButton(f"💳 Банковская карта ({int(price)}₽)", callback_data=f"pay_card_{tier}_{period}"),
-            types.InlineKeyboardButton(f"⭐ Telegram Stars ({int(stars)}⭐)", callback_data=f"pay_stars_{tier}_{period}"),
+            types.InlineKeyboardButton(f"💳 Карта ({int(price)}₽)", callback_data=f"pay_card_{tier}_{period}"),
+            types.InlineKeyboardButton(f"⭐ Звезды ({int(stars)}⭐)", callback_data=f"pay_stars_{tier}_{period}"),
             types.InlineKeyboardButton("⬅️ Назад", callback_data=f"tier_{tier}")
         )
-        bot.edit_message_text(f"💳 **Оплата: {TIERS[tier]['name']} ({period})**\nСумма: {int(price)}₽ или {int(stars)}⭐", 
-                              call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_text(f"💳 **Оплата: {TIERS[tier]['name']}**\nСумма: {int(price)}₽ / {int(stars)}⭐", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
-    # Заглушки для остальных кнопок
     elif call.data in ["add_project", "list_projects", "help_data"]:
-        bot.answer_callback_query(call.id, "Раздел в разработке")
+        bot.answer_callback_query(call.id, "Раздел в разработке (Блок 5)")
+
+    elif call.data == "admin_main":
+        if user_id != ADMIN_ID: return
+        # Логика статистики из БД...
+        bot.answer_callback_query(call.id, "Загрузка статистики...")
 
     bot.answer_callback_query(call.id)
 
-# 5. Интеллект и SEO
-@bot.message_handler(content_types=['text', 'photo'])
-def handle_seo(message):
-    # Логика White-list и Gemini как в предыдущем блоке
-    bot.reply_to(message, "⚙️ Анализирую ваш запрос через Gemini 2.0...")
+# 5. Обработка SEO-запросов (Gemini 2.0)
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    init_db()
+    bot.send_message(message.chat.id, "✅ Бот активирован!", reply_markup=get_main_menu(message.from_user.id))
 
-# 6. Запуск
+@bot.message_handler(content_types=['text', 'photo'])
+def handle_message(message):
+    user_id = message.from_user.id
+    # Здесь должна быть проверка лимитов и вызов Gemini как в Блоке 4...
+    bot.reply_to(message, "⚙️ Анализирую через Gemini 2.0 Flash...")
+
+# 6. Flask для Render
 app = Flask(__name__)
 @app.route('/')
 def health(): return "OK", 200
