@@ -43,28 +43,75 @@ def init_db():
     if not conn: return
     cur = conn.cursor()
 
-    # ВНИМАНИЕ: Для применения изменений в структуре (progress, platform)
-    # на этапе разработки можно пересоздать таблицы.
-    # Если бот уже в продакшене, лучше использовать ALTER TABLE.
-    # Сейчас для надежности пересоздаем (старые данные удалятся!)
-    cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance INT DEFAULT 0, tariff TEXT DEFAULT 'Нет тарифа', tariff_expires TIMESTAMP, gens_left INT DEFAULT 0, is_admin BOOLEAN DEFAULT FALSE, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, total_paid_rub INT DEFAULT 0, total_paid_stars INT DEFAULT 0)")
+    # --- ВАЖНО: ЭТИ СТРОКИ УДАЛЯЮТ СТАРУЮ БАЗУ, ЧТОБЫ СОЗДАТЬ НОВУЮ С КОЛОНКОЙ PROGRESS ---
+    print("⚠️ Обновляю структуру базы данных...")
+    cur.execute("DROP TABLE IF EXISTS projects CASCADE")
+    cur.execute("DROP TABLE IF EXISTS users CASCADE")
+    cur.execute("DROP TABLE IF EXISTS articles CASCADE")
+    # --------------------------------------------------------------------------------------
+
+    # 1. Таблица пользователей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            balance INT DEFAULT 0,
+            tariff TEXT DEFAULT 'Нет тарифа',
+            tariff_expires TIMESTAMP,
+            gens_left INT DEFAULT 0,
+            is_admin BOOLEAN DEFAULT FALSE,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_paid_rub INT DEFAULT 0,
+            total_paid_stars INT DEFAULT 0
+        )
+    """)
     
-    cur.execute("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id BIGINT, type TEXT, url TEXT, info JSONB DEFAULT '{}', knowledge_base JSONB DEFAULT '[]', keywords TEXT, cms_key TEXT, platform TEXT, frequency INT DEFAULT 0, progress JSONB DEFAULT '{}', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    # 2. Таблица проектов (ТУТ ТЕПЕРЬ ЕСТЬ progress)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            type TEXT,
+            url TEXT,
+            info JSONB DEFAULT '{}', 
+            knowledge_base JSONB DEFAULT '[]', 
+            keywords TEXT,
+            cms_key TEXT,
+            platform TEXT,
+            frequency INT DEFAULT 0,
+            progress JSONB DEFAULT '{}', 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     
-    cur.execute("CREATE TABLE IF NOT EXISTS articles (id SERIAL PRIMARY KEY, project_id INT, title TEXT, content TEXT, status TEXT DEFAULT 'draft', rewrite_count INT DEFAULT 0, published_url TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    # 3. Таблица статей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id SERIAL PRIMARY KEY,
+            project_id INT,
+            title TEXT,
+            content TEXT,
+            status TEXT DEFAULT 'draft',
+            rewrite_count INT DEFAULT 0,
+            published_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     # Предустановка Админа
     cur.execute("INSERT INTO users (user_id, is_admin, tariff, gens_left) VALUES (%s, TRUE, 'GOD_MODE', 9999) ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE", (ADMIN_ID,))
     
-    # Проекты Админа
+    # Проекты Админа (Восстанавливаем их)
     admin_projects = [('site', 'https://designservice.group/'), ('site', 'https://ecosteni.ru/')]
     for p_type, p_url in admin_projects:
+        # Сначала создаем "болванку", если проекта нет
         cur.execute("SELECT id FROM projects WHERE user_id = %s AND url = %s", (ADMIN_ID, p_url))
         if not cur.fetchone():
-            cur.execute("INSERT INTO projects (user_id, type, url, info) VALUES (%s, %s, %s, '{}')", (ADMIN_ID, p_type, p_url))
+            cur.execute("INSERT INTO projects (user_id, type, url, info, progress) VALUES (%s, %s, %s, '{}', '{}')", (ADMIN_ID, p_type, p_url))
 
-    conn.commit(); cur.close(); conn.close()
-    print("✅ БД инициализирована.")
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("✅ БД успешно пересоздана с новыми колонками.")
 
 # --- 3. УТИЛИТЫ ---
 def get_gemini_response(prompt):
