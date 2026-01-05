@@ -136,8 +136,15 @@ def h(): return "OK", 200
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
+# Финальная правка для запуска
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Запуск Flask в отдельном потоке
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    # Запуск планировщика
     threading.Thread(target=run_scheduler, daemon=True).start()
+    
+    # Сброс возможных конфликтов сессий
+    bot.remove_webhook()
+    print("Бот запущен и готов к работе...")
     bot.infinity_polling(skip_pending=True)
