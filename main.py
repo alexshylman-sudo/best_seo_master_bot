@@ -108,7 +108,6 @@ def init_db():
     cur.execute("INSERT INTO users (user_id, is_admin, tariff, gens_left) VALUES (%s, TRUE, 'GOD_MODE', 9999) ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE", (ADMIN_ID,))
     
     conn.commit(); cur.close(); conn.close()
-    
     patch_db_schema()
     print("✅ БД инициализирована.")
 
@@ -128,10 +127,22 @@ def send_long_message(chat_id, text, parse_mode=None):
     if len(text) <= 4000:
         bot.send_message(chat_id, text, parse_mode=parse_mode)
     else:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        # Разбиваем по переносам строк, чтобы не резать слова
+        parts = []
+        while len(text) > 0:
+            if len(text) > 4000:
+                # Ищем последний перенос строки перед 4000 символом
+                split_pos = text.rfind('\n', 0, 4000)
+                if split_pos == -1: split_pos = 4000
+                parts.append(text[:split_pos])
+                text = text[split_pos:]
+            else:
+                parts.append(text)
+                text = ""
+        
         for part in parts:
             bot.send_message(chat_id, part, parse_mode=parse_mode)
-            time.sleep(0.5)
+            time.sleep(0.3)
 
 def get_gemini_response(prompt):
     try:
@@ -141,22 +152,8 @@ def get_gemini_response(prompt):
         return f"Ошибка AI: {e}"
 
 def validate_input(text, question_context):
-    """Смягченная проверка: пропускает 'нет конкурентов', 'хочу квартиру'."""
     try:
-        prompt = f"""
-        Ты модератор опроса для бизнеса.
-        Вопрос: "{question_context}"
-        Ответ пользователя: "{text}"
-        
-        Твоя задача: Отсеять ТОЛЬКО явный спам, мат или бред.
-        
-        Правила:
-        1. Если пользователь пишет "нет конкурентов", "не знаю", "все люди" — это OK (это допустимый ответ).
-        2. Если ответ короткий, но по теме (напр. "продажи", "ж 25+") — это OK.
-        3. Если ответ содержит мат или случайный набор букв ("ываыва", "123") — это BAD.
-        
-        Верни ТОЛЬКО одно слово: OK или BAD.
-        """
+        prompt = f"Модератор опроса. Вопрос: '{question_context}'. Ответ: '{text}'. Если ответ содержит мат, бессмыслицу или спам - верни BAD. Если ответ адекватный (даже 'нет конкурентов') - верни OK."
         res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt]).text.strip()
         return "BAD" not in res.upper()
     except: return True
@@ -279,7 +276,6 @@ def check_url_step(message):
     
     msg_check = bot.send_message(message.chat.id, "⏳ Проверяю доступность и базу данных...")
     
-    # ПРОВЕРКА НА ДУБЛИКАТЫ
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT user_id FROM projects WHERE url = %s", (url,))
     exists = cur.fetchone()
@@ -303,7 +299,7 @@ def check_url_step(message):
     bot.delete_message(message.chat.id, msg_check.message_id)
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
-def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
+def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None, just_finished_survey=False):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url, keywords, progress FROM projects WHERE id = %s", (pid,))
     res = cur.fetchone()
@@ -313,12 +309,17 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     url, kw_db, progress = res
     if not progress: progress = {}
     
-    can_gen_keys = progress.get("info_done") or progress.get("upload_done")
     has_keywords = kw_db is not None and len(kw_db) > 5
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     
-    # СТРАТЕГИЯ - ВАЖНАЯ КНОПКА (ПЕРВАЯ, ЕСЛИ ЕСТЬ КЛЮЧИ)
+    # ЕСЛИ ТОЛЬКО ЧТО ЗАКОНЧИЛ ОПРОС - ПОКАЗЫВАЕМ ТОЛЬКО "ПОДОБРАТЬ КЛЮЧИ"
+    if just_finished_survey:
+        markup.add(types.InlineKeyboardButton("🔑 Подобрать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
+        bot.send_message(chat_id, "✅ Спасибо за честные ответы! Теперь самое время подобрать ключевые слова для продвижения.", reply_markup=markup)
+        return
+
+    # ОБЫЧНЫЙ РЕЖИМ
     if has_keywords:
         markup.add(types.InlineKeyboardButton("🚀 ⭐️ СТРАТЕГИЯ И СТАТЬИ ⭐️", callback_data=f"strat_{pid}"))
 
@@ -333,22 +334,16 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     else:
         markup.add(btn_info, btn_anal, btn_upl)
 
-    # Кнопки ключей
     if has_keywords:
         markup.add(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"))
-    elif can_gen_keys:
+    elif progress.get("info_done") or progress.get("upload_done"):
         markup.add(types.InlineKeyboardButton("🔑 Подобрать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
     
-    # Кнопка удаления (Внизу)
     markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"delete_proj_confirm_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
 
     safe_url = escape_md(url)
-    
-    if new_site_url:
-        text = f"✅ Сайт {safe_url} добавлен!\n\n👇 Выберите действие:"
-    else:
-        text = f"📂 **Проект:** {safe_url}\nРежим: {'Первичная настройка' if mode=='onboarding' else 'Управление'}"
+    text = f"✅ Сайт {safe_url} добавлен!" if new_site_url else f"📂 **Проект:** {safe_url}\nРежим: {'Первичная настройка' if mode=='onboarding' else 'Управление'}"
     
     try:
         if msg_id and not new_site_url:
@@ -379,7 +374,6 @@ def delete_keywords(call):
     cur.execute("UPDATE projects SET keywords = NULL WHERE id = %s", (pid,))
     conn.commit(); cur.close(); conn.close()
     bot.answer_callback_query(call.id, "✅ Ключи удалены.")
-    # ОБНОВЛЯЕМ МЕНЮ
     open_project_menu(call.message.chat.id, pid, mode="management", msg_id=call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_main")
@@ -389,7 +383,7 @@ def back_main(call):
 
 # --- 6. ФУНКЦИОНАЛ ---
 
-# ОПРОСНИК (6 ВОПРОСОВ)
+# ОПРОСНИК
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
 def start_survey_6q(call):
     pid = call.data.split("_")[1]
@@ -399,11 +393,10 @@ def start_survey_6q(call):
 
 def q2(m, d, prev_q): 
     if not validate_input(m.text, prev_q):
-        msg = bot.send_message(m.chat.id, f"⛔ Это не похоже на честный ответ. Попробуйте еще раз.\n\n❓ {prev_q}")
+        msg = bot.send_message(m.chat.id, f"⛔ Это не похоже на честный ответ.\n\n❓ {prev_q}")
         bot.register_next_step_handler(msg, q2, d, prev_q)
         return
     d["answers"].append(f"Цель: {m.text}")
-    
     q_text = "Кто ваша целевая аудитория? (Пол, возраст, интересы)"
     msg = bot.send_message(m.chat.id, f"❓ Вопрос 2/6:\n{q_text}")
     bot.register_next_step_handler(msg, q3, d, q_text)
@@ -414,7 +407,6 @@ def q3(m, d, prev_q):
         bot.register_next_step_handler(msg, q3, d, prev_q)
         return
     d["answers"].append(f"ЦА: {m.text}")
-    
     q_text = "Назовите ваших главных конкурентов:"
     msg = bot.send_message(m.chat.id, f"❓ Вопрос 3/6:\n{q_text}")
     bot.register_next_step_handler(msg, q4, d, q_text)
@@ -425,7 +417,6 @@ def q4(m, d, prev_q):
         bot.register_next_step_handler(msg, q4, d, prev_q)
         return
     d["answers"].append(f"Конкуренты: {m.text}")
-    
     q_text = "В чем ваше главное преимущество (УТП)?"
     msg = bot.send_message(m.chat.id, f"❓ Вопрос 4/6:\n{q_text}")
     bot.register_next_step_handler(msg, q5, d, q_text)
@@ -436,7 +427,6 @@ def q5(m, d, prev_q):
         bot.register_next_step_handler(msg, q5, d, prev_q)
         return
     d["answers"].append(f"УТП: {m.text}")
-    
     q_text = "География продвижения (Город, Страна):"
     msg = bot.send_message(m.chat.id, f"❓ Вопрос 5/6:\n{q_text}")
     bot.register_next_step_handler(msg, q6, d, q_text)
@@ -447,14 +437,13 @@ def q6(m, d, prev_q):
         bot.register_next_step_handler(msg, q6, d, prev_q)
         return
     d["answers"].append(f"Гео: {m.text}")
-    
-    q_text = "Свободная форма. Напишите всё, что важно знать о вашем бизнесе для составления правильных ключевых слов. (Особенности, сезонность, нюансы):"
+    q_text = "Свободная форма. Особенности, сезонность, нюансы:"
     msg = bot.send_message(m.chat.id, f"❓ Вопрос 6/6 (Важно!):\n{q_text}")
     bot.register_next_step_handler(msg, finish_survey, d, q_text)
 
 def finish_survey(m, d, prev_q):
     if not validate_input(m.text, prev_q):
-        msg = bot.send_message(m.chat.id, f"⛔ Это поле важно. Напишите хоть что-то осмысленное.\n\n❓ {prev_q}")
+        msg = bot.send_message(m.chat.id, f"⛔ Напишите осмысленно.\n\n❓ {prev_q}")
         bot.register_next_step_handler(msg, finish_survey, d, prev_q)
         return
     d["answers"].append(f"Доп. инфо: {m.text}")
@@ -465,8 +454,8 @@ def finish_survey(m, d, prev_q):
     conn.commit(); cur.close(); conn.close()
     
     update_project_progress(d["pid"], "info_done")
-    bot.send_message(m.chat.id, "✅ Ответы сохранены!")
-    open_project_menu(m.chat.id, d["pid"], mode="management")
+    # СПЕЦИАЛЬНЫЙ ВЫЗОВ МЕНЮ С ОДНОЙ КНОПКОЙ
+    open_project_menu(m.chat.id, d["pid"], mode="management", just_finished_survey=True)
 
 # АНАЛИЗ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("anz_"))
@@ -480,7 +469,7 @@ def deep_analysis(call):
     url = cur.fetchone()[0]
     
     raw_data = deep_analyze_site(url)
-    ai_prompt = f"Ты SEO профессионал. Проведи аудит сайта. Данные: {raw_data}. Дай 3 критических ошибки и 3 точки роста."
+    ai_prompt = f"Ты SEO профи. Аудит сайта. Данные: {raw_data}. Дай 3 ошибки и 3 точки роста."
     advice = get_gemini_response(ai_prompt)
     
     cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
@@ -495,29 +484,39 @@ def deep_analysis(call):
     send_long_message(call.message.chat.id, f"📊 **Результат аудита:**\n\n{advice}")
     open_project_menu(call.message.chat.id, pid, mode="management")
 
-# ЗАГРУЗКА
+# ЗАГРУЗКА ФАЙЛОВ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("upf_"))
 def upload_files(call):
     pid = call.data.split("_")[1]
-    msg = bot.send_message(call.message.chat.id, "📂 Пришлите текст, фото или PDF.")
+    msg = bot.send_message(call.message.chat.id, "📂 Пришлите текст, фото или документ (.txt/pdf).")
     bot.register_next_step_handler(msg, process_upload, pid)
 
 def process_upload(message, pid):
-    content = message.text if message.text else "File/Photo content"
-    check = get_gemini_response(f"Это полезно для SEO? Если нет ответь МУСОР. Текст: {content[:500]}")
-    
-    if "МУСОР" in check.upper():
-        bot.reply_to(message, "⚠️ Это не полезная информация.")
-    else:
+    content = ""
+    if message.content_type == 'text':
+        content = message.text
+    elif message.content_type == 'document':
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            content = downloaded_file.decode('utf-8') # Пытаемся прочитать текст
+        except:
+            content = "Document uploaded: " + message.document.file_name
+
+    # Мягкая проверка: если есть слова, считаем полезным
+    if len(content) > 10:
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
         kb = cur.fetchone()[0]; 
         if not kb: kb = []
-        kb.append(f"User Upload: {check}")
+        kb.append(f"User Upload: {content[:1000]}...")
         cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
         conn.commit(); cur.close(); conn.close()
         update_project_progress(pid, "upload_done")
-        bot.reply_to(message, "✅ Добавлено в базу знаний.")
+        bot.reply_to(message, "✅ Информация добавлена в базу знаний.")
+    else:
+        bot.reply_to(message, "⚠️ Файл пуст или не читается.")
+    
     open_project_menu(message.chat.id, pid, mode="management")
 
 # КЛЮЧИ
@@ -543,23 +542,7 @@ def generate_keywords_action(call):
     info_json = res[2] or {}
     survey_text = info_json.get("survey", "")
     
-    prompt = f"""
-    Твоя задача: Составь список из {count} SEO ключевых слов для сайта {res[1]}.
-    Контекст из опроса: {survey_text}
-    База знаний: {kb_text}
-    
-    ВАЖНО: Формат вывода должен быть СТРОГО таким:
-    
-    **Высокая частотность:**
-    - слово 1
-    - слово 2
-    
-    **Средняя частотность:**
-    - слово 3
-    
-    **Низкая частотность:**
-    - слово 5
-    """
+    prompt = f"Твоя задача: Составь список из {count} SEO ключевых слов для сайта {res[1]}. Контекст: {survey_text}. База: {kb_text}. ВАЖНО: Формат вывода: **Высокая частотность:** список... **Средняя частотность:** список... **Низкая частотность:** список..."
     
     keywords = get_gemini_response(prompt)
     
@@ -568,11 +551,13 @@ def generate_keywords_action(call):
     
     send_long_message(call.message.chat.id, keywords, parse_mode='Markdown')
     
+    # 3 КНОПКИ
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"approve_kw_{pid}"),
+    markup.row(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"approve_kw_{pid}"),
                types.InlineKeyboardButton("📥 Скачать (.txt)", callback_data=f"download_kw_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔄 Пройти опрос заново", callback_data=f"srv_{pid}"))
     
-    bot.send_message(call.message.chat.id, "👇 Что делаем дальше?", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "👇 Вы можете скачать файл, отредактировать (удалить лишнее) и загрузить обратно через кнопку 'Загрузить файлы'.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_kw_"))
 def approve_keywords(call):
@@ -594,7 +579,6 @@ def download_keywords(call):
     file_data = io.BytesIO(res[0].encode('utf-8'))
     file_data.name = f"keywords_{pid}.txt"
     bot.send_document(call.message.chat.id, file_data, caption=f"Ключевые слова для {res[1]}")
-    open_project_menu(call.message.chat.id, pid, mode="management")
 
 # СТРАТЕГИЯ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
@@ -830,6 +814,7 @@ def show_profile(uid):
 
 def show_admin_panel(uid):
     conn = get_db_connection(); cur = conn.cursor()
+    
     try:
         cur.execute("SELECT count(*) FROM users WHERE last_active > NOW() - INTERVAL '15 minutes'")
         online = cur.fetchone()[0]
@@ -839,8 +824,10 @@ def show_admin_panel(uid):
     profit_rub = cur.fetchone()[0] or 0
     cur.execute("SELECT sum(amount) FROM payments WHERE currency='stars' AND created_at > date_trunc('month', CURRENT_DATE)")
     profit_stars = cur.fetchone()[0] or 0
+    
     cur.execute("SELECT count(*) FROM articles WHERE status='published'")
     arts = cur.fetchone()[0]
+    
     cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name")
     tariffs_stat = cur.fetchall()
     tariff_txt = "\n".join([f"- {t[0]}: {t[1]}" for t in tariffs_stat])
@@ -852,6 +839,7 @@ def show_admin_panel(uid):
            f"💰 Прибыль (мес): {profit_rub}₽ | {profit_stars}⭐️\n"
            f"📄 Опубликовано статей: {arts}\n\n"
            f"📊 **Продажи тарифов:**\n{tariff_txt}")
+    
     bot.send_message(uid, txt)
 
 # --- 9. ЗАПУСК ---
