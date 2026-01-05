@@ -34,24 +34,6 @@ def get_db_connection():
         print(f"❌ Ошибка БД: {e}")
         return None
 
-def cleanup_duplicates():
-    """Удаляет дубликаты проектов, оставляя только последний добавленный"""
-    conn = get_db_connection()
-    if not conn: return
-    cur = conn.cursor()
-    try:
-        # Оставляем только запись с максимальным ID для каждой пары user_id + url
-        cur.execute("""
-            DELETE FROM projects a USING projects b
-            WHERE a.id < b.id AND a.url = b.url;
-        """)
-        conn.commit()
-        print("🧹 Дубликаты проектов очищены.")
-    except Exception as e:
-        print(f"Cleanup error: {e}")
-    finally:
-        cur.close(); conn.close()
-
 def patch_db_schema():
     conn = get_db_connection()
     if not conn: return
@@ -128,7 +110,6 @@ def init_db():
     conn.commit(); cur.close(); conn.close()
     
     patch_db_schema()
-    cleanup_duplicates() # Чистим дубли при запуске
     print("✅ БД инициализирована.")
 
 def update_last_active(user_id):
@@ -160,22 +141,21 @@ def get_gemini_response(prompt):
         return f"Ошибка AI: {e}"
 
 def validate_input(text, question_context):
-    """Строгая проверка ответа"""
+    """Смягченная проверка: пропускает 'нет конкурентов', 'хочу квартиру'."""
     try:
         prompt = f"""
-        Ты модератор бизнес-опроса. 
-        Вопрос пользователю: "{question_context}"
+        Ты модератор опроса для бизнеса.
+        Вопрос: "{question_context}"
         Ответ пользователя: "{text}"
         
-        Твоя задача: Оценить адекватность ответа.
-        Верни 'BAD', если ответ:
-        1. Содержит нецензурную лексику.
-        2. Бессмысленный набор букв или цифр (например "1", "ывап", ")").
-        3. Не отвечает на вопрос (например "не знаю", "кто-то").
-        4. Слишком короткий (менее 2 букв), если это не аббревиатура.
+        Твоя задача: Отсеять ТОЛЬКО явный спам, мат или бред.
         
-        Верни 'OK', если ответ похож на правду.
-        ОТВЕТЬ ТОЛЬКО ОДНИМ СЛОВОМ: OK или BAD.
+        Правила:
+        1. Если пользователь пишет "нет конкурентов", "не знаю", "все люди" — это OK (это допустимый ответ).
+        2. Если ответ короткий, но по теме (напр. "продажи", "ж 25+") — это OK.
+        3. Если ответ содержит мат или случайный набор букв ("ываыва", "123") — это BAD.
+        
+        Верни ТОЛЬКО одно слово: OK или BAD.
         """
         res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt]).text.strip()
         return "BAD" not in res.upper()
@@ -306,12 +286,10 @@ def check_url_step(message):
     if exists:
         cur.close(); conn.close()
         bot.delete_message(message.chat.id, msg_check.message_id)
-        # Сразу просим ввести новый URL
         msg = bot.send_message(message.chat.id, f"⛔ Сайт {url} уже есть в системе.\n👇 **Введите другой URL:**")
         bot.register_next_step_handler(msg, check_url_step)
         return
 
-    # ПРОВЕРКА ДОСТУПНОСТИ
     if not check_site_availability(url):
         cur.close(); conn.close()
         msg = bot.edit_message_text("❌ Сайт недоступен (код не 200). Проверьте ссылку и введите снова:", message.chat.id, msg_check.message_id)
@@ -340,6 +318,10 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     
+    # СТРАТЕГИЯ - ВАЖНАЯ КНОПКА (ПЕРВАЯ, ЕСЛИ ЕСТЬ КЛЮЧИ)
+    if has_keywords:
+        markup.add(types.InlineKeyboardButton("🚀 ⭐️ СТРАТЕГИЯ И СТАТЬИ ⭐️", callback_data=f"strat_{pid}"))
+
     btn_info = types.InlineKeyboardButton("📝 Добавить информацию (Опрос)", callback_data=f"srv_{pid}")
     btn_anal = types.InlineKeyboardButton("📊 Анализ сайта (Глубокий)", callback_data=f"anz_{pid}")
     btn_upl = types.InlineKeyboardButton("📂 Загрузить файлы", callback_data=f"upf_{pid}")
@@ -351,12 +333,14 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     else:
         markup.add(btn_info, btn_anal, btn_upl)
 
+    # Кнопки ключей
     if has_keywords:
-        markup.row(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"),
-                   types.InlineKeyboardButton("🚀 Стратегия и Статьи", callback_data=f"strat_{pid}"))
+        markup.add(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"))
     elif can_gen_keys:
         markup.add(types.InlineKeyboardButton("🔑 Подобрать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
-
+    
+    # Кнопка удаления (Внизу)
+    markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"delete_proj_confirm_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
 
     safe_url = escape_md(url)
@@ -379,6 +363,25 @@ def open_proj_mgmt(call):
     pid = call.data.split("_")[3]
     open_project_menu(call.message.chat.id, pid, mode="management", msg_id=call.message.message_id)
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_proj_confirm_"))
+def delete_project_confirm(call):
+    pid = call.data.split("_")[3]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("DELETE FROM projects WHERE id = %s", (pid,))
+    conn.commit(); cur.close(); conn.close()
+    bot.answer_callback_query(call.id, "🗑 Проект удален.")
+    list_projects(call.from_user.id, call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delkw_"))
+def delete_keywords(call):
+    pid = call.data.split("_")[1]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET keywords = NULL WHERE id = %s", (pid,))
+    conn.commit(); cur.close(); conn.close()
+    bot.answer_callback_query(call.id, "✅ Ключи удалены.")
+    # ОБНОВЛЯЕМ МЕНЮ
+    open_project_menu(call.message.chat.id, pid, mode="management", msg_id=call.message.message_id)
+
 @bot.callback_query_handler(func=lambda call: call.data == "back_main")
 def back_main(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -386,12 +389,12 @@ def back_main(call):
 
 # --- 6. ФУНКЦИОНАЛ ---
 
-# ОПРОСНИК (С УМНОЙ ВАЛИДАЦИЕЙ)
+# ОПРОСНИК (6 ВОПРОСОВ)
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
-def start_survey_5q(call):
+def start_survey_6q(call):
     pid = call.data.split("_")[1]
     q_text = "Какая главная цель вашего сайта? (Продажи, Трафик, Бренд?)"
-    msg = bot.send_message(call.message.chat.id, f"❓ Вопрос 1/5:\n{q_text}")
+    msg = bot.send_message(call.message.chat.id, f"❓ Вопрос 1/6:\n{q_text}")
     bot.register_next_step_handler(msg, q2, {"pid": pid, "answers": []}, q_text)
 
 def q2(m, d, prev_q): 
@@ -402,7 +405,7 @@ def q2(m, d, prev_q):
     d["answers"].append(f"Цель: {m.text}")
     
     q_text = "Кто ваша целевая аудитория? (Пол, возраст, интересы)"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 2/5:\n{q_text}")
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 2/6:\n{q_text}")
     bot.register_next_step_handler(msg, q3, d, q_text)
 
 def q3(m, d, prev_q): 
@@ -413,7 +416,7 @@ def q3(m, d, prev_q):
     d["answers"].append(f"ЦА: {m.text}")
     
     q_text = "Назовите ваших главных конкурентов:"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 3/5:\n{q_text}")
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 3/6:\n{q_text}")
     bot.register_next_step_handler(msg, q4, d, q_text)
 
 def q4(m, d, prev_q): 
@@ -424,7 +427,7 @@ def q4(m, d, prev_q):
     d["answers"].append(f"Конкуренты: {m.text}")
     
     q_text = "В чем ваше главное преимущество (УТП)?"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 4/5:\n{q_text}")
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 4/6:\n{q_text}")
     bot.register_next_step_handler(msg, q5, d, q_text)
 
 def q5(m, d, prev_q): 
@@ -435,15 +438,26 @@ def q5(m, d, prev_q):
     d["answers"].append(f"УТП: {m.text}")
     
     q_text = "География продвижения (Город, Страна):"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 5/5:\n{q_text}")
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 5/6:\n{q_text}")
+    bot.register_next_step_handler(msg, q6, d, q_text)
+
+def q6(m, d, prev_q):
+    if not validate_input(m.text, prev_q):
+        msg = bot.send_message(m.chat.id, f"⛔ Некорректный ответ.\n\n❓ {prev_q}")
+        bot.register_next_step_handler(msg, q6, d, prev_q)
+        return
+    d["answers"].append(f"Гео: {m.text}")
+    
+    q_text = "Свободная форма. Напишите всё, что важно знать о вашем бизнесе для составления правильных ключевых слов. (Особенности, сезонность, нюансы):"
+    msg = bot.send_message(m.chat.id, f"❓ Вопрос 6/6 (Важно!):\n{q_text}")
     bot.register_next_step_handler(msg, finish_survey, d, q_text)
 
 def finish_survey(m, d, prev_q):
     if not validate_input(m.text, prev_q):
-        msg = bot.send_message(m.chat.id, f"⛔ Некорректный ответ.\n\n❓ {prev_q}")
+        msg = bot.send_message(m.chat.id, f"⛔ Это поле важно. Напишите хоть что-то осмысленное.\n\n❓ {prev_q}")
         bot.register_next_step_handler(msg, finish_survey, d, prev_q)
         return
-    d["answers"].append(f"Гео: {m.text}")
+    d["answers"].append(f"Доп. инфо: {m.text}")
     
     full_text = "\n".join(d["answers"])
     conn = get_db_connection(); cur = conn.cursor()
@@ -534,7 +548,7 @@ def generate_keywords_action(call):
     Контекст из опроса: {survey_text}
     База знаний: {kb_text}
     
-    ВАЖНО: Формат вывода должен быть СТРОГО таким (без лишних описаний и болтовни):
+    ВАЖНО: Формат вывода должен быть СТРОГО таким:
     
     **Высокая частотность:**
     - слово 1
@@ -542,13 +556,9 @@ def generate_keywords_action(call):
     
     **Средняя частотность:**
     - слово 3
-    - слово 4
     
     **Низкая частотность:**
     - слово 5
-    - слово 6
-    
-    Учти региональность из опроса.
     """
     
     keywords = get_gemini_response(prompt)
@@ -556,10 +566,8 @@ def generate_keywords_action(call):
     cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (keywords, pid))
     conn.commit(); cur.close(); conn.close()
     
-    # Отправляем сообщение
     send_long_message(call.message.chat.id, keywords, parse_mode='Markdown')
     
-    # Кнопки действия ПОСЛЕ ключей
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"approve_kw_{pid}"),
                types.InlineKeyboardButton("📥 Скачать (.txt)", callback_data=f"download_kw_{pid}"))
@@ -586,7 +594,6 @@ def download_keywords(call):
     file_data = io.BytesIO(res[0].encode('utf-8'))
     file_data.name = f"keywords_{pid}.txt"
     bot.send_document(call.message.chat.id, file_data, caption=f"Ключевые слова для {res[1]}")
-    # Возврат в меню после скачивания
     open_project_menu(call.message.chat.id, pid, mode="management")
 
 # СТРАТЕГИЯ
@@ -619,17 +626,19 @@ def cms_ask(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cms_set_"))
 def cms_instruction(call):
-    # Исправлена ошибка распаковки (ValueError)
     parts = call.data.split("_")
-    # parts: ['cms', 'set', 'PID', 'PLATFORM']
     pid = parts[2]
     platform = parts[3]
 
-    links = {"wp": "https://wordpress.org/documentation/article/application-passwords/", 
-             "tilda": "https://help-ru.tilda.cc/api", 
-             "bitrix": "https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=3533"}
+    instructions = {
+        "wp": "1. Зайдите в админку (/wp-admin)\n2. Пользователи -> Профиль\n3. Прокрутите вниз до 'Пароли приложений'\n4. Введите имя (напр. 'Bot') -> Добавить\n5. Скопируйте полученный пароль.",
+        "tilda": "1. Настройки сайта -> API\n2. Создать ключи (Public/Secret)",
+        "bitrix": "1. Профиль -> Пароли приложений"
+    }
     
-    msg = bot.send_message(call.message.chat.id, f"📚 Инструкция для {platform.upper()}:\n{links.get(platform)}\n\n👇 **Пришлите ключ доступа в ответном сообщении:**")
+    txt = instructions.get(platform, "Инструкция не найдена.")
+    
+    msg = bot.send_message(call.message.chat.id, f"📚 **Инструкция для {platform.upper()}:**\n\n{txt}\n\n👇 **Пришлите ключ доступа в ответном сообщении:**", parse_mode='Markdown')
     bot.register_next_step_handler(msg, save_cms_key, pid, platform)
 
 def save_cms_key(message, pid, platform):
@@ -762,20 +771,16 @@ def process_tariff_selection(call, name, price, code):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def pre_payment(call):
-    # buy_start_1m
     parts = call.data.split("_")
-    plan = parts[1] # start
-    period = parts[2] # 1m
+    plan = parts[1] 
+    period = parts[2]
     
     prices = {
         "start_1m": 1400, "pro_1m": 2500, "agent_1m": 7500,
         "start_1y": 11760, "pro_1y": 21000, "agent_1y": 62999
     }
     
-    # Красивые названия
-    names = {
-        "start": "СЕО Старт", "pro": "СЕО Профи", "agent": "PBN Агент"
-    }
+    names = {"start": "СЕО Старт", "pro": "СЕО Профи", "agent": "PBN Агент"}
     period_name = "Месяц" if period == "1m" else "Год"
     
     key = f"{plan}_{period}"
@@ -786,11 +791,9 @@ def pre_payment(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def process_payment(call):
-    # pay_rub_start_1m_1400
     parts = call.data.split("_")
     currency = parts[1]
     
-    # Собираем код плана обратно
     if parts[2] == "test":
         plan_code = "test"
         amount_idx = 3
@@ -798,8 +801,7 @@ def process_payment(call):
         plan_code = f"{parts[2]}_{parts[3]}"
         amount_idx = 4
         
-    try:
-        amount = int(parts[amount_idx])
+    try: amount = int(parts[amount_idx])
     except: amount = 500
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -828,24 +830,17 @@ def show_profile(uid):
 
 def show_admin_panel(uid):
     conn = get_db_connection(); cur = conn.cursor()
-    
-    # 1. Онлайн (активные за 15 мин)
     try:
         cur.execute("SELECT count(*) FROM users WHERE last_active > NOW() - INTERVAL '15 minutes'")
         online = cur.fetchone()[0]
     except: online = 0
     
-    # 2. Прибыль за месяц
     cur.execute("SELECT sum(amount) FROM payments WHERE currency='rub' AND created_at > date_trunc('month', CURRENT_DATE)")
     profit_rub = cur.fetchone()[0] or 0
     cur.execute("SELECT sum(amount) FROM payments WHERE currency='stars' AND created_at > date_trunc('month', CURRENT_DATE)")
     profit_stars = cur.fetchone()[0] or 0
-    
-    # 3. Статьи
     cur.execute("SELECT count(*) FROM articles WHERE status='published'")
     arts = cur.fetchone()[0]
-    
-    # 4. Тарифы
     cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name")
     tariffs_stat = cur.fetchall()
     tariff_txt = "\n".join([f"- {t[0]}: {t[1]}" for t in tariffs_stat])
@@ -857,7 +852,6 @@ def show_admin_panel(uid):
            f"💰 Прибыль (мес): {profit_rub}₽ | {profit_stars}⭐️\n"
            f"📄 Опубликовано статей: {arts}\n\n"
            f"📊 **Продажи тарифов:**\n{tariff_txt}")
-    
     bot.send_message(uid, txt)
 
 # --- 9. ЗАПУСК ---
