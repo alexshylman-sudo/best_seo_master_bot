@@ -502,11 +502,6 @@ def process_upload(message, pid):
     bot.reply_to(message, msg_text)
     open_project_menu(message.chat.id, pid, mode="management")
 
-# ЛОВУШКА
-@bot.message_handler(content_types=['document'])
-def handle_unexpected_docs(message):
-    bot.reply_to(message, "⚠️ Я вижу файл, но не знаю, к какому проекту его привязать.\nВыберите проект -> 'Загрузить файлы'.")
-
 # КЛЮЧИ И СТРАТЕГИЯ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kw_ask_count_"))
 def kw_ask_count(call):
@@ -813,7 +808,11 @@ def pre_payment(call):
     parts = call.data.split("_")
     plan, period = parts[1], parts[2]
     
-    prices = {"start_1m": 1400, "pro_1m": 2500, "agent_1m": 7500, "start_1y": 11760, "pro_1y": 21000, "agent_1y": 62999}
+    prices = {
+        "start_1m": 1400, "pro_1m": 2500, "agent_1m": 7500,
+        "start_1y": 11760, "pro_1y": 21000, "agent_1y": 62999
+    }
+    
     names = {"start": "СЕО Старт", "pro": "СЕО Профи", "agent": "PBN Агент"}
     period_name = "Месяц" if period == "1m" else "Год"
     
@@ -827,14 +826,20 @@ def pre_payment(call):
 def process_payment(call):
     parts = call.data.split("_")
     currency = parts[1]
-    if parts[2] == "test": plan_code, amount_idx = "test", 3
-    else: plan_code, amount_idx = f"{parts[2]}_{parts[3]}", 4
+    
+    if parts[2] == "test":
+        plan_code = "test"
+        amount_idx = 3
+    else:
+        plan_code = f"{parts[2]}_{parts[3]}"
+        amount_idx = 4
     try: amount = int(parts[amount_idx])
     except: amount = 500
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("INSERT INTO payments (user_id, amount, currency, tariff_name) VALUES (%s, %s, %s, %s)", 
                 (call.from_user.id, amount, currency, plan_code))
+    
     col = "total_paid_rub" if currency == "rub" else "total_paid_stars"
     gens_add = 5 if plan_code == 'test' else 15
     cur.execute(f"UPDATE users SET tariff=%s, gens_left=gens_left+%s, {col}={col}+%s WHERE user_id=%s", (plan_code, gens_add, amount, call.from_user.id))
