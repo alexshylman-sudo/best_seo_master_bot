@@ -1,104 +1,135 @@
 import os
 import logging
 import threading
-import time
-from flask import Flask
-from google import genai
 import telebot
-from telebot.types import Message
+import psycopg2
+from telebot import types
+from google import genai
+from flask import Flask
 from dotenv import load_dotenv
 
-# 1. Настройка окружения и логирования
+# 1. Настройки
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-# 2. Flask-сервер для Health Check на Render
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "SEO Master Bot is active!", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-# 3. Инициализация Telegram и Gemini
 bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
 client = genai.Client()
+DB_URL = os.getenv("DATABASE_URL") # Не забудьте добавить в Environment Variables на Render
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message: Message):
-    welcome_text = (
-        "✅ **Бот онлайн (Tier 1)!**\n\n"
-        "Я готов к SEO-анализу. Пришлите мне:\n"
-        "1. Текст для проверки.\n"
-        "2. Скриншот сайта для аудита.\n"
-        "3. Любой SEO-вопрос."
-    )
-    try:
-        bot.reply_to(message, welcome_text, parse_mode='Markdown')
-    except:
-        bot.reply_to(message, welcome_text.replace("**", ""))
+# Состояния для квеста (добавление площадки)
+user_states = {} 
 
-@bot.message_handler(content_types=['text', 'photo'])
-def handle_message(message: Message):
-    try:
-        system_prompt = (
-            "Ты — ведущий SEO-эксперт. Твои ответы должны быть практическими, "
-            "содержать конкретные рекомендации и быть оформлены в Markdown."
+# 2. База данных
+def get_db_connection():
+    return psycopg2.connect(DB_URL)
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            tier TEXT DEFAULT 'Тест',
+            balance INT DEFAULT 0
         )
-        content = [system_prompt]
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(user_id),
+            name TEXT,
+            url TEXT,
+            platform_type TEXT, -- 'Сайт' или 'Соцсеть'
+            keywords TEXT,
+            target_region TEXT
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
-        if message.photo:
-            file_info = bot.get_file(message.photo[-1].file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-            content.append({"mime_type": "image/jpeg", "data": downloaded_file})
-            content.append(message.caption or "Проведи SEO-аудит этого скриншота.")
-        else:
-            content.append(message.text)
+# 3. Навигация (ТЗ: Отсутствие тупиков)
+def get_main_menu():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📂 Мои площадки", callback_data="list_projects"),
+        types.InlineKeyboardButton("➕ Новая площадка", callback_data="add_step_1"),
+        types.InlineKeyboardButton("💎 Тарифы", callback_data="show_tiers"),
+        types.InlineKeyboardButton("📖 Инструкция", callback_data="help_data")
+    )
+    return markup
 
-        # Генерация контента
-        response = None
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash", 
-                    contents=content
-                )
-                break
-            except Exception as e:
-                if "429" in str(e):
-                    time.sleep(5)
-                else:
-                    raise e
-        
-        if response and response.text:
-            text = response.text
-            for i in range(0, len(text), 4000):
-                part = text[i:i+4000]
-                try:
-                    # Попытка отправить с форматированием
-                    bot.reply_to(message, part, parse_mode='Markdown')
-                except Exception as parse_error:
-                    # Резервный вариант: отправка без разметки при ошибке 400
-                    logger.warning(f"Ошибка Markdown: {parse_error}")
-                    bot.reply_to(message, part) 
-        else:
-            bot.reply_to(message, "⚠️ Не удалось получить ответ от модели.")
+def back_to_menu_button():
+    return types.InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")
 
-    except Exception as e:
-        logger.error(f"Ошибка обработки: {e}")
-        bot.reply_to(message, "❌ Произошла ошибка. Попробуйте еще раз.")
+# 4. Обработка команд
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    user_id = message.from_user.id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    bot.send_message(
+        message.chat.id, 
+        "🚀 **AI Content-Director 2026**\nДобро пожаловать в систему линейного управления SEO.",
+        reply_markup=get_main_menu(),
+        parse_mode='Markdown'
+    )
 
-# 4. Запуск
+# 5. Линейный квест: Добавление площадки (ТЗ п.2)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('add_step'))
+def start_add_project(call):
+    if call.data == "add_step_1":
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🌐 Сайт", callback_data="add_type_web"))
+        markup.add(types.InlineKeyboardButton("📱 Соцсеть", callback_data="add_type_social"))
+        markup.add(back_to_menu_button())
+        bot.edit_message_text("Шаг 1: Выберите тип площадки:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('add_type'))
+def process_type(call):
+    p_type = "Сайт" if "web" in call.data else "Соцсеть"
+    user_states[call.from_user.id] = {'type': p_type}
+    bot.edit_message_text(f"Шаг 2: Введите URL вашей площадки (например, https://mysite.com):", call.message.chat.id, call.message.message_id)
+
+@bot.message_handler(func=lambda m: m.from_user.id in user_states and 'url' not in user_states[m.from_user.id])
+def process_url(message):
+    url = message.text
+    # Простая валидация (ТЗ п.1)
+    if not url.startswith("http"):
+        bot.reply_to(message, "❌ Неверный формат ссылки. Ссылка должна начинаться с http... Попробуйте еще раз:")
+        return
+    
+    user_states[message.from_user.id]['url'] = url
+    bot.send_message(message.chat.id, "Шаг 3: Введите название проекта (для вашего удобства):")
+
+@bot.message_handler(func=lambda m: m.from_user.id in user_states and 'name' not in user_states[m.from_user.id])
+def process_name(message):
+    u_id = message.from_user.id
+    data = user_states[u_id]
+    
+    # Сохранение в БД
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO projects (user_id, name, url, platform_type) VALUES (%s, %s, %s, %s)",
+        (u_id, message.text, data['url'], data['type'])
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    del user_states[u_id]
+    bot.send_message(message.chat.id, f"✅ Проект '{message.text}' успешно добавлен!", reply_markup=get_main_menu())
+
+# 6. Flask (Health Check)
+app = Flask(__name__)
+@app.route('/')
+def home(): return "OK", 200
+
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    bot.remove_webhook()
-    logger.info("Бот запущен в режиме Infinity Polling...")
-    bot.infinity_polling(timeout=20, long_polling_timeout=10)
+    init_db()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    bot.infinity_polling()
