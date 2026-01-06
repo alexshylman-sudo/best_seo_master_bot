@@ -132,17 +132,8 @@ def init_db():
         ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE, tariff = 'GOD_MODE', gens_left = 9999
     """, (ADMIN_ID,))
     
-    # ВОССТАНОВЛЕНИЕ ПРОЕКТОВ АДМИНА (Неудаляемые)
-    admin_projects = ['https://designservice.group/', 'https://ecosteni.ru/']
-    for url in admin_projects:
-        cur.execute("SELECT id FROM projects WHERE url=%s", (url,))
-        if not cur.fetchone():
-            cur.execute("""
-                INSERT INTO projects (user_id, type, url, info, progress) 
-                VALUES (%s, 'site', %s, '{}', '{"info_done": false, "analysis_done": false, "upload_done": false}')
-            """, (ADMIN_ID, url))
-            print(f"✅ Проект админа восстановлен: {url}")
-
+    # --- УБРАНО АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ САЙТОВ АДМИНА ---
+    
     conn.commit(); cur.close(); conn.close()
     patch_db_schema()
 
@@ -409,18 +400,21 @@ def open_proj_mgmt(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_proj_confirm_"))
 def delete_project_confirm(call):
     pid = call.data.split("_")[3]
-    # Защита админских проектов
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT url FROM projects WHERE id=%s", (pid,))
-    url = cur.fetchone()[0]
-    if url in ['https://designservice.group/', 'https://ecosteni.ru/']:
-        bot.answer_callback_query(call.id, "⛔ Этот проект защищен от удаления!")
-        cur.close(); conn.close()
-        return
-
-    cur.execute("DELETE FROM projects WHERE id = %s", (pid,))
-    conn.commit(); cur.close(); conn.close()
-    bot.answer_callback_query(call.id, "🗑 Проект удален.")
+    cur = None
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM projects WHERE id = %s", (pid,))
+        conn.commit()
+        bot.answer_callback_query(call.id, "🗑 Проект удален.")
+    except Exception as e:
+        print(f"Delete Error: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка удаления")
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+    
     list_projects(call.from_user.id, call.message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delkw_"))
