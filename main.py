@@ -55,7 +55,7 @@ def patch_db_schema():
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_login TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_password TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_url TEXT")
-        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_key TEXT") # Добавлено по ТЗ
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_key TEXT")
         
         conn.commit()
         print("✅ Схема БД обновлена (patching complete).")
@@ -551,13 +551,11 @@ def upload_files(call):
 @bot.message_handler(content_types=['document', 'text', 'photo'])
 def global_file_handler(message):
     # --- 1. ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА КНОПОК МЕНЮ ---
-    # Исправление: если нажата кнопка меню, передаем управление в menu_handler,
-    # вместо того чтобы блокировать выполнение.
     if message.text and message.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
         menu_handler(message)
         return
 
-    # 2. Игнорируем команды (они обрабатываются своими декораторами)
+    # 2. Игнорируем команды
     if message.text and message.text.startswith("/"):
         return
 
@@ -567,7 +565,7 @@ def global_file_handler(message):
     # ЛОГИКА ВОССТАНОВЛЕНИЯ КОНТЕКСТА
     if not pid:
         conn = get_db_connection(); cur = conn.cursor()
-        # Ищем последний активный проект (по дате создания или последнему обновлению)
+        # Ищем последний активный проект
         cur.execute("SELECT id, url FROM projects WHERE user_id = %s ORDER BY id DESC LIMIT 1", (uid,))
         res = cur.fetchone()
         cur.close(); conn.close()
@@ -592,10 +590,11 @@ def global_file_handler(message):
             file_info = bot.get_file(message.document.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             
+            # Попытка декодирования (UTF-8 затем Windows-1251)
             try:
                 content = downloaded_file.decode('utf-8')
             except UnicodeDecodeError:
-                content = downloaded_file.decode('cp1251') # Для файлов созданных в Windows
+                content = downloaded_file.decode('cp1251') 
             
             filename = message.document.file_name or ""
             is_txt = filename.lower().endswith('.txt')
@@ -947,8 +946,7 @@ def approve_publish(call):
     
     url, login, pwd = res[0], res[1], res[2]
     
-    # Форматирование для WP (переносы строк в <br>)
-    # Gemini 2.0 обычно хорошо ставит <p>, но для надежности:
+    # Форматирование для WP
     formatted_content = content.replace("\n", "<br>")
     
     if url.endswith('/'): url = url[:-1]
@@ -959,9 +957,13 @@ def approve_publish(call):
     try:
         creds = f"{login}:{pwd}"
         token = base64.b64encode(creds.encode()).decode()
+        
+        # --- ИСПРАВЛЕНИЕ: ОБХОД ЗАЩИТЫ BEGET ---
         headers = {
             'Authorization': 'Basic ' + token,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Cookie': 'beget=begetok'
         }
         
         post_data = {
@@ -970,8 +972,14 @@ def approve_publish(call):
             'status': 'publish'
         }
         
-        r = requests.post(api_url, headers=headers, json=post_data)
+        r = requests.post(api_url, headers=headers, json=post_data, timeout=20)
         
+        # Если снова вернул 200, но это HTML (ошибка защиты)
+        if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
+             bot.delete_message(call.message.chat.id, msg.message_id)
+             bot.send_message(call.message.chat.id, "❌ Хостинг продолжает блокировать бота даже с куками. Тут программно уже сложно обойти, нужна настройка хостинга (отключить 'Заглушку для ботов').")
+             return
+
         if r.status_code == 201:
             link = r.json().get('link')
             conn = get_db_connection(); cur = conn.cursor()
@@ -982,11 +990,21 @@ def approve_publish(call):
             bot.send_message(call.message.chat.id, f"✅ **Успешно опубликовано!**\n🔗 {link}", parse_mode='Markdown')
         else:
             bot.delete_message(call.message.chat.id, msg.message_id)
-            err_text = f"❌ Ошибка WP ({r.status_code}): {r.text[:200]}"
+            # Пытаемся достать текст ошибки из JSON
+            try:
+                err_json = r.json()
+                err_msg = err_json.get('message', r.text[:200])
+                err_code = err_json.get('code', r.status_code)
+            except:
+                err_msg = r.text[:200]
+                err_code = r.status_code
+
+            err_text = f"❌ Ошибка WP ({err_code}): {err_msg}"
             if r.status_code == 401: err_text += "\n\nПроверьте Логин и Пароль приложения!"
             bot.send_message(call.message.chat.id, err_text)
             
     except Exception as e:
+        bot.delete_message(call.message.chat.id, msg.message_id)
         bot.send_message(call.message.chat.id, f"❌ Ошибка соединения: {e}")
 
 # --- 7. ТАРИФЫ ---
