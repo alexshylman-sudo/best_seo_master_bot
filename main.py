@@ -9,7 +9,7 @@ import datetime
 import io
 import re
 import base64
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 from telebot import TeleBot, types
 from flask import Flask
 from google import genai
@@ -899,7 +899,6 @@ def propose_articles(chat_id, pid):
     competitors = info_json.get("competitors", "")
     kw = proj[2] or "Общие"
     
-    # NEW: Strict Keyword Optimization Prompt
     prompt = f"""
     You are a Senior SEO Specialist and Yoast SEO Expert.
     
@@ -923,7 +922,6 @@ def propose_articles(chat_id, pid):
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         topics = json.loads(clean_json)
         if not isinstance(topics, list): topics = ["Error in topic format"]
-        # Ensure we have at least some topics
         if len(topics) < 2: topics = ["SEO Topic 1", "SEO Topic 2", "SEO Topic 3", "SEO Topic 4", "SEO Topic 5"]
     except: 
         topics = ["Error generating topics"]
@@ -957,13 +955,11 @@ def write_article(call):
     topics = info.get("temp_topics", [])
     selected_topic = topics[idx] if len(topics) > idx else "SEO Article"
     
-    # Determine main keyword (simple heuristic: first 3 words of title or first kw)
     main_keyword = selected_topic.split(':')[0] if ':' in selected_topic else selected_topic
     
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью (~2500 слов) с учетом Yoast SEO...", parse_mode='Markdown')
     
-    # NEW: SUPER STRICT YOAST PROMPT
     prompt = f"""
     You are a Senior SEO Copywriter. Write a blog post for the topic: "{selected_topic}".
     
@@ -1033,17 +1029,7 @@ def rewrite_once(call):
         cur.close(); conn.close(); return
         
     bot.edit_message_text("🔄 Переписываю...", call.message.chat.id, call.message.message_id)
-    
-    # REWRITE PROMPT WITH STRICT RULES
-    prompt = f"""
-    Rewrite the article: "{res[1]}".
-    Maintain strictly HTML format (h2, p, etc).
-    Ensure:
-    1. Short sentences (<20 words).
-    2. Active voice.
-    3. Plenty of transition words.
-    Return ONLY the HTML content.
-    """
+    prompt = f"Rewrite the article: "{res[1]}". Maintain strictly HTML format. Ensure short sentences and active voice. Return ONLY the HTML content."
     text = get_gemini_response(prompt)
     
     cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (text, aid))
