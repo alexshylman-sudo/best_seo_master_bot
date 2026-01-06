@@ -138,6 +138,11 @@ def update_last_active(user_id):
     except: pass
 
 # --- 3. УТИЛИТЫ ---
+def escape_md(text):
+    """Экранирует спецсимволы Markdown V2"""
+    if not text: return ""
+    return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+
 def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     if not text: return
     parts = []
@@ -200,8 +205,7 @@ def deep_analyze_site(url):
                 link_text = a_tag.get_text().strip()
                 if link_text and len(link_text) > 3: 
                     internal_links.append({"url": full_url, "anchor": link_text})
-        unique_links = {v['url']: v for v in internal_links}.values()
-        top_links = list(unique_links)[:100] 
+        unique_links = list({v['url']: v for v in internal_links}.values())[:100]
         analysis_text = f"URL: {url}\nTitle: {title}\nDesc: {desc}\nHeaders: {headers}\nContent Sample: {raw_text}"
         return analysis_text, top_links
     except Exception as e:
@@ -233,10 +237,6 @@ def format_html_for_chat(html_content):
     clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
     clean_text = clean_text.strip('",}').strip()
     return clean_text
-
-def escape_md(text):
-    if not text: return ""
-    return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
@@ -415,6 +415,7 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
                 markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
             else:
                 markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
+                
     else:
         if is_fully_configured:
             markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
@@ -684,13 +685,25 @@ def strategy_start(call):
     markup.add(*btns)
     bot.send_message(call.message.chat.id, "📅 Сколько статей в неделю?", reply_markup=markup)
 
-# --- НОВАЯ ЛОГИКА КАЛЕНДАРЯ ---
+# --- НОВАЯ ЛОГИКА КАЛЕНДАРЯ (ОБНОВЛЕНО) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("freq_"))
 def save_freq_and_plan(call):
     _, pid, freq = call.data.split("_")
     freq = int(freq)
     
-    bot.edit_message_text(f"📅 Составляю календарь на {freq} статей...", call.message.chat.id, call.message.message_id)
+    # 1. Расчет оставшихся дней недели
+    days_map = {0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"}
+    today_idx = datetime.datetime.today().weekday()
+    remaining_days = [days_map[i] for i in range(today_idx + 1, 7)] # Дни с завтрашнего
+    
+    # Если дней осталось меньше чем запрошено статей, планируем на оставшиеся
+    actual_count = min(freq, len(remaining_days)) if remaining_days else 0
+    
+    if actual_count == 0:
+        bot.send_message(call.message.chat.id, f"📅 Эта неделя заканчивается. План на {freq} статей будет создан в следующий понедельник.\nСейчас вы можете написать **Тестовую статью**.")
+        return
+
+    bot.edit_message_text(f"📅 Генерирую план на остаток недели ({actual_count} статей)...", call.message.chat.id, call.message.message_id)
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
@@ -699,20 +712,18 @@ def save_freq_and_plan(call):
     survey = info_json.get("survey", "")
     kw = res[1] or ""
     
+    # Промпт для генерации
+    days_str = ", ".join(remaining_days[:actual_count])
     prompt = f"""
-    Роль: SEO Стратег.
-    Задача: Составь контент-план на неделю для {freq} статей.
-    Контекст: {survey}. Ключи: {kw[:1000]}
+    Роль: SEO Маркетолог.
+    Задача: Составь контент-план только на эти дни: {days_str}.
+    Всего статей: {actual_count}.
+    Ниша: {survey}. Ключи: {kw[:1000]}
     
-    ВАЖНОЕ ТРЕБОВАНИЕ К ФОРМАТУ:
-    Верни ТОЛЬКО JSON массив объектов.
-    Дни должны идти строго по порядку: Понедельник, Вторник, Среда, Четверг, Пятница, Суббота, Воскресенье.
-    Если статей меньше 7, распредели их равномерно по неделе.
-    
-    Пример JSON:
+    Верни ТОЛЬКО JSON массив объектов (без Markdown, без ```json):
     [
-      {{"day": "Понедельник", "time": "10:00", "topic": "Тема статьи 1"}},
-      {{"day": "Среда", "time": "15:00", "topic": "Тема статьи 2"}}
+      {{"day": "Четверг", "time": "10:00", "topic": "Тема 1"}},
+      {{"day": "Пятница", "time": "15:00", "topic": "Тема 2"}}
     ]
     """
     ai_resp = get_gemini_response(prompt)
@@ -722,19 +733,18 @@ def save_freq_and_plan(call):
         clean_json = ai_resp.replace("```json", "").replace("```", "").strip()
         calendar_plan = json.loads(clean_json)
     except:
-        calendar_plan = [{"day": "Понедельник", "time": "10:00", "topic": "Ошибка генерации, попробуйте снова"}]
+        calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации"}]
 
     # Сохраняем план
     info_json["temp_plan"] = calendar_plan
     cur.execute("UPDATE projects SET frequency=%s, info=%s WHERE id=%s", (freq, json.dumps(info_json), pid))
     conn.commit(); cur.close(); conn.close()
     
-    # Формируем красивое сообщение
-    msg_text = "🗓 **Ваш календарь:**\n\n"
+    # Сообщение
+    msg_text = "🗓 **План на остаток недели:**\n\n"
     for item in calendar_plan:
-        msg_text += f"**{item['day']} {item['time']}** - {item['topic']}\n\n"
+        msg_text += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
     
-    # Кнопки
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
     
@@ -745,7 +755,6 @@ def save_freq_and_plan(call):
         d_name = item.get('day', 'День')
         short = short_days.get(d_name, d_name[:2])
         repl_btns.append(types.InlineKeyboardButton(f"🔄 {short}", callback_data=f"repl_topic_{pid}_{i}"))
-    
     markup.add(*repl_btns)
     
     bot.send_message(call.message.chat.id, msg_text, reply_markup=markup, parse_mode='Markdown')
@@ -754,8 +763,7 @@ def save_freq_and_plan(call):
 def replace_topic(call):
     _, _, pid, idx = call.data.split("_")
     idx = int(idx)
-    
-    bot.answer_callback_query(call.id, "Генерирую новую тему...")
+    bot.answer_callback_query(call.id, "🔄 Меняю тему...")
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
@@ -774,10 +782,9 @@ def replace_topic(call):
     
     cur.close(); conn.close()
     
-    # Перерисовка сообщения
-    msg_text = "🗓 **Обновленный календарь:**\n\n"
+    msg_text = "🗓 **Обновленный план:**\n\n"
     for item in plan:
-        msg_text += f"**{item['day']} {item['time']}** - {item['topic']}\n\n"
+        msg_text += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
         
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
@@ -800,22 +807,20 @@ def approve_plan(call):
     info = cur.fetchone()[0]
     plan = info.get("temp_plan", [])
     
-    # Сохраняем в content_plan (чистовой)
     cur.execute("UPDATE projects SET content_plan=%s WHERE id=%s", (json.dumps(plan), pid))
     conn.commit(); cur.close(); conn.close()
     
-    bot.edit_message_text(f"✅ План утвержден! На эту неделю запланировано {len(plan)} статей.\nКак только статья будет опубликована, я пришлю уведомление.", 
+    bot.edit_message_text(f"✅ План утвержден! На эту неделю запланировано {len(plan)} статей.\n\nКак только статья будет опубликована, я пришлю уведомление.", 
                           call.message.chat.id, call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
     # Генерация 1 статьи сразу
-    write_article_handler(call) # Используем существующую функцию
+    write_article_handler(call) 
 
-# --- НАПИСАНИЕ СТАТЬИ ---
+# --- НАПИСАНИЕ СТАТЬИ (ИСПРАВЛЕНО) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
-    # Если это test_article, формат другой
     is_test = "test_article" in call.data
     pid = call.data.split("_")[2]
     idx = 0 
@@ -829,21 +834,20 @@ def write_article_handler(call):
     internal_links = info.get('internal_links', [])
     links_text = json.dumps(internal_links[:50], ensure_ascii=False)
     
-    # Если тест - берем тему из плана или генерим
-    topic_text = "Тестовая статья про ремонт"
+    topic_text = "Тестовая SEO статья"
     if is_test:
         plan = info.get("content_plan", [])
         if plan: topic_text = plan[0]['topic']
-        else: topic_text = f"Обзор трендов: {keywords.split(',')[0] if keywords else 'Ремонт'}"
+        else: topic_text = f"Тренды: {keywords.split(',')[0] if keywords else 'Ремонт'}"
     else:
-        # Для ручного выбора (старый метод)
+        # Для ручного выбора
         topics = info.get("temp_topics", [])
         if topics: topic_text = topics[idx]
 
     main_keyword = topic_text.split(':')[0]
     
     if is_test:
-        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: {topic_text}...", parse_mode='Markdown')
+        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: {escape_md(topic_text)}...", parse_mode='Markdown')
     else:
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, f"⏳ Пишу статью...", parse_mode='Markdown')
@@ -893,7 +897,11 @@ def write_article_handler(call):
     conn.commit(); cur.close(); conn.close()
     
     clean_view = format_html_for_chat(article_html)
-    send_safe_message(call.message.chat.id, clean_view)
+    # Используем HTML для предпросмотра, чтобы избежать Markdown ошибок
+    try:
+        send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
+    except:
+        send_safe_message(call.message.chat.id, clean_view, parse_mode=None)
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"),
@@ -967,7 +975,8 @@ def approve_publish(call):
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
-            bot.send_message(call.message.chat.id, f"✅ **Успешно опубликовано!**\n🔗 {link}\n\nВозврат в главное меню...", parse_mode='Markdown')
+            # Используем безопасное форматирование без Markdown, чтобы не ломать ссылку
+            bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n{link}\n\nВозврат в главное меню...")
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
             bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code}")
@@ -977,7 +986,10 @@ def approve_publish(call):
 
 # ЗАПУСК
 def run_scheduler():
-    while True: time.sleep(60)
+    # Ежедневно в 10 утра (пример) бот должен проверять план
+    while True: 
+        # Тут будет логика проверки content_plan и авто-постинга
+        time.sleep(60)
 
 app = Flask(__name__)
 @app.route('/')
