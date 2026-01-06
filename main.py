@@ -132,8 +132,6 @@ def init_db():
         ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE, tariff = 'GOD_MODE', gens_left = 9999
     """, (ADMIN_ID,))
     
-    # --- УБРАНО АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ САЙТОВ АДМИНА ---
-    
     conn.commit(); cur.close(); conn.close()
     patch_db_schema()
 
@@ -334,6 +332,7 @@ def check_url_step(message):
     
     USER_CONTEXT[message.from_user.id] = pid
     bot.delete_message(message.chat.id, msg_check.message_id)
+    # Запускаем онбординг (пошаговый режим)
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
 def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
@@ -349,39 +348,57 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     
-    # 1. Стратегия
-    if has_keywords:
-        markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-
-    # Кнопки Onboarding vs Management
-    btn_info = types.InlineKeyboardButton("📝 Добавить информацию (Опрос)", callback_data=f"srv_{pid}")
-    btn_anal = types.InlineKeyboardButton("📊 Анализ сайта (Глубокий)", callback_data=f"anz_{pid}")
-    btn_upl = types.InlineKeyboardButton("📂 Загрузить файлы", callback_data=f"upf_{pid}")
+    # --- ЛОГИКА ОТОБРАЖЕНИЯ КНОПОК ---
     
     if mode == "onboarding":
-        # Исчезают после выполнения
-        if not progress.get("info_done"): markup.add(btn_info)
-        if not progress.get("analysis_done"): markup.add(btn_anal)
-        # Файлы можно грузить всегда в онбординге, если еще не загружены
-        if not progress.get("upload_done"): markup.add(btn_upl)
-    else:
-        # Management: Всегда доступны
-        markup.add(btn_info, btn_anal, btn_upl)
-
-    # Ключевые слова
-    kw_text = "🔑 Подобрать ключевые слова"
-    if has_keywords:
-        markup.add(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"))
-    elif progress.get("info_done"):
-        # Ключи доступны только если пройден опрос
-        markup.add(types.InlineKeyboardButton(kw_text, callback_data=f"kw_ask_count_{pid}"))
+        # СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ ДЛЯ НОВОГО ПРОЕКТА
+        if not progress.get("analysis_done"):
+            # Шаг 1: Анализ
+            markup.add(types.InlineKeyboardButton("📊 Анализ сайта (Глубокий)", callback_data=f"anz_{pid}"))
+            
+        elif not progress.get("info_done"):
+            # Шаг 2: Опрос
+            markup.add(types.InlineKeyboardButton("📝 Добавить информацию (Опрос)", callback_data=f"srv_{pid}"))
+            
+        elif not progress.get("upload_done"):
+            # Шаг 3: Файлы (с возможностью пропуска)
+            markup.add(types.InlineKeyboardButton("📂 Загрузить файлы", callback_data=f"upf_{pid}"))
+            markup.add(types.InlineKeyboardButton("➡️ Пропустить / Далее", callback_data=f"skip_upl_{pid}"))
+            
+        else:
+            # Шаг 4: Ключи (и далее стратегия)
+            if not has_keywords:
+                markup.add(types.InlineKeyboardButton("🔑 Создать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
+            else:
+                markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
+                markup.add(types.InlineKeyboardButton("⚙️ Настройки сайта (CMS)", callback_data=f"cms_select_{pid}"))
     
-    markup.add(types.InlineKeyboardButton("⚙️ Настройки сайта (CMS)", callback_data=f"cms_select_{pid}"))
-    markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"delete_proj_confirm_{pid}"))
-    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
+    else:
+        # РЕЖИМ УПРАВЛЕНИЯ ("Мои проекты") - ВСЕ КНОПКИ
+        if has_keywords:
+            markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
+
+        # Основные инструменты
+        markup.add(types.InlineKeyboardButton("📝 Добавить информацию (Опрос)", callback_data=f"srv_{pid}"))
+        markup.add(types.InlineKeyboardButton("📊 Анализ сайта (Глубокий)", callback_data=f"anz_{pid}"))
+        markup.add(types.InlineKeyboardButton("📂 Загрузить файлы", callback_data=f"upf_{pid}"))
+    
+        # Ключи
+        if has_keywords:
+            markup.add(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"))
+        elif progress.get("info_done"):
+            markup.add(types.InlineKeyboardButton("🔑 Создать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
+        
+        # Настройки и удаление
+        markup.add(types.InlineKeyboardButton("⚙️ Настройки сайта (CMS)", callback_data=f"cms_select_{pid}"))
+        markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}")) # Изменен коллбек на запрос подтверждения
+
+    if mode == "management" or has_keywords:
+        markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
 
     safe_url = url
     text = f"✅ Сайт {safe_url} успешно добавлен!" if new_site_url else f"📂 **Проект:** {safe_url}"
+    if mode == "onboarding": text += "\n⬇️ Следующий шаг:"
     
     try:
         if msg_id and not new_site_url:
@@ -396,6 +413,28 @@ def open_proj_mgmt(call):
     pid = call.data.split("_")[3]
     USER_CONTEXT[call.from_user.id] = pid
     open_project_menu(call.message.chat.id, pid, mode="management", msg_id=call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("skip_upl_"))
+def skip_upload_step(call):
+    pid = call.data.split("_")[2]
+    update_project_progress(pid, "upload_done")
+    # Возвращаемся в меню (режим онбординга продолжится, но шаг сменится)
+    open_project_menu(call.message.chat.id, pid, mode="onboarding", msg_id=call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ask_del_"))
+def ask_delete_project(call):
+    pid = call.data.split("_")[2]
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✅ ДА, Удалить", callback_data=f"delete_proj_confirm_{pid}"))
+    markup.add(types.InlineKeyboardButton("❌ НЕТ, Отмена", callback_data=f"open_proj_mgmt_{pid}"))
+    
+    bot.edit_message_text(
+        "⚠️ **Вы точно хотите удалить проект?**\n\nВаши статьи, созданные ранее, **останутся** на вашем сайте. Бот просто забудет этот проект.", 
+        call.message.chat.id, 
+        call.message.message_id, 
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_proj_confirm_"))
 def delete_project_confirm(call):
@@ -493,9 +532,9 @@ def finish_survey(m, d, prev_q):
     
     update_project_progress(d["pid"], "info_done")
     
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔑 Подобрать ключевые слова", callback_data=f"kw_ask_count_{d['pid']}"))
-    bot.send_message(m.chat.id, "✅ Опрос пройден! Данные сохранены.", reply_markup=markup)
+    # После завершения опроса, открываем меню (там теперь покажется следующий шаг)
+    bot.send_message(m.chat.id, "✅ Опрос пройден! Данные сохранены.")
+    open_project_menu(m.chat.id, d['pid'], mode="onboarding")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("anz_"))
 def deep_analysis(call):
@@ -533,7 +572,8 @@ def deep_analysis(call):
     update_project_progress(pid, "analysis_done")
     bot.delete_message(call.message.chat.id, msg.message_id)
     send_safe_message(call.message.chat.id, f"📊 **Результат анализа:**\n\n{advice}")
-    open_project_menu(call.message.chat.id, pid, mode="management")
+    # Возврат в меню (покажет следующий шаг)
+    open_project_menu(call.message.chat.id, pid, mode="onboarding")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("upf_"))
 def upload_files(call):
@@ -629,7 +669,8 @@ def global_file_handler(message):
 
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, msg_text)
-    open_project_menu(message.chat.id, pid, mode="management")
+    # Возврат в меню (покажет следующий шаг, если был этап загрузки)
+    open_project_menu(message.chat.id, pid, mode="onboarding")
 
 # --- КЛЮЧИ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kw_ask_count_"))
