@@ -180,10 +180,6 @@ def check_site_availability(url):
     except: return False
 
 def deep_analyze_site(url):
-    """
-    Анализирует контент И собирает внутренние ссылки для перелинковки.
-    Возвращает (текст_анализа, список_ссылок_json)
-    """
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 Bot"})
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -465,20 +461,47 @@ def add_competitors_start(call):
     bot.register_next_step_handler(msg, save_competitors, pid)
 
 def save_competitors(message, pid):
-    if message.text in ["➕ Новый проект", "📂 Мои проекты", "🔙 В меню"]: return
-    
-    links = message.text.strip()
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
-    info = cur.fetchone()[0] or {}
-    info["competitors"] = links
-    
-    cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
-    conn.commit(); cur.close(); conn.close()
-    
-    update_project_progress(pid, "competitors_done")
-    bot.send_message(message.chat.id, "✅ Конкуренты сохранены!")
-    open_project_menu(message.chat.id, pid, mode="onboarding")
+    # 1. ПРОВЕРКА: Если юзер нажал кнопку меню - выходим
+    if message.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
+        menu_handler(message) # Передаем управление в главное меню
+        return
+
+    # 2. ПРОВЕРКА: Если прислали не текст
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "⚠️ Пожалуйста, пришлите ссылку текстом.")
+        bot.register_next_step_handler(msg, save_competitors, pid)
+        return
+
+    # 3. ОСНОВНАЯ ЛОГИКА
+    try:
+        links = message.text.strip()
+        conn = get_db_connection()
+        if not conn:
+            bot.send_message(message.chat.id, "❌ Ошибка БД.")
+            return
+            
+        cur = conn.cursor()
+        cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
+        res = cur.fetchone()
+        
+        if not res:
+            bot.send_message(message.chat.id, "❌ Проект не найден.")
+            cur.close(); conn.close()
+            return
+            
+        info = res[0] or {}
+        info["competitors"] = links
+        
+        # ensure_ascii=False важно для сохранения кириллицы
+        cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info, ensure_ascii=False), pid))
+        conn.commit(); cur.close(); conn.close()
+        
+        update_project_progress(pid, "competitors_done")
+        bot.send_message(message.chat.id, "✅ Конкуренты сохранены!")
+        
+        open_project_menu(message.chat.id, pid, mode="onboarding")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Произошла ошибка: {e}")
 
 
 # --- 7. ОПРОСНИК (5 вопросов) ---
@@ -660,6 +683,7 @@ def global_file_handler(message):
 
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, msg_text)
+    # Возврат в меню (покажет следующий шаг, если был этап загрузки)
     open_project_menu(message.chat.id, pid, mode="onboarding")
 
 # --- КЛЮЧИ ---
