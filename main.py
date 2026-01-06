@@ -184,29 +184,24 @@ def deep_analyze_site(url):
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 Bot"})
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # 1. Основной контент
         title = soup.title.string if soup.title else "No Title"
         desc = soup.find("meta", attrs={"name": "description"})
         desc = desc["content"] if desc else "No Description"
         headers = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
         raw_text = soup.get_text()[:5000].strip()
         
-        # 2. Сбор внутренних ссылок (Sitemap)
         internal_links = []
         domain = urlparse(url).netloc
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
-            # Приводим к полному URL
             full_url = urljoin(url, href)
             parsed_href = urlparse(full_url)
             
-            # Проверяем, что это ссылка на тот же домен и не мусор
             if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.pdf', '.css', '.js']):
                 link_text = a_tag.get_text().strip()
-                if link_text and len(link_text) > 3: # Игнорируем пустые ссылки или иконки
+                if link_text and len(link_text) > 3: 
                     internal_links.append({"url": full_url, "anchor": link_text})
         
-        # Ограничиваем кол-во ссылок, чтобы не забить базу
         unique_links = {v['url']: v for v in internal_links}.values()
         top_links = list(unique_links)[:100] 
         
@@ -461,18 +456,15 @@ def add_competitors_start(call):
     bot.register_next_step_handler(msg, save_competitors, pid)
 
 def save_competitors(message, pid):
-    # 1. ПРОВЕРКА: Если юзер нажал кнопку меню - выходим
     if message.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
-        menu_handler(message) # Передаем управление в главное меню
+        menu_handler(message)
         return
 
-    # 2. ПРОВЕРКА: Если прислали не текст
     if not message.text:
         msg = bot.send_message(message.chat.id, "⚠️ Пожалуйста, пришлите ссылку текстом.")
         bot.register_next_step_handler(msg, save_competitors, pid)
         return
 
-    # 3. ОСНОВНАЯ ЛОГИКА
     try:
         links = message.text.strip()
         conn = get_db_connection()
@@ -492,13 +484,11 @@ def save_competitors(message, pid):
         info = res[0] or {}
         info["competitors"] = links
         
-        # ensure_ascii=False важно для сохранения кириллицы
         cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info, ensure_ascii=False), pid))
         conn.commit(); cur.close(); conn.close()
         
         update_project_progress(pid, "competitors_done")
         bot.send_message(message.chat.id, "✅ Конкуренты сохранены!")
-        
         open_project_menu(message.chat.id, pid, mode="onboarding")
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Произошла ошибка: {e}")
@@ -510,7 +500,6 @@ def start_survey_6q(call):
     pid = call.data.split("_")[1]
     USER_CONTEXT[call.from_user.id] = pid
     
-    # Очищаем
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET info = '{}', keywords = NULL WHERE id = %s", (pid,))
     conn.commit(); cur.close(); conn.close()
@@ -575,10 +564,8 @@ def deep_analysis(call):
     cur.execute("SELECT url FROM projects WHERE id=%s", (pid,))
     url = cur.fetchone()[0]
     
-    # NEW: Анализ с парсингом ссылок
     raw_data, links = deep_analyze_site(url)
     
-    # Сохраняем ссылки для перелинковки
     cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
     info = cur.fetchone()[0] or {}
     info['internal_links'] = links
@@ -683,7 +670,6 @@ def global_file_handler(message):
 
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, msg_text)
-    # Возврат в меню (покажет следующий шаг, если был этап загрузки)
     open_project_menu(message.chat.id, pid, mode="onboarding")
 
 # --- КЛЮЧИ ---
@@ -712,7 +698,6 @@ def generate_keywords_action(call):
     competitors = info_json.get("competitors", "Не указаны")
     kb = str(res[0])[:3000] 
     
-    # NEW: Промпт для кластеризации
     prompt = f"""
     Роль: SEO Эксперт.
     Задача: Составь Семантическое Ядро (СЯ) из {count} ключевых слов для сайта {res[1]}.
@@ -748,8 +733,10 @@ def generate_keywords_action(call):
 def approve_keywords(call):
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🚀 ⭐️ СТРАТЕГИЯ И СТАТЬИ ⭐️", callback_data=f"strat_{pid}"))
-    bot.send_message(call.message.chat.id, "✅ Ключи утверждены! Переходим к стратегии.", reply_markup=markup)
+    # NEW: Добавлена кнопка настройки сайта
+    markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
+    markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
+    bot.send_message(call.message.chat.id, "✅ Ключи утверждены! Рекомендую сразу настроить подключение к сайту.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("download_kw_"))
 def download_keywords(call):
@@ -776,6 +763,22 @@ def cms_select_start(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cms_setup_wp_"))
 def cms_setup_wp(call):
     pid = call.data.split("_")[3]
+    # NEW: Инструкция перед вводом
+    instructions = (
+        "🔐 **Как подключить WordPress:**\n\n"
+        "1. Зайдите в админку сайта (`/wp-admin`).\n"
+        "2. Перейдите в **Пользователи** -> **Профиль**.\n"
+        "3. Прокрутите вниз до раздела **Пароли приложений**.\n"
+        "4. Придумайте имя (например `Bot`) и нажмите **Добавить**.\n"
+        "5. Скопируйте полученный длинный код."
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Дальше ➡️", callback_data=f"cms_input_url_{pid}"))
+    bot.send_message(call.message.chat.id, instructions, parse_mode='Markdown', reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cms_input_url_"))
+def cms_ask_url(call):
+    pid = call.data.split("_")[3]
     msg = bot.send_message(call.message.chat.id, 
                            "1️⃣ Введите **URL админки**\nПример: `https://mysite.com` (без /wp-admin)", 
                            parse_mode='Markdown')
@@ -793,7 +796,7 @@ def cms_save_login(message, pid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET cms_login=%s WHERE id=%s", (message.text.strip(), pid))
     conn.commit(); cur.close(); conn.close()
-    msg = bot.send_message(message.chat.id, "3️⃣ Введите **Пароль приложения** (Application Password).")
+    msg = bot.send_message(message.chat.id, "3️⃣ Введите **Пароль приложения** (Который вы скопировали).")
     bot.register_next_step_handler(msg, cms_save_pass, pid)
 
 def cms_save_pass(message, pid):
@@ -875,32 +878,23 @@ def propose_articles(chat_id, pid):
     competitors = info_json.get("competitors", "")
     kw = proj[2] or "Общие"
     
+    # NEW: Исправленный промпт для 5 тем (JSON список)
     prompt = f"""
     Роль: SEO Стратег. 
     Контекст: {survey}
     Ключи: {kw[:1000]}
     
-    Задача: Придумай 5 вирусных SEO тем для блога, используя Высокочастотные (ВЧ) ключи.
-    ФОРМАТ ВЫВОДА (Строго):
-    1. **Заголовок**
-    Краткое описание...
-    |
-    2. **Заголовок**
-    ...
+    Задача: Придумай ровно 5 вирусных SEO тем для блога, используя Высокочастотные (ВЧ) ключи.
+    ВЕРНИ ТОЛЬКО JSON СПИСОК СТРОК.
+    Пример: ["Тема 1", "Тема 2", "Тема 3", "Тема 4", "Тема 5"]
     """
     
+    topics = []
     try:
         raw_text = get_gemini_response(prompt)
-        topics_raw = raw_text.split("|")
-        topics = []
-        for t in topics_raw:
-            clean = t.replace("*", "").strip()
-            lines = clean.split("\n")
-            header = lines[0]
-            if header and header[0].isdigit(): 
-                header = header.split(".", 1)[-1].strip()
-            if len(header) > 3: topics.append(header)
-        topics = topics[:5]
+        clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+        topics = json.loads(clean_json)
+        if not isinstance(topics, list): topics = ["Ошибка формата тем"]
     except: 
         topics = ["Ошибка генерации тем"]
 
@@ -926,9 +920,8 @@ def write_article(call):
     res = cur.fetchone()
     info, keywords = res[0], res[1] or ""
     
-    # NEW: Достаем внутренние ссылки
     internal_links = info.get('internal_links', [])
-    links_text = json.dumps(internal_links[:50], ensure_ascii=False) # Берем топ 50
+    links_text = json.dumps(internal_links[:50], ensure_ascii=False)
     
     topics = info.get("temp_topics", [])
     selected_topic = topics[idx] if len(topics) > idx else "SEO Article"
@@ -936,7 +929,6 @@ def write_article(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью (~2500 слов) с учетом Yoast SEO...", parse_mode='Markdown')
     
-    # NEW: Мощный промпт с перелинковкой и Yoast правилами
     prompt = f"""
     Роль: SEO-копирайтер уровня Pro.
     Тема: "{selected_topic}".
@@ -981,7 +973,11 @@ def write_article(call):
     aid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
-    send_safe_message(call.message.chat.id, article_html, parse_mode='HTML')
+    # NEW: Чистый текст для чата (удаляем теги)
+    soup_chat = BeautifulSoup(article_html, "html.parser")
+    clean_text_for_chat = soup_chat.get_text(separator="\n\n")
+    
+    send_safe_message(call.message.chat.id, clean_text_for_chat)
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"),
@@ -1006,7 +1002,11 @@ def rewrite_once(call):
     cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (text, aid))
     conn.commit(); cur.close(); conn.close()
     
-    send_safe_message(call.message.chat.id, text, parse_mode='HTML')
+    # Clean text for chat
+    soup_chat = BeautifulSoup(text, "html.parser")
+    clean_text = soup_chat.get_text(separator="\n\n")
+    
+    send_safe_message(call.message.chat.id, clean_text)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"))
     bot.send_message(call.message.chat.id, "👇 Обновленная версия.", reply_markup=markup)
@@ -1043,6 +1043,7 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
+        # NEW: Метаданные для Yoast в поле meta
         meta_payload = {
             '_yoast_wpseo_title': seo_data.get('seo_title', title),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
