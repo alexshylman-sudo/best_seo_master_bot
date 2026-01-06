@@ -579,13 +579,28 @@ def global_file_handler(message):
     if message.content_type == 'text': 
         content = message.text
     elif message.content_type == 'document':
+        # --- ФИКС ЗАВИСАНИЯ ТУТ ---
+        # 1. Показываем юзеру, что процесс идет
+        msg_loading = bot.send_message(message.chat.id, "⏳ Читаю и анализирую файл...", parse_mode='Markdown')
         try:
             file_info = bot.get_file(message.document.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
-            content = downloaded_file.decode('utf-8')
-            is_txt = message.document.file_name.endswith('.txt')
-        except: 
-            bot.reply_to(message, "⚠️ Не удалось прочитать файл. Нужен UTF-8 .txt")
+            
+            # 2. Улучшенная работа с кодировкой (UTF-8 и Windows-1251)
+            try:
+                content = downloaded_file.decode('utf-8')
+            except UnicodeDecodeError:
+                content = downloaded_file.decode('cp1251') # Для файлов созданных в Windows
+            
+            # Безопасная проверка имени файла
+            filename = message.document.file_name or ""
+            is_txt = filename.lower().endswith('.txt')
+            
+            # Удаляем сообщение о загрузке
+            bot.delete_message(message.chat.id, msg_loading.message_id)
+        except Exception as e: 
+            bot.delete_message(message.chat.id, msg_loading.message_id)
+            bot.reply_to(message, f"⚠️ Ошибка чтения файла: {e}\nУбедитесь, что это текстовый файл (.txt).")
             return
 
     if not content: return
@@ -594,19 +609,26 @@ def global_file_handler(message):
     
     # AI Логика: Это ключи или просто текст?
     if is_txt or len(content) > 10:
-        check = get_gemini_response(f"Проанализируй текст: '{content[:500]}...'. Это похоже на список ключевых слов (SEO keys)? Ответь ТОЛЬКО 'ДА' или 'НЕТ'.")
-        
-        if "ДА" in check.upper():
-            cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (content, pid))
-            msg_text = "✅ Файл распознан как Ключевые слова! Доступ к стратегии открыт."
-            update_project_progress(pid, "upload_done")
-        else:
-            cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
-            kb = cur.fetchone()[0] or []
-            kb.append(f"File/Text Upload: {content[:2000]}...")
-            cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
-            msg_text = "✅ Информация сохранена в Базу Знаний проекта."
-            update_project_progress(pid, "upload_done")
+        # Уведомляем, если Gemini задумается
+        msg_ai = bot.send_message(message.chat.id, "🧠 AI анализирует контент...")
+        try:
+            check = get_gemini_response(f"Проанализируй текст: '{content[:500]}...'. Это похоже на список ключевых слов (SEO keys)? Ответь ТОЛЬКО 'ДА' или 'НЕТ'.")
+            bot.delete_message(message.chat.id, msg_ai.message_id)
+            
+            if "ДА" in check.upper():
+                cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (content, pid))
+                msg_text = "✅ Файл распознан как Ключевые слова! Доступ к стратегии открыт."
+                update_project_progress(pid, "upload_done")
+            else:
+                cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
+                kb = cur.fetchone()[0] or []
+                kb.append(f"File/Text Upload: {content[:2000]}...")
+                cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
+                msg_text = "✅ Информация сохранена в Базу Знаний проекта."
+                update_project_progress(pid, "upload_done")
+        except:
+            bot.delete_message(message.chat.id, msg_ai.message_id)
+            msg_text = "⚠️ Ошибка AI анализа."
     else: 
         msg_text = "⚠️ Слишком короткое сообщение для анализа."
 
