@@ -139,7 +139,6 @@ def update_last_active(user_id):
 
 # --- 3. УТИЛИТЫ ---
 def escape_md(text):
-    """Экранирует спецсимволы Markdown V2"""
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
 
@@ -240,6 +239,7 @@ def format_html_for_chat(html_content):
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
+    # 1. Google (Nano Banana / Imagen)
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -248,10 +248,12 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-    except Exception as e:
-        print(f"Google img fail: {e}")
+    except Exception:
+        pass # Тихо падаем на фоллбек
 
+    # 2. Flux Fallback (с задержкой во избежание лимитов)
     if not image_bytes:
+        time.sleep(1.5) # Пауза чтобы не ловить Rate Limit
         try:
             seed = random.randint(1, 99999)
             safe_prompt = quote(image_prompt)
@@ -259,11 +261,12 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             img_resp = requests.get(image_url, timeout=30)
             if img_resp.status_code == 200:
                 image_bytes = img_resp.content
-        except Exception as e:
-            print(f"Flux fail: {e}")
+        except Exception:
+            pass
 
     if not image_bytes: return None, None
 
+    # 3. Upload WP
     try:
         if api_url.endswith('/'): api_url = api_url[:-1]
         seed = random.randint(1, 99999)
@@ -674,16 +677,52 @@ def perform_analysis(call):
 def strategy_start(call):
     pid = call.data.split("_")[1]
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT cms_login FROM projects WHERE id=%s", (pid,))
-    if not cur.fetchone()[0]:
-        cur.close(); conn.close()
+    
+    # 1. Проверяем CMS
+    cur.execute("SELECT cms_login, content_plan FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    cur.close(); conn.close()
+    
+    if not res[0]: # cms_login is None
         bot.send_message(call.message.chat.id, "⚠️ Настройте CMS в настройках проекта!")
         return
-    cur.close(); conn.close()
+    
+    plan = res[1]
+    # 2. Если план уже есть - показываем его
+    if plan and len(plan) > 0:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Показать текущий план", callback_data=f"show_plan_{pid}"))
+        markup.add(types.InlineKeyboardButton("🗑 Удалить и создать новый", callback_data=f"reset_plan_{pid}"))
+        bot.send_message(call.message.chat.id, "📅 У вас уже утвержден план на эту неделю.", reply_markup=markup)
+        return
+
+    # 3. Если плана нет - выбираем частоту
     markup = types.InlineKeyboardMarkup(row_width=4)
     btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
     markup.add(*btns)
     bot.send_message(call.message.chat.id, "📅 Сколько статей в неделю?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("show_plan_"))
+def show_current_plan(call):
+    pid = call.data.split("_")[2]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT content_plan FROM projects WHERE id=%s", (pid,))
+    plan = cur.fetchone()[0] or []
+    cur.close(); conn.close()
+    
+    msg = "🗓 **Ваш текущий план:**\n\n"
+    for item in plan:
+        msg += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
+    
+    bot.send_message(call.message.chat.id, msg, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reset_plan_"))
+def reset_plan(call):
+    pid = call.data.split("_")[2]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
+    conn.commit(); cur.close(); conn.close()
+    strategy_start(call) # Возврат к выбору частоты
 
 # --- НОВАЯ ЛОГИКА КАЛЕНДАРЯ (ОБНОВЛЕНО) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("freq_"))
@@ -766,13 +805,19 @@ def replace_topic(call):
     bot.answer_callback_query(call.id, "🔄 Меняю тему...")
     
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
-    info = cur.fetchone()[0]
+    cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    info = res[0]
+    keywords = res[1] or ""
     plan = info.get("temp_plan", [])
     
     if idx < len(plan):
         old_topic = plan[idx]['topic']
-        prompt = f"Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. Верни только тему текстом."
+        prompt = f"""
+        Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. 
+        Контекст: {keywords[:500]}
+        Верни только тему текстом.
+        """
         new_topic = get_gemini_response(prompt).strip().replace('"', '')
         plan[idx]['topic'] = new_topic
         
@@ -847,7 +892,8 @@ def write_article_handler(call):
     main_keyword = topic_text.split(':')[0]
     
     if is_test:
-        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: {escape_md(topic_text)}...", parse_mode='Markdown')
+        # Используем HTML, так как Markdown падает на спецсимволах
+        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: <b>{topic_text}</b>...", parse_mode='HTML')
     else:
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, f"⏳ Пишу статью...", parse_mode='Markdown')
@@ -865,6 +911,7 @@ def write_article_handler(call):
        - **IMAGES**: You MUST insert 5-7 image placeholders evenly distributed.
        - Format: `[IMG: specific detailed prompt for image generation in English]`
        - Use HTML tags like `<ul>`, `<ol>`, `<h2>`.
+       - DO NOT use CSS styles like 'float: left'. Use simple paragraph structure.
     2. **SEO**: 
        - Insert 3 internal links from: {links_text}
        - Short paragraphs.
@@ -932,9 +979,8 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
-            align = "left" if i % 2 == 0 else "right"
-            margin = "margin-right: 20px;" if align == "left" else "margin-left: 20px;"
-            img_html = f'<div class="wp-block-image" style="float: {align}; {margin} margin-bottom: 20px; max-width: 50%;"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}" /></div>'
+            # Используем стандартный WP класс без float для безопасности
+            img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
             final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
@@ -975,7 +1021,7 @@ def approve_publish(call):
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
-            # Используем безопасное форматирование без Markdown, чтобы не ломать ссылку
+            # Используем безопасное форматирование без Markdown
             bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n{link}\n\nВозврат в главное меню...")
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
@@ -986,10 +1032,7 @@ def approve_publish(call):
 
 # ЗАПУСК
 def run_scheduler():
-    # Ежедневно в 10 утра (пример) бот должен проверять план
-    while True: 
-        # Тут будет логика проверки content_plan и авто-постинга
-        time.sleep(60)
+    while True: time.sleep(60)
 
 app = Flask(__name__)
 @app.route('/')
