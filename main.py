@@ -225,32 +225,23 @@ def update_project_progress(pid, step_key):
 
 def format_html_for_chat(html_content):
     """Очищает HTML и JSON мусор для красивого вывода в чат"""
-    # 1. Заменяем литералы \n на реальные переносы
-    text = html_content.replace('\\n', '\n')
+    text = str(html_content).replace('\\n', '\n')
     
-    # 2. Убираем всё, что похоже на JSON в конце (если вдруг прилипло)
-    # Ищем закрывающую фигурную скобку и всё что после неё, если это похоже на мусор
-    if "}" in text and ("seo_title" in text or "focus_kw" in text):
-        text = text.split('"seo_title"')[0].rsplit(',', 1)[0] # Грубая обрезка JSON хвоста
-        text = text.strip().rstrip('}')
-
-    # 3. Форматирование HTML тегов для Telegram
+    if '", "seo_title":' in text:
+        text = text.split('", "seo_title":')[0]
+    if '","seo_title":' in text:
+        text = text.split('","seo_title":')[0]
+    
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
     
-    # Удаляем лишние теги
     soup = BeautifulSoup(text, "html.parser")
-    # Удаляем скрипты и стили
     for script in soup(["script", "style", "head", "title", "meta"]):
         script.decompose()
     
     clean_text = soup.get_text(separator="\n\n")
-    
-    # Финальная чистка от множественных переносов
     clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
-    
-    # Убираем кавычки JSON если остались по краям
-    clean_text = clean_text.strip('",')
+    clean_text = clean_text.strip('",}').strip()
     
     return clean_text
 
@@ -908,14 +899,22 @@ def propose_articles(chat_id, pid):
     competitors = info_json.get("competitors", "")
     kw = proj[2] or "Общие"
     
+    # NEW: Strict Keyword Optimization Prompt
     prompt = f"""
-    Роль: SEO Стратег. 
-    Контекст: {survey}
-    Ключи: {kw[:1000]}
+    You are a Senior SEO Specialist and Yoast SEO Expert.
     
-    Задача: Придумай ровно 5 вирусных SEO тем для блога, используя Высокочастотные (ВЧ) ключи.
-    ВЕРНИ ТОЛЬКО JSON СПИСОК СТРОК.
-    Пример: ["Тема 1", "Тема 2", "Тема 3", "Тема 4", "Тема 5"]
+    Goal: Create 5 viral, high-ranking blog post titles optimized for the following context and keywords.
+    
+    Context: {survey}
+    Keywords: {kw[:1000]}
+    
+    MANDATORY RULES:
+    1. Focus on High-Volume Keywords from the provided list.
+    2. Titles must be catchy but SEO-friendly (under 60 characters preferred).
+    3. Return EXACTLY 5 titles as a JSON list of strings.
+    
+    Example Output:
+    ["Title 1", "Title 2", "Title 3", "Title 4", "Title 5"]
     """
     
     topics = []
@@ -923,10 +922,11 @@ def propose_articles(chat_id, pid):
         raw_text = get_gemini_response(prompt)
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         topics = json.loads(clean_json)
-        if not isinstance(topics, list): topics = ["Ошибка формата тем"]
-        if len(topics) < 2: topics = ["Тема 1", "Тема 2", "Тема 3", "Тема 4", "Тема 5"] # Fallback
+        if not isinstance(topics, list): topics = ["Error in topic format"]
+        # Ensure we have at least some topics
+        if len(topics) < 2: topics = ["SEO Topic 1", "SEO Topic 2", "SEO Topic 3", "SEO Topic 4", "SEO Topic 5"]
     except: 
-        topics = ["Ошибка генерации тем"]
+        topics = ["Error generating topics"]
 
     info_json["temp_topics"] = topics
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info_json), pid))
@@ -957,30 +957,39 @@ def write_article(call):
     topics = info.get("temp_topics", [])
     selected_topic = topics[idx] if len(topics) > idx else "SEO Article"
     
+    # Determine main keyword (simple heuristic: first 3 words of title or first kw)
+    main_keyword = selected_topic.split(':')[0] if ':' in selected_topic else selected_topic
+    
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью (~2500 слов) с учетом Yoast SEO...", parse_mode='Markdown')
     
+    # NEW: SUPER STRICT YOAST PROMPT
     prompt = f"""
-    Роль: SEO-копирайтер уровня Pro.
-    Тема: "{selected_topic}".
-    Ключи (Приоритет ВЧ): {keywords[:1000]}...
+    You are a Senior SEO Copywriter. Write a blog post for the topic: "{selected_topic}".
     
-    ВНУТРЕННИЕ ССЫЛКИ САЙТА (Для перелинковки):
-    {links_text}
+    CONTEXT & DATA:
+    - Focus Keyword: "{main_keyword}" (Optimize STRICTLY for this).
+    - Secondary Keywords: {keywords[:500]}...
+    - Internal Links to use: {links_text}
     
-    ИНСТРУКЦИЯ (YOAST SEO GREEN LIGHT):
-    1. Напиши статью на 2000+ слов. Используй только HTML теги (h2, h3, p, ul, li).
-    2. Ключевая фраза должна быть в первом абзаце и в одном из H2.
-    3. Предложения короткие (макс 20 слов). Пассивный залог < 10%.
-    4. ОБЯЗАТЕЛЬНО: Вставь 3-5 ссылок из списка "Внутренние ссылки" в текст контекстно. (Тег <a href="...">анкор</a>).
-    5. Структура: Введение, 4-6 разделов H2 (внутри H3), Заключение.
+    MANDATORY YOAST SEO CHECKLIST (Follow or FAIL):
+    1. **Focus Keyphrase**: Must appear in the Introduction (first paragraph), the exact match in SEO Title, and at least one H2 subheading.
+    2. **Density**: Use the exact focus keyword 4-6 times throughout the text.
+    3. **Internal Links**: You MUST contextually insert at least 3 hyperlinks from the provided list. Format: <a href="url">anchor</a>.
+    4. **Outbound Links**: You MUST include 2 links to authoritative external sites (like Wikipedia, gov sites, manufacturer specs) relevant to the topic.
+    5. **Readability**: 
+       - Paragraphs max 150 words.
+       - Sentences max 20 words. 
+       - Use transition words (However, Therefore, In addition) in >30% of sentences.
+       - Passive voice <10%.
+    6. **Structure**: Intro -> H2 -> H3 -> H2 -> H3 -> Conclusion. Total 2000+ words.
     
-    ФОРМАТ ОТВЕТА (JSON):
+    OUTPUT FORMAT (Strict JSON):
     {{
-        "html_content": "Полный HTML код статьи...",
-        "seo_title": "Заголовок для сниппета (ключ в начале)",
-        "meta_desc": "Мета-описание (с призывом к действию)",
-        "focus_kw": "Главное ключевое слово"
+        "html_content": "Full article HTML content (h2, h3, p, ul, li). NO <html>, <head>, or <body> tags.",
+        "seo_title": "SEO Title (Start with Focus Keyword, max 60 chars)",
+        "meta_desc": "Meta Description (Include Focus Keyword, max 155 chars)",
+        "focus_kw": "{main_keyword}"
     }}
     """
     response_text = get_gemini_response(prompt)
@@ -996,7 +1005,7 @@ def write_article(call):
         }
     except:
         article_html = response_text
-        seo_data = {"seo_title": selected_topic, "meta_desc": "", "focus_kw": ""}
+        seo_data = {"seo_title": selected_topic, "meta_desc": "", "focus_kw": main_keyword}
 
     cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
     cur.execute("INSERT INTO articles (project_id, title, content, seo_data, status) VALUES (%s, %s, %s, %s, 'draft') RETURNING id", 
@@ -1024,7 +1033,17 @@ def rewrite_once(call):
         cur.close(); conn.close(); return
         
     bot.edit_message_text("🔄 Переписываю...", call.message.chat.id, call.message.message_id)
-    prompt = f"Перепиши статью '{res[1]}' в другом стиле, сохраняя HTML теги. Верни только HTML контент."
+    
+    # REWRITE PROMPT WITH STRICT RULES
+    prompt = f"""
+    Rewrite the article: "{res[1]}".
+    Maintain strictly HTML format (h2, p, etc).
+    Ensure:
+    1. Short sentences (<20 words).
+    2. Active voice.
+    3. Plenty of transition words.
+    Return ONLY the HTML content.
+    """
     text = get_gemini_response(prompt)
     
     cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (text, aid))
@@ -1044,7 +1063,6 @@ def approve_publish(call):
     row = cur.fetchone()
     pid, title, content, seo_json = row
     
-    # Декодируем JSON если это строка, иначе берем как есть (psycopg2 авто-декод)
     seo_data = seo_json
     if isinstance(seo_json, str):
         try: seo_data = json.loads(seo_json)
@@ -1056,6 +1074,10 @@ def approve_publish(call):
     res = cur.fetchone()
     cur.close(); conn.close()
     
+    if not res:
+        bot.send_message(call.message.chat.id, "❌ Ошибка: Проект не найден.")
+        return
+
     url, login, pwd = res[0], res[1], res[2]
     formatted_content = content.replace("\n", "<br>")
     
@@ -1075,7 +1097,6 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
-        # Meta payload для Yoast (ключи которые обычно работают через REST)
         meta_payload = {
             '_yoast_wpseo_title': seo_data.get('seo_title', ''),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
