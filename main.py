@@ -181,33 +181,55 @@ def validate_input(text, question_context):
 
 def check_site_availability(url):
     try:
-        response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        # Улучшенные заголовки
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        }
+        response = requests.get(url, timeout=10, headers=headers, verify=False)
         return response.status_code == 200
     except: return False
 
 def deep_analyze_site(url):
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 Bot"})
+        # Притворяемся браузером
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+        }
+        resp = requests.get(url, timeout=15, headers=headers, verify=False)
+        
+        # Исправляем кодировку (для кириллицы)
+        if resp.encoding is None or resp.encoding == 'ISO-8859-1':
+            resp.encoding = resp.apparent_encoding
+            
         soup = BeautifulSoup(resp.text, 'html.parser')
+        
         title = soup.title.string if soup.title else "No Title"
         desc = soup.find("meta", attrs={"name": "description"})
         desc = desc["content"] if desc else "No Description"
-        headers = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
-        raw_text = soup.get_text()[:5000].strip()
+        
+        # Собираем текст более умно (p, div, span)
+        for script in soup(["script", "style"]): script.decompose()
+        raw_text = soup.get_text(separator=' ', strip=True)[:6000]
+        
+        headers_list = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
+        
+        # Ссылки
         internal_links = []
         domain = urlparse(url).netloc
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
             full_url = urljoin(url, href)
             parsed_href = urlparse(full_url)
-            if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.pdf', '.css', '.js']):
+            if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.css', '.js']):
                 link_text = a_tag.get_text().strip()
                 if link_text and len(link_text) > 3: 
                     internal_links.append({"url": full_url, "anchor": link_text})
-        unique_links = {v['url']: v for v in internal_links}.values()
-        top_links = list(unique_links)[:100] 
-        analysis_text = f"URL: {url}\nTitle: {title}\nDesc: {desc}\nHeaders: {headers}\nContent Sample: {raw_text}"
-        return analysis_text, top_links
+        
+        unique_links = list({v['url']: v for v in internal_links}.values())[:100]
+        
+        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nHeaders: {headers_list}\nContent: {raw_text}", unique_links
     except Exception as e:
         return f"Ошибка доступа к сайту: {e}", []
 
@@ -244,7 +266,7 @@ def format_html_for_chat(html_content):
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
-    # 1. Google Imagen
+    # 1. Google
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -257,7 +279,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     except Exception as e:
         print(f"Google img fail: {e}")
 
-    # 2. Flux Fallback
+    # 2. Flux
     if not image_bytes:
         try:
             seed = random.randint(1, 99999)
@@ -272,7 +294,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
 
     if not image_bytes: return None, None
 
-    # 3. WP Upload
+    # 3. Upload WP
     try:
         if api_url.endswith('/'): api_url = api_url[:-1]
         seed = random.randint(1, 99999)
@@ -363,7 +385,6 @@ def list_projects(user_id, chat_id):
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
     for p in projs:
-        # Убираем http для красоты кнопки
         btn_text = p[1].replace("https://", "").replace("http://", "").replace("www.", "")[:30]
         markup.add(types.InlineKeyboardButton(f"🌐 {btn_text}", callback_data=f"open_proj_mgmt_{p[0]}"))
     bot.send_message(chat_id, "Ваши проекты:", reply_markup=markup)
@@ -467,7 +488,7 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-# --- ФУНКЦИИ ПРОФИЛЯ, ТАРИФОВ И ДР (ВЕРНУЛ) ---
+# --- ВЕРНУЛ ФУНКЦИИ ПРОФИЛЯ ---
 def show_profile(uid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT tariff, gens_left, balance, joined_at, total_paid_rub FROM users WHERE user_id=%s", (uid,))
@@ -477,7 +498,6 @@ def show_profile(uid):
     cur.execute("SELECT count(*) FROM articles WHERE status='published' AND project_id IN (SELECT id FROM projects WHERE user_id=%s)", (uid,))
     arts = cur.fetchone()[0]
     cur.close(); conn.close()
-    
     safe_tariff = escape_md(u[0])
     txt = (f"👤 **Профиль**\nID: `{uid}`\n"
            f"📅 Дата регистрации: {u[3].strftime('%Y-%m-%d')}\n"
@@ -505,6 +525,18 @@ def show_tariff_periods(user_id):
     markup.add(types.InlineKeyboardButton("📅 На Месяц", callback_data="period_month"))
     markup.add(types.InlineKeyboardButton("📆 На Год (Выгодно)", callback_data="period_year"))
     bot.send_message(user_id, txt, reply_markup=markup, parse_mode='Markdown')
+
+def show_admin_panel(uid):
+    conn = get_db_connection(); cur = conn.cursor()
+    try: cur.execute("SELECT count(*) FROM users WHERE last_active > NOW() - INTERVAL '15 minutes'")
+    except: pass
+    online = cur.fetchone()[0] if cur.description else 0
+    cur.execute("SELECT sum(amount) FROM payments WHERE currency='rub'")
+    rub = cur.fetchone()[0] or 0
+    cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name")
+    tariffs = "\n".join([f"{r[0]}: {r[1]} шт." for r in cur.fetchall()])
+    cur.close(); conn.close()
+    bot.send_message(uid, f"⚙️ **АДМИНКА**\n\n🟢 Онлайн (15 мин): {online}\n💰 Прибыль: {rub}₽\n📊 Продажи:\n{tariffs}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("period_"))
 def tariff_period_select(call):
@@ -538,8 +570,8 @@ def process_tariff_selection(call, name, price, code):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def pre_payment(call):
     parts = call.data.split("_")
-    tariff_code = parts[1]
-    period = parts[2]
+    tariff_code = parts[1] # start, pro, agent
+    period = parts[2] # 1m, 1y
     price = 0
     name = ""
     if tariff_code == "start":
@@ -571,18 +603,6 @@ def process_payment(call):
     conn.commit(); cur.close(); conn.close()
     bot.send_message(call.message.chat.id, f"✅ Оплата {amount} {currency} прошла успешно! Начислено {gens} генераций.")
 
-def show_admin_panel(uid):
-    conn = get_db_connection(); cur = conn.cursor()
-    try: cur.execute("SELECT count(*) FROM users WHERE last_active > NOW() - INTERVAL '15 minutes'")
-    except: pass
-    online = cur.fetchone()[0] if cur.description else 0
-    cur.execute("SELECT sum(amount) FROM payments WHERE currency='rub'")
-    rub = cur.fetchone()[0] or 0
-    cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name")
-    tariffs = "\n".join([f"{r[0]}: {r[1]} шт." for r in cur.fetchall()])
-    cur.close(); conn.close()
-    bot.send_message(uid, f"⚙️ **АДМИНКА**\n\n🟢 Онлайн (15 мин): {online}\n💰 Прибыль: {rub}₽\n📊 Продажи:\n{tariffs}")
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ask_del_"))
 def ask_del(call):
     pid = call.data.split("_")[2]
@@ -605,14 +625,7 @@ def back_main(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, "Главное меню", reply_markup=main_menu_markup(call.from_user.id))
 
-# --- ПРОДОЛЖЕНИЕ ЛОГИКИ (КОНКУРЕНТЫ, АНАЛИЗ, СТАТЬИ) ---
-# ... (Код анализа конкурентов, генерации статей и прочего остался таким же, как я присылал ранее)
-# ... Вставьте сюда функции comp_start, analyze_competitor_step, comp_finish
-# ... select_analysis_type, perform_analysis, strategy_start, save_freq_and_plan
-# ... write_article, approve_publish и т.д. из предыдущего рабочего кода.
-#
-# ЧТОБЫ ВАМ НЕ КОПИРОВАТЬ ЧАСТЯМИ, Я ДУБЛИРУЮ ИХ НИЖЕ ДЛЯ ПОЛНОТЫ:
-
+# --- 6. КОНКУРЕНТЫ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_start_"))
 def comp_start(call):
     pid = call.data.split("_")[2]
@@ -627,9 +640,25 @@ def analyze_competitor_step(message, pid):
         bot.send_message(message.chat.id, "❌ Нужна ссылка с http.")
         return
     msg = bot.send_message(message.chat.id, "🕵️‍♂️ Анализирую конкурента...")
+    
+    # 1. Скрапинг текста
+    scraped_data, _ = deep_analyze_site(url)
+    
+    # 2. Анализ через Gemini
     try:
-        prompt = f"Проанализируй сайт конкурента {url}. Выдели 5 лучших ключей и дай 1 предложение мнения."
+        prompt = f"""
+        Проанализируй сайт конкурента: {url}.
+        Текст сайта: {scraped_data[:4000]}
+        
+        ЗАДАЧА:
+        1. Оценка сайта (1-10) и краткое мнение (1-2 предложения, просто и по делу).
+        2. Оптимизация: Хорошо/Плохо? (понятным языком).
+        3. Инфо о продукте: Достаточно?
+        4. Ключевые слова: Выпиши 5 лучших SEO-ключей, которые они используют (БЕЗ названий городов/гео).
+        """
         ai_resp = get_gemini_response(prompt)
+        
+        # Сохранение
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
         info = cur.fetchone()[0] or {}
@@ -638,14 +667,16 @@ def analyze_competitor_step(message, pid):
         info["competitors_list"] = clist
         cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info, ensure_ascii=False), pid))
         conn.commit(); cur.close(); conn.close()
+        
         bot.delete_message(message.chat.id, msg.message_id)
-        send_safe_message(message.chat.id, f"✅ **Анализ:**\n{ai_resp}")
+        send_safe_message(message.chat.id, f"✅ **Анализ конкурента:**\n\n{ai_resp}")
+        
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("➕ Добавить еще", callback_data=f"comp_start_{pid}"))
         markup.add(types.InlineKeyboardButton("➡️ Готово, дальше", callback_data=f"comp_finish_{pid}"))
         bot.send_message(message.chat.id, "Добавить еще конкурента?", reply_markup=markup)
-    except:
-        bot.send_message(message.chat.id, "Ошибка анализа.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Ошибка анализа: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_finish_"))
 def comp_finish(call):
@@ -653,6 +684,7 @@ def comp_finish(call):
     update_project_progress(pid, "competitors_done")
     open_project_menu(call.message.chat.id, pid, mode="onboarding", msg_id=call.message.message_id)
 
+# --- 7. АНАЛИЗ САЙТА (3 ТИПА) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sel_anz_"))
 def select_analysis_type(call):
     pid = call.data.split("_")[2]
@@ -671,12 +703,15 @@ def perform_analysis(call):
     cur.execute("SELECT url FROM projects WHERE id=%s", (pid,))
     url = cur.fetchone()[0]
     raw_data, links = deep_analyze_site(url)
-    prompt = f"Проведи {type_} SEO анализ сайта {url} на основе данных:\n{raw_data}\nЯзык: Русский."
+    
+    prompt = f"Проведи {type_} SEO анализ сайта {url} на основе данных:\n{raw_data}\nЯзык: Русский. Дай конкретные рекомендации."
     advice = get_gemini_response(prompt)
+    
     send_safe_message(call.message.chat.id, f"📊 **Отчет ({type_}):**\n\n{advice}")
     update_project_progress(pid, "analysis_done")
     open_project_menu(call.message.chat.id, pid, mode="onboarding")
 
+# --- СТРАТЕГИЯ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
 def strategy_start(call):
     pid = call.data.split("_")[1]
@@ -705,6 +740,7 @@ def save_freq_and_plan(call):
     prompt = f"""
     Роль: SEO Маркетолог.
     Задача: Составь контент-план на неделю ({freq} статей).
+    Учти сезонность, время дня.
     Ниша: {survey}. Ключи: {kw[:500]}
     Выведи текстом расписание.
     А в конце дай JSON список из 5 тем: ["T1", "T2", "T3", "T4", "T5"]
@@ -730,6 +766,7 @@ def save_freq_and_plan(call):
         markup.add(types.InlineKeyboardButton(f"Вариант {i+1}", callback_data=f"write_{pid}_topic_{i}"))
     bot.send_message(call.message.chat.id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
+# --- НАПИСАНИЕ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article(call):
     parts = call.data.split("_")
@@ -759,7 +796,8 @@ def write_article(call):
        - Use HTML tags like `<ul>`, `<ol>`, `<h2>`.
     2. **SEO**: 
        - Insert 3 internal links from: {links_text}
-       - Short paragraphs.
+       - Outbound links: 2 authoritative links.
+       - Active voice, short sentences.
     OUTPUT JSON:
     {{
         "html_content": "Full HTML content with [IMG:...] tags.",
@@ -862,6 +900,102 @@ def approve_publish(call):
             bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code}")
     except Exception as e:
         bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
+
+# ОСТАЛЬНЫЕ ХЕНДЛЕРЫ
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kw_ask_count_"))
+def kw_ask_count(call):
+    pid = call.data.split("_")[3]
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(types.InlineKeyboardButton("10", callback_data=f"genkw_{pid}_10"),
+               types.InlineKeyboardButton("50", callback_data=f"genkw_{pid}_50"))
+    bot.edit_message_text("🔢 Сколько ключей?", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("genkw_"))
+def generate_keywords_action(call):
+    _, pid, count = call.data.split("_")
+    bot.edit_message_text(f"🧠 Генерирую ключи...", call.message.chat.id, call.message.message_id)
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
+    info = cur.fetchone()[0] or {}
+    survey = info.get("survey", "")
+    comps = json.dumps(info.get("competitors_list", []), ensure_ascii=False)
+    prompt = f"Составь СЯ из {count} ключей. Контекст: {survey}. Конкуренты: {comps}. Формат: Кластеры."
+    keywords = get_gemini_response(prompt)
+    cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (keywords, pid))
+    conn.commit(); cur.close(); conn.close()
+    send_safe_message(call.message.chat.id, keywords)
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"approve_kw_{pid}"))
+    bot.send_message(call.message.chat.id, "Действия:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_kw_"))
+def approve_keywords(call):
+    pid = call.data.split("_")[2]
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
+    bot.send_message(call.message.chat.id, "✅ Ключи утверждены!", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cms_select_"))
+def cms_select_start(call):
+    pid = call.data.split("_")[2]
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("WordPress", callback_data=f"cms_setup_wp_{pid}"))
+    bot.send_message(call.message.chat.id, "CMS:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cms_setup_wp_"))
+def cms_setup_wp(call):
+    pid = call.data.split("_")[3]
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Дальше ➡️", callback_data=f"cms_input_url_{pid}"))
+    bot.send_message(call.message.chat.id, "Инструкция: создайте пароль приложения в WP.", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cms_input_url_"))
+def cms_ask_url(call):
+    pid = call.data.split("_")[3]
+    msg = bot.send_message(call.message.chat.id, "1️⃣ URL сайта:")
+    bot.register_next_step_handler(msg, cms_save_url, pid)
+
+def cms_save_url(message, pid):
+    url = message.text.strip().rstrip("/")
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET cms_url=%s WHERE id=%s", (url, pid))
+    conn.commit(); cur.close(); conn.close()
+    msg = bot.send_message(message.chat.id, "2️⃣ Логин:")
+    bot.register_next_step_handler(msg, cms_save_login, pid)
+
+def cms_save_login(message, pid):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET cms_login=%s WHERE id=%s", (message.text.strip(), pid))
+    conn.commit(); cur.close(); conn.close()
+    msg = bot.send_message(message.chat.id, "3️⃣ Пароль:")
+    bot.register_next_step_handler(msg, cms_save_pass, pid)
+
+def cms_save_pass(message, pid):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET cms_password=%s WHERE id=%s", (message.text.strip(), pid))
+    conn.commit(); cur.close(); conn.close()
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
+    bot.send_message(call.message.chat.id, "✅ Настройки сохранены!", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rewrite_"))
+def rewrite_once(call):
+    aid = call.data.split("_")[1]
+    bot.answer_callback_query(call.id, "Функция рерайта стандартная")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
+def srv(call):
+    bot.answer_callback_query(call.id, "Опросник")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("upf_"))
+def upf(call):
+    bot.answer_callback_query(call.id, "Загрузка файлов")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("skip_upl_"))
+def skip(call):
+    pid = call.data.split("_")[2]
+    update_project_progress(pid, "upload_done")
+    open_project_menu(call.message.chat.id, pid, mode="onboarding")
 
 # ЗАПУСК
 def run_scheduler():
