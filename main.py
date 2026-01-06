@@ -27,8 +27,7 @@ APP_URL = os.getenv("APP_URL")
 bot = TeleBot(TOKEN)
 client = genai.Client(api_key=GEMINI_KEY)
 
-# Глобальное хранилище контекста (кто с каким проектом работает)
-# user_id: project_id
+# Глобальный контекст
 USER_CONTEXT = {} 
 
 # --- 2. БАЗА ДАННЫХ ---
@@ -45,6 +44,7 @@ def patch_db_schema():
     cur = conn.cursor()
     try:
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_login TEXT")
         conn.commit()
     except: pass
     finally: cur.close(); conn.close()
@@ -79,6 +79,7 @@ def init_db():
             knowledge_base JSONB DEFAULT '[]', 
             keywords TEXT,
             cms_key TEXT,
+            cms_login TEXT,
             platform TEXT,
             frequency INT DEFAULT 0,
             progress JSONB DEFAULT '{}', 
@@ -128,36 +129,46 @@ def escape_md(text):
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
 
-def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
-    """
-    Максимально безопасная отправка.
-    Режет текст жестко, если он длинный.
-    Если HTML ломается — шлет текстом.
-    """
-    if not text: return
+def markdown_to_html(text):
+    """Преобразует Markdown в HTML для WordPress"""
+    if not text: return ""
+    # Жирный
+    text = text.replace("**", "<strong>")
+    # Заголовки (Markdown # -> h2)
+    lines = text.split('\n')
+    new_lines = []
+    for line in lines:
+        if line.startswith("### "): new_lines.append(f"<h3>{line[4:]}</h3>")
+        elif line.startswith("## "): new_lines.append(f"<h2>{line[3:]}</h2>")
+        elif line.startswith("# "): new_lines.append(f"<h1>{line[2:]}</h1>")
+        else: new_lines.append(line)
+    text = "<br>".join(new_lines)
+    return text
 
-    # Убираем двойные звездочки, меняем на жирный для HTML (на всякий случай)
-    if parse_mode == 'HTML':
-        text = text.replace("**", "") 
+def send_safe_message(chat_id, text, parse_mode='Markdown', reply_markup=None):
+    if not text: return
     
-    # Разбиваем на куски по 3000 символов (безопасный лимит)
-    chunk_size = 3000
-    parts = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    parts = []
+    chunk_size = 4000
+    while len(text) > 0:
+        if len(text) > chunk_size:
+            split_pos = text.rfind('\n', 0, chunk_size)
+            if split_pos == -1: split_pos = chunk_size
+            parts.append(text[:split_pos])
+            text = text[split_pos:]
+        else:
+            parts.append(text)
+            text = ""
 
     for i, part in enumerate(parts):
-        # Клавиатуру цепляем только к последнему куску
         markup = reply_markup if i == len(parts) - 1 else None
-        
         try:
             bot.send_message(chat_id, part, parse_mode=parse_mode, reply_markup=markup)
-        except Exception as e:
-            print(f"⚠️ Send Error (HTML): {e}")
-            # Если не вышло с HTML, шлем как есть
-            try:
-                bot.send_message(chat_id, part, parse_mode=None, reply_markup=markup)
-            except Exception as e2:
-                print(f"❌ Send Error (Plain): {e2}")
-        time.sleep(0.5) # Пауза, чтобы Телеграм не банил за флуд
+        except:
+            # Fallback (без форматирования)
+            try: bot.send_message(chat_id, part, parse_mode=None, reply_markup=markup)
+            except: pass
+        time.sleep(0.3)
 
 def get_gemini_response(prompt):
     try:
@@ -167,12 +178,10 @@ def get_gemini_response(prompt):
         return f"Ошибка AI: {e}"
 
 def validate_input(text, question_context):
-    # Проверка на нажатие кнопок меню
     if text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
         return False, "MENU_CLICK"
-
     try:
-        prompt = f"Модератор. Вопрос: '{question_context}'. Ответ: '{text}'. Если это мат, спам или бред - верни BAD. Если это ответ по делу - верни OK."
+        prompt = f"Модератор. Вопрос: '{question_context}'. Ответ: '{text}'. Если это мат, спам или бессмыслица - верни BAD. Если это ответ по теме - верни OK."
         res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt]).text.strip()
         return ("BAD" not in res.upper()), "AI_CHECK"
     except: return True, "SKIP"
@@ -286,7 +295,6 @@ def check_url_step(message):
         return
     
     msg_check = bot.send_message(message.chat.id, "⏳ Проверяю...")
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT user_id FROM projects WHERE url = %s", (url,))
     if cur.fetchone():
@@ -306,9 +314,7 @@ def check_url_step(message):
     pid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
-    # Устанавливаем контекст
     USER_CONTEXT[message.from_user.id] = pid
-    
     bot.delete_message(message.chat.id, msg_check.message_id)
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
@@ -321,7 +327,6 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     
     url, kw_db, progress = res
     if not progress: progress = {}
-    
     has_keywords = kw_db is not None and len(kw_db) > 20
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -362,7 +367,6 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
 @bot.callback_query_handler(func=lambda call: call.data.startswith("open_proj_mgmt_"))
 def open_proj_mgmt(call):
     pid = call.data.split("_")[3]
-    # Обновляем контекст пользователя
     USER_CONTEXT[call.from_user.id] = pid
     open_project_menu(call.message.chat.id, pid, mode="management", msg_id=call.message.message_id)
 
@@ -393,71 +397,53 @@ def back_main(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
 def start_survey_6q(call):
     pid = call.data.split("_")[1]
-    USER_CONTEXT[call.from_user.id] = pid # Context update
-    
+    USER_CONTEXT[call.from_user.id] = pid
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET info = '{}', keywords = NULL, progress = '{}' WHERE id = %s", (pid,))
     conn.commit(); cur.close(); conn.close()
     
-    q_text = "Какая главная цель вашего сайта? (Продажи, Трафик, Бренд?)"
-    msg = bot.send_message(call.message.chat.id, f"❓ Вопрос 1/6:\n{q_text}")
-    bot.register_next_step_handler(msg, q2, {"pid": pid, "answers": []}, q_text)
+    msg = bot.send_message(call.message.chat.id, "❓ Вопрос 1/6:\nКакая главная цель вашего сайта? (Продажи, Трафик, Бренд?)")
+    bot.register_next_step_handler(msg, q2, {"pid": pid, "answers": []}, "Цель")
 
 def q2(m, d, prev_q): 
-    valid, err_type = validate_input(m.text, prev_q)
+    valid, err = validate_input(m.text, prev_q)
     if not valid:
-        msg = bot.send_message(m.chat.id, f"⛔ Пожалуйста, ответьте текстом (без кнопок меню).\n\n❓ {prev_q}")
-        bot.register_next_step_handler(msg, q2, d, prev_q); return
+        bot.send_message(m.chat.id, f"⛔ Пожалуйста, ответьте текстом (без кнопок).\n\n❓ {prev_q}"); bot.register_next_step_handler(m, q2, d, prev_q); return
     d["answers"].append(f"Цель: {m.text}")
-    q_text = "Кто ваша целевая аудитория?"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 2/6:\n{q_text}")
-    bot.register_next_step_handler(msg, q3, d, q_text)
+    msg = bot.send_message(m.chat.id, "❓ Вопрос 2/6:\nКто ваша целевая аудитория?")
+    bot.register_next_step_handler(msg, q3, d, "ЦА")
 
 def q3(m, d, prev_q):
-    valid, err_type = validate_input(m.text, prev_q)
-    if not valid:
-        msg = bot.send_message(m.chat.id, f"⛔ Ответьте текстом.\n\n❓ {prev_q}")
-        bot.register_next_step_handler(msg, q3, d, prev_q); return
+    valid, err = validate_input(m.text, prev_q)
+    if not valid: bot.send_message(m.chat.id, f"⛔ Некорректно.\n\n❓ {prev_q}"); bot.register_next_step_handler(m, q3, d, prev_q); return
     d["answers"].append(f"ЦА: {m.text}")
-    q_text = "Назовите ваших главных конкурентов:"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 3/6:\n{q_text}")
-    bot.register_next_step_handler(msg, q4, d, q_text)
+    msg = bot.send_message(m.chat.id, "❓ Вопрос 3/6:\nНазовите ваших главных конкурентов:")
+    bot.register_next_step_handler(msg, q4, d, "Конкуренты")
 
 def q4(m, d, prev_q):
-    valid, err_type = validate_input(m.text, prev_q)
-    if not valid:
-        msg = bot.send_message(m.chat.id, f"⛔ Ответьте текстом.\n\n❓ {prev_q}")
-        bot.register_next_step_handler(msg, q4, d, prev_q); return
+    valid, err = validate_input(m.text, prev_q)
+    if not valid: bot.send_message(m.chat.id, f"⛔ Некорректно.\n\n❓ {prev_q}"); bot.register_next_step_handler(m, q4, d, prev_q); return
     d["answers"].append(f"Конкуренты: {m.text}")
-    q_text = "В чем ваше главное преимущество (УТП)?"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 4/6:\n{q_text}")
-    bot.register_next_step_handler(msg, q5, d, q_text)
+    msg = bot.send_message(m.chat.id, "❓ Вопрос 4/6:\nВ чем ваше главное преимущество (УТП)?")
+    bot.register_next_step_handler(msg, q5, d, "УТП")
 
 def q5(m, d, prev_q):
-    valid, err_type = validate_input(m.text, prev_q)
-    if not valid:
-        msg = bot.send_message(m.chat.id, f"⛔ Ответьте текстом.\n\n❓ {prev_q}")
-        bot.register_next_step_handler(msg, q5, d, prev_q); return
+    valid, err = validate_input(m.text, prev_q)
+    if not valid: bot.send_message(m.chat.id, f"⛔ Некорректно.\n\n❓ {prev_q}"); bot.register_next_step_handler(m, q5, d, prev_q); return
     d["answers"].append(f"УТП: {m.text}")
-    q_text = "География продвижения (Город, Страна):"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 5/6:\n{q_text}")
-    bot.register_next_step_handler(msg, q6, d, q_text)
+    msg = bot.send_message(m.chat.id, "❓ Вопрос 5/6:\nГеография продвижения (Город, Страна):")
+    bot.register_next_step_handler(msg, q6, d, "Гео")
 
 def q6(m, d, prev_q):
-    valid, err_type = validate_input(m.text, prev_q)
-    if not valid:
-        msg = bot.send_message(m.chat.id, f"⛔ Ответьте текстом.\n\n❓ {prev_q}")
-        bot.register_next_step_handler(msg, q6, d, prev_q); return
+    valid, err = validate_input(m.text, prev_q)
+    if not valid: bot.send_message(m.chat.id, f"⛔ Некорректно.\n\n❓ {prev_q}"); bot.register_next_step_handler(m, q6, d, prev_q); return
     d["answers"].append(f"Гео: {m.text}")
-    q_text = "Свободная форма. Что важно знать о бизнесе? (Особенности, сезонность):"
-    msg = bot.send_message(m.chat.id, f"❓ Вопрос 6/6 (Важно!):\n{q_text}")
-    bot.register_next_step_handler(msg, finish_survey, d, q_text)
+    msg = bot.send_message(m.chat.id, "❓ Вопрос 6/6 (Важно!):\nСвободная форма. Что важно знать о бизнесе?")
+    bot.register_next_step_handler(msg, finish_survey, d, "Инфо")
 
 def finish_survey(m, d, prev_q):
-    valid, err_type = validate_input(m.text, prev_q)
-    if not valid:
-        msg = bot.send_message(m.chat.id, f"⛔ Ответьте текстом.\n\n❓ {prev_q}")
-        bot.register_next_step_handler(msg, finish_survey, d, prev_q); return
+    valid, err = validate_input(m.text, prev_q)
+    if not valid: bot.send_message(m.chat.id, f"⛔ Некорректно.\n\n❓ {prev_q}"); bot.register_next_step_handler(m, finish_survey, d, prev_q); return
     d["answers"].append(f"Доп. инфо: {m.text}")
     
     full_text = "\n".join(d["answers"])
@@ -468,7 +454,7 @@ def finish_survey(m, d, prev_q):
     update_project_progress(d["pid"], "info_done")
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔑 Подобрать ключевые слова", callback_data=f"kw_ask_count_{d['pid']}"))
-    bot.send_message(m.chat.id, "✅ Спасибо за честные ответы! Теперь давайте подберем ключевые слова.", reply_markup=markup)
+    bot.send_message(m.chat.id, "✅ Спасибо за ответы! Теперь давайте подберем ключевые слова.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("anz_"))
 def deep_analysis(call):
@@ -478,12 +464,11 @@ def deep_analysis(call):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url FROM projects WHERE id=%s", (pid,))
     url = cur.fetchone()[0]
-    raw_data = deep_analyze_site(url)
-    advice = get_gemini_response(f"Ты SEO профи. Аудит сайта: {raw_data}. Дай 3 ошибки и 3 точки роста.")
+    raw = deep_analyze_site(url)
+    advice = get_gemini_response(f"Ты SEO профи. Аудит сайта: {raw}. Дай 3 ошибки и 3 точки роста.")
     
     cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
-    kb = cur.fetchone()[0]; 
-    if not kb: kb = []
+    kb = cur.fetchone()[0] or []
     kb.append(f"Deep Audit: {advice[:500]}")
     cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
     conn.commit(); cur.close(); conn.close()
@@ -494,55 +479,39 @@ def deep_analysis(call):
     open_project_menu(call.message.chat.id, pid, mode="management")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("upf_"))
-def upload_files_request(call):
+def upload_files(call):
     pid = call.data.split("_")[1]
     USER_CONTEXT[call.from_user.id] = pid
-    msg = bot.send_message(call.message.chat.id, "📂 Пришлите текст, фото или .txt файл.")
-    # Мы не полагаемся ТОЛЬКО на это, у нас есть global handler
-    # bot.register_next_step_handler(msg, process_upload, pid) 
+    bot.send_message(call.message.chat.id, "📂 Пришлите текст, фото или .txt файл.")
 
-# ОБЩИЙ ОБРАБОТЧИК ФАЙЛОВ (РАБОТАЕТ ВСЕГДА, ДАЖЕ ПОСЛЕ ПЕРЕЗАГРУЗКИ)
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ФАЙЛОВ
 @bot.message_handler(content_types=['document', 'text', 'photo'])
 def global_file_handler(message):
-    # Если это текст и похоже на команду или ответ на опрос - игнорируем (пусть другие хендлеры работают)
     if message.text and (message.text.startswith("/") or message.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка"]):
         return
 
-    # Проверяем, есть ли активный проект у юзера
     pid = USER_CONTEXT.get(message.from_user.id)
-    
     if not pid:
         if message.content_type == 'document':
-            bot.reply_to(message, "⚠️ Я не знаю, к какому проекту это относится. Сначала выберите проект -> 'Загрузить файлы'.")
+            bot.reply_to(message, "⚠️ Сначала выберите проект -> 'Загрузить файлы'.")
         return
 
-    # Если мы здесь - значит пользователь прислал файл/текст в контексте проекта
-    process_upload_content(message, pid)
-
-def process_upload_content(message, pid):
     content = ""
     is_txt = False
-    
-    if message.content_type == 'text': 
-        content = message.text
+    if message.content_type == 'text': content = message.text
     elif message.content_type == 'document':
         try:
             file_info = bot.get_file(message.document.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             content = downloaded_file.decode('utf-8')
             is_txt = message.document.file_name.endswith('.txt')
-        except: 
-            content = ""; 
-            if message.content_type == 'document': bot.reply_to(message, "❌ Ошибка чтения файла.")
-            return
+        except: pass
 
     if not content: return
 
     conn = get_db_connection(); cur = conn.cursor()
-    # Умная проверка через AI
     if is_txt or len(content) > 20:
-        prompt = f"Это список ключевых слов? Текст: '{content[:500]}'. Ответь YES, если это список фраз. NO, если это статья."
-        check = get_gemini_response(prompt)
+        check = get_gemini_response(f"Это список ключевых слов? '{content[:300]}'. YES/NO")
         
         if "YES" in check.upper() or is_txt:
             cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (content, pid))
@@ -550,14 +519,12 @@ def process_upload_content(message, pid):
             update_project_progress(pid, "upload_done")
         else:
             cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
-            kb = cur.fetchone()[0]; 
-            if not kb: kb = []
+            kb = cur.fetchone()[0] or []
             kb.append(f"Upload: {content[:500]}...")
             cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
             msg_text = "✅ Информация добавлена в базу."
             update_project_progress(pid, "upload_done")
-    else:
-        msg_text = "⚠️ Слишком короткий текст."
+    else: msg_text = "⚠️ Слишком коротко."
 
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, msg_text)
@@ -577,7 +544,7 @@ def kw_ask_count(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("genkw_"))
 def generate_keywords_action(call):
     _, pid, count = call.data.split("_")
-    bot.edit_message_text(f"🧠 Подбираю {count} слов... (Это может занять минуту)", call.message.chat.id, call.message.message_id)
+    bot.edit_message_text(f"🧠 Подбираю {count} слов...", call.message.chat.id, call.message.message_id)
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT knowledge_base, url, info FROM projects WHERE id=%s", (pid,))
@@ -592,7 +559,6 @@ def generate_keywords_action(call):
     cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (keywords, pid))
     conn.commit(); cur.close(); conn.close()
     
-    # Безопасная отправка
     send_safe_message(call.message.chat.id, keywords)
     
     markup = types.InlineKeyboardMarkup()
@@ -600,15 +566,12 @@ def generate_keywords_action(call):
                types.InlineKeyboardButton("📥 Скачать (.txt)", callback_data=f"download_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("🔄 Пройти опрос заново", callback_data=f"srv_{pid}"))
     
-    bot.send_message(call.message.chat.id, "👇 Что делаем дальше?", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "👇 Вы можете скачать файл, отредактировать и загрузить обратно.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_kw_"))
 def approve_keywords(call):
     pid = call.data.split("_")[2]
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🚀 ⭐️ СТРАТЕГИЯ И СТАТЬИ ⭐️", callback_data=f"strat_{pid}"))
-    markup.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
-    bot.send_message(call.message.chat.id, "🎉 Ключи утверждены!", reply_markup=markup)
+    open_project_menu(call.message.chat.id, pid, mode="management")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("download_kw_"))
 def download_keywords(call):
@@ -654,48 +617,47 @@ def cms_ask(call):
 def cms_instruction(call):
     parts = call.data.split("_")
     pid, platform = parts[2], parts[3]
-    links = {"wp": "1. /wp-admin -> Пользователи -> Профиль\n2. 'Пароли приложений' -> Добавить.\n3. Введите 'Bot', скопируйте пароль.\n4. Пришлите мне: **ВАШ_ЛОГИН ПАРОЛЬ** (через пробел)", 
-             "tilda": "1. Настройки -> API -> Ключи.", "bitrix": "1. Профиль -> Пароли приложений."}
-    msg = bot.send_message(call.message.chat.id, f"📚 **{platform.upper()}:**\n{links.get(platform)}\n\n👇 **Пришлите ключ доступа в ответном сообщении:**", parse_mode='Markdown')
-    # Здесь тоже ставим глобальный контекст на всякий случай
-    USER_CONTEXT[call.from_user.id] = pid
-    bot.register_next_step_handler(msg, save_cms_key, pid, platform)
+    msg = bot.send_message(call.message.chat.id, f"🔐 **Шаг 1. Введите логин администратора от {platform.upper()}:**", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, save_cms_login, pid, platform)
 
-def save_cms_key(message, pid, platform):
+def save_cms_login(message, pid, platform):
+    login = message.text
+    msg = bot.send_message(message.chat.id, "🔑 **Шаг 2. Теперь введите Пароль Приложения** (Application Password):\n(Для WP: Пользователи -> Профиль -> Пароли приложений)")
+    bot.register_next_step_handler(msg, save_cms_password, pid, platform, login)
+
+def save_cms_password(message, pid, platform, login):
+    password = message.text
+    # Формируем строку авторизации: login:password
+    auth_key = f"{login.strip()} {password.strip()}"
+    
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("UPDATE projects SET cms_key=%s, platform=%s WHERE id=%s", (message.text, platform, pid))
+    cur.execute("UPDATE projects SET cms_key=%s, cms_login=%s, platform=%s WHERE id=%s", (auth_key, login, platform, pid))
     conn.commit(); cur.close(); conn.close()
+    
     bot.send_message(message.chat.id, "✅ Доступ сохранен!")
     propose_articles(message.chat.id, pid)
 
 def propose_articles(chat_id, pid):
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT user_id, info, keywords, knowledge_base FROM projects WHERE id=%s", (pid,))
+    cur.execute("SELECT user_id, info, keywords FROM projects WHERE id=%s", (pid,))
     proj = cur.fetchone()
-    user_id = proj[0]
+    user_id, info_json, kw = proj[0], proj[1] or {}, proj[2] or ""
     
     cur.execute("SELECT gens_left, is_admin FROM users WHERE user_id=%s", (user_id,))
     u_data = cur.fetchone()
-    gens_left, is_admin = u_data[0], u_data[1]
-    
-    if gens_left <= 0 and not is_admin:
+    if u_data[0] <= 0 and not u_data[1]:
         cur.close(); conn.close()
-        bot.send_message(chat_id, "⚠️ **Лимит генераций исчерпан!** Пополните баланс.")
+        bot.send_message(chat_id, "⚠️ Лимит генераций исчерпан!")
         return
 
-    bot.send_message(chat_id, f"⚡ Осталось генераций: {gens_left}. Генерирую темы...")
-    
-    info_json = proj[1] or {}
-    survey = info_json.get("survey", "")
-    kw = proj[2] or "Нет ключей"
-    kb = str(proj[3])[:2000]
+    bot.send_message(chat_id, f"⚡ Осталось генераций: {u_data[0]}. Генерирую темы...")
     
     prompt = f"""
     Твоя роль: SEO стратег. 
-    Сайт данные: {survey}, Ключи: {kw[:1000]}
+    Ключи: {kw[:1000]}
     
     Задача: Придумай 5 тем для статей.
-    ФОРМАТ ВЫВОДА СТРОГО ТАКОЙ:
+    ФОРМАТ ВЫВОДА:
     Тема 1: Заголовок
     Описание: Описание
     |
@@ -703,74 +665,60 @@ def propose_articles(chat_id, pid):
     Описание: Описание
     """
     
-    try:
-        raw_text = get_gemini_response(prompt)
-        topics_raw = raw_text.split("|")
-        topics = []
-        for t in topics_raw:
-            if "Тема" in t:
-                clean_t = t.strip().replace("Тема", "").replace("*", "")
-                parts = clean_t.split("\n")
-                title_line = parts[0].split(":")[-1].strip()
-                if len(title_line) > 5:
-                    desc = parts[1] if len(parts) > 1 else ""
-                    topics.append({"title": title_line, "desc": desc})
-        
-        topics = topics[:5]
-    except:
-        topics = [{"title": "Article 1", "desc": ""}, {"title": "Article 2", "desc": ""}]
-
-    info_json["temp_topics"] = topics
+    raw_text = get_gemini_response(prompt)
+    topics = []
+    for t in raw_text.split("|"):
+        if "Тема" in t:
+            clean = t.replace("Тема", "").replace("*", "").strip()
+            lines = clean.split("\n")
+            title = lines[0].split(":")[-1].strip()
+            if len(title)>5: topics.append(title)
+    
+    info_json["temp_topics"] = topics[:5]
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info_json), pid))
     conn.commit(); cur.close(); conn.close()
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    msg_text = "📝 **Выберите тему:**\n\n"
-    
-    for i, t in enumerate(topics):
-        msg_text += f"{i+1}. **{t['title']}**\n_{t['desc']}_\n\n"
-        markup.add(types.InlineKeyboardButton(f"Выбрать тему №{i+1}", callback_data=f"write_{pid}_topic_{i}"))
+    for i, t in enumerate(topics[:5]):
+        markup.add(types.InlineKeyboardButton(f"{i+1}. {t}", callback_data=f"write_{pid}_topic_{i}"))
         
-    bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
+    bot.send_message(chat_id, "📝 **Выберите тему:**", reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article(call):
     parts = call.data.split("_")
-    pid = parts[1]
-    topic_idx = int(parts[3])
+    pid, idx = parts[1], int(parts[3])
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
-    info = res[0]
-    keywords = res[1] or ""
-    
-    topics = info.get("temp_topics", [])
-    selected_topic = topics[topic_idx]['title'] if len(topics) > topic_idx else "Article"
+    title = res[0].get("temp_topics", [])[idx]
+    kw = res[1] or ""
     
     bot.delete_message(call.message.chat.id, call.message.message_id)
-    bot.send_message(call.message.chat.id, f"⏳ Пишу статью: **{selected_topic}**\n(~2500 слов, Yoast SEO)...", parse_mode='Markdown')
+    bot.send_message(call.message.chat.id, f"⏳ Пишу статью: **{title}** (~2500 слов)...", parse_mode='Markdown')
     
     prompt = f"""
-    Напиши SEO-статью на тему: "{selected_topic}".
-    Ключевые слова: {keywords[:500]}...
-    Форматирование: Используй HTML <b> и <i>. Без Markdown звездочек.
-    В конце добавь блок SEO (Title, Description).
+    Напиши SEO-статью: "{title}".
+    Ключи: {kw[:500]}...
+    Формат: Markdown. (Жирный, Заголовки #). Без HTML тегов.
+    В конце: 
+    **Фокусное слово:**
+    **SEO-заголовок:**
+    **Мета-описание:**
     """
-    
-    article_text = get_gemini_response(prompt)
+    text = get_gemini_response(prompt)
     
     cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
-    
-    cur.execute("INSERT INTO articles (project_id, title, content, status) VALUES (%s, %s, %s, 'draft') RETURNING id", (pid, selected_topic, article_text))
+    cur.execute("INSERT INTO articles (project_id, title, content, status) VALUES (%s, %s, %s, 'draft') RETURNING id", (pid, title, text))
     aid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
-    send_safe_message(call.message.chat.id, article_text, parse_mode='HTML')
+    send_safe_message(call.message.chat.id, text, parse_mode='Markdown')
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Публикуем", callback_data=f"approve_{aid}"),
-               types.InlineKeyboardButton("✏️ Переписать (1 раз)", callback_data=f"rewrite_{aid}"))
+               types.InlineKeyboardButton("✏️ Переписать", callback_data=f"rewrite_{aid}"))
     
     bot.send_message(call.message.chat.id, "👇 Что делаем?", reply_markup=markup)
 
@@ -780,74 +728,96 @@ def rewrite_once(call):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT rewrite_count, title FROM articles WHERE id=%s", (aid,))
     res = cur.fetchone()
-    rc, title = res[0], res[1]
     
-    if rc > 0:
+    if res[0] > 0:
         bot.answer_callback_query(call.id, "⛔ Только 1 правка!")
         cur.close(); conn.close(); return
         
     bot.send_message(call.message.chat.id, "🔄 Переписываю...")
-    new_text = get_gemini_response(f"Перепиши статью: {title}. HTML формат.")
+    text = get_gemini_response(f"Перепиши статью: {res[1]}. Markdown.")
     
-    cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (new_text, aid))
+    cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (text, aid))
     conn.commit(); cur.close(); conn.close()
     
-    send_safe_message(call.message.chat.id, new_text, parse_mode='HTML')
-    
+    send_safe_message(call.message.chat.id, text, parse_mode='Markdown')
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Публикуем", callback_data=f"approve_{aid}"))
-    
-    bot.send_message(call.message.chat.id, "👇 Новая версия готова.", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "👇 Готово.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
 def approve(call):
     aid = call.data.split("_")[1]
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT project_id, title, content FROM articles WHERE id=%s", (aid,))
-    art = cur.fetchone()
-    pid, title, content = art
+    pid, title, content = cur.fetchone()
     
-    # ПУБЛИКАЦИЯ В WP
-    success, link = publish_to_wordpress(pid, title, content, call.from_user.id)
-    
-    if success:
-        cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
-        conn.commit()
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(call.message.chat.id, f"✅ **Опубликовано!**\n🔗 {link}", parse_mode='Markdown')
-    else:
-        bot.send_message(call.message.chat.id, f"❌ Ошибка публикации: {link}")
-    
-    cur.close(); conn.close()
-
-def publish_to_wordpress(pid, title, content, user_id):
-    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url, cms_key FROM projects WHERE id=%s", (pid,))
-    res = cur.fetchone()
+    site_url, auth_str = cur.fetchone()
+    
+    # Конвертируем MD -> HTML для сайта
+    html_content = markdown_to_html(content)
+    
+    # AUTH
+    try:
+        parts = auth_str.split(' ', 1)
+        login, password = parts[0], parts[1]
+        token = base64.b64encode(f"{login}:{password}".encode()).decode()
+        headers = {'Authorization': 'Basic ' + token}
+        
+        api_url = f"{site_url.rstrip('/')}/wp-json/wp/v2/posts"
+        r = requests.post(api_url, headers=headers, json={'title': title, 'content': html_content, 'status': 'publish'})
+        
+        if r.status_code == 201:
+            link = r.json().get('link')
+            cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
+            conn.commit()
+            bot.send_message(call.message.chat.id, f"✅ **Опубликовано!**\n🔗 {link}", parse_mode='Markdown')
+        else:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка WP ({r.status_code}): {r.text[:100]}")
+    except Exception as e:
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
+        
+    cur.close(); conn.close()
+
+# --- 7. ПРОФИЛЬ & АДМИНКА ---
+def show_profile(uid):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT tariff, gens_left, balance, joined_at, total_paid_rub FROM users WHERE user_id=%s", (uid,))
+    u = cur.fetchone()
+    
+    cur.execute("SELECT count(*) FROM projects WHERE user_id=%s", (uid,))
+    projs = cur.fetchone()[0]
+    cur.execute("SELECT count(*) FROM articles WHERE status='published' AND project_id IN (SELECT id FROM projects WHERE user_id=%s)", (uid,))
+    arts = cur.fetchone()[0]
     cur.close(); conn.close()
     
-    if not res or not res[1]: return False, "Нет ключа доступа."
-    
-    site_url, app_key = res
-    if site_url.endswith('/'): site_url = site_url[:-1]
-    api_url = f"{site_url}/wp-json/wp/v2/posts"
-    
-    try:
-        # Пытаемся распарсить ЛОГИН ПАРОЛЬ
-        parts = app_key.split(' ', 1)
-        if len(parts) < 2: return False, "Неверный формат ключа (нужен ЛОГИН ПАРОЛЬ)."
-        
-        creds = f"{parts[0]}:{parts[1]}"
-        token = base64.b64encode(creds.encode()).decode()
-        headers = {'Authorization': 'Basic ' + token}
-        post = {'title': title, 'content': content, 'status': 'publish'}
-        
-        r = requests.post(api_url, headers=headers, json=post)
-        if r.status_code == 201: return True, r.json().get('link')
-        return False, f"Code {r.status_code}: {r.text[:100]}"
-    except Exception as e: return False, str(e)
+    txt = (f"👤 **Профиль**\nID: `{uid}`\n"
+           f"📅 Регистрация: {u[3].strftime('%Y-%m-%d')}\n"
+           f"💎 Тариф: {u[0]}\n⚡ Генераций: {u[1]}\n"
+           f"💰 Потрачено: {u[4]}р\n"
+           f"📂 Проектов: {projs} | 📄 Статей: {arts}")
+           
+    markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Пополнить баланс", callback_data="period_test"))
+    bot.send_message(uid, txt, reply_markup=markup, parse_mode='Markdown')
 
-# --- 7. ТАРИФЫ (Без изменений) ---
+def show_admin_panel(uid):
+    conn = get_db_connection(); cur = conn.cursor()
+    
+    cur.execute("SELECT count(*) FROM users WHERE last_active > NOW() - INTERVAL '15 minutes'")
+    online = cur.fetchone()[0]
+    
+    cur.execute("SELECT sum(amount) FROM payments WHERE currency='rub'")
+    rub = cur.fetchone()[0] or 0
+    cur.execute("SELECT sum(amount) FROM payments WHERE currency='stars'")
+    stars = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name")
+    stats = "\n".join([f"{r[0]}: {r[1]}" for r in cur.fetchall()])
+    
+    cur.close(); conn.close()
+    bot.send_message(uid, f"⚙️ **АДМИНКА**\n\n🟢 Онлайн: {online}\n💰 Прибыль: {rub}₽ | {stars}⭐️\n📊 Тарифы:\n{stats}")
+
+# --- 8. ТАРИФЫ (Без изменений) ---
 def show_tariff_periods(user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("🏎 Тест-драйв (500р)", callback_data="period_test"))
@@ -892,17 +862,6 @@ def pre_payment(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def process_payment(call):
     bot.send_message(call.message.chat.id, "✅ Оплата прошла успешно!")
-
-# --- 8. ПРОФИЛЬ ---
-def show_profile(uid):
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT tariff, gens_left, balance FROM users WHERE user_id=%s", (uid,))
-    u = cur.fetchone()
-    cur.close(); conn.close()
-    bot.send_message(uid, f"👤 Тариф: {u[0]}\n⚡ Генераций: {u[1]}")
-
-def show_admin_panel(uid):
-    bot.send_message(uid, "⚙️ Админка")
 
 # --- 9. ЗАПУСК ---
 def keep_alive():
