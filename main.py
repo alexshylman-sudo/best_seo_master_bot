@@ -227,7 +227,6 @@ def format_html_for_chat(html_content):
     
     # Убираем плейсхолдеры картинок из чата
     text = re.sub(r'\[IMG:.*?\]', '', text)
-    
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
     
@@ -241,12 +240,10 @@ def format_html_for_chat(html_content):
     return clean_text
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
-    """
-    Умная генерация: Сначала пробует Google, если ошибка - использует Flux (Pollinations)
-    """
+    """Генерация (Google -> Flux) и загрузка в WP"""
     image_bytes = None
     
-    # 1. Попытка Google Imagen 3 (Nano Banana)
+    # 1. Попытка Google
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -255,11 +252,11 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-            print("Generated via Google Imagen")
+            print("Generated via Google")
     except Exception as e:
-        print(f"Google Imagen fail, falling back to Flux: {e}")
+        print(f"Google img fail: {e}")
 
-    # 2. Fallback на Flux (Pollinations), если Google не дал картинку
+    # 2. Fallback на Flux
     if not image_bytes:
         try:
             seed = random.randint(1, 99999)
@@ -274,8 +271,11 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
 
     if not image_bytes: return None, None
 
-    # 3. Загрузка в WordPress
+    # 3. Загрузка в WP
     try:
+        # Чистим URL от trailing slash
+        if api_url.endswith('/'): api_url = api_url[:-1]
+        
         seed = random.randint(1, 99999)
         file_name = f"img-{seed}.png"
         
@@ -294,7 +294,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
-            # ALT текст
+            # ALT
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
@@ -302,8 +302,10 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
                 timeout=10
             )
             return media_id, source_url
+        else:
+            print(f"WP Upload Fail: {r.status_code} {r.text}")
     except Exception as e:
-        print(f"WP Upload Error: {e}")
+        print(f"WP Upload Except: {e}")
     
     return None, None
 
@@ -335,8 +337,10 @@ def menu_handler(message):
 
     if txt == "➕ Новый проект":
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🌐 Сайт", callback_data="new_site"))
-        bot.send_message(uid, "Добавьте сайт:", reply_markup=markup)
+        markup.add(types.InlineKeyboardButton("🌐 Сайт", callback_data="new_site"),
+                   types.InlineKeyboardButton("📸 Инстаграм (Скоро)", callback_data="soon"),
+                   types.InlineKeyboardButton("✈️ Телеграм (Скоро)", callback_data="soon"))
+        bot.send_message(uid, "Выберите тип площадки:", reply_markup=markup)
     elif txt == "📂 Мои проекты":
         list_projects(uid, message.chat.id)
     elif txt == "👤 Профиль":
@@ -344,7 +348,9 @@ def menu_handler(message):
     elif txt == "💎 Тарифы":
         show_tariff_periods(uid)
     elif txt == "🆘 Техподдержка":
-        bot.send_message(uid, f"Написать: tg://user?id={SUPPORT_ID}")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("Написать", url=f"tg://user?id={SUPPORT_ID}"))
+        bot.send_message(uid, "Напишите в поддержку, если возникли вопросы:", reply_markup=markup)
     elif txt == "⚙️ Админка" and uid == ADMIN_ID:
         show_admin_panel(uid)
     elif txt == "🔙 В меню":
@@ -393,23 +399,28 @@ def check_url_step(message):
     USER_CONTEXT[message.from_user.id] = pid
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
-# --- ГЛАВНОЕ МЕНЮ ПРОЕКТА (ОБНОВЛЕНО: СКРЫТИЕ КНОПОК) ---
+# --- ГЛАВНОЕ МЕНЮ ПРОЕКТА ---
 def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
     conn = get_db_connection(); cur = conn.cursor()
+    # ИСПРАВЛЕНИЕ: Безопасное извлечение даже если поля NULL
     cur.execute("SELECT url, keywords, progress, cms_login, cms_password FROM projects WHERE id = %s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
-    if not res: return
+    if not res: 
+        bot.send_message(chat_id, "❌ Проект не найден.")
+        return
     
     url, kw_db, progress, cms_login, cms_pass = res
     if not progress: progress = {}
     
-    # Критерий "Настроенности": есть ключи, пройден опрос, есть доступ к сайту
-    is_fully_configured = (kw_db is not None and len(kw_db) > 10) and progress.get("info_done") and cms_login
+    # Логика: Полностью ли настроен проект?
+    # Считаем настроенным, если есть ключи, пройден опрос и настроена CMS
+    is_fully_configured = (kw_db is not None and len(kw_db) > 5) and progress.get("info_done") and cms_login
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     
     if mode == "onboarding":
+        # ПОШАГОВЫЙ ПУТЬ
         if not progress.get("analysis_done"):
             markup.add(types.InlineKeyboardButton("📊 Анализ сайта", callback_data=f"sel_anz_{pid}"))
         elif not progress.get("info_done"):
@@ -428,16 +439,20 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
                 markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
                 
     else:
-        # ОБЫЧНЫЙ РЕЖИМ (Management)
+        # ОБЫЧНЫЙ РЕЖИМ
         if is_fully_configured:
-            # ЧИСТОЕ МЕНЮ
+            # ЧИСТОЕ МЕНЮ: Только работа
             markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
             markup.add(types.InlineKeyboardButton("📊 Анализ сайта", callback_data=f"sel_anz_{pid}"))
             markup.add(types.InlineKeyboardButton("⚙️ Настройки проекта", callback_data=f"proj_settings_{pid}"))
         else:
-            # Если проект недонастроен
-            markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ (Настроить)", callback_data=f"strat_{pid}"))
-            markup.add(types.InlineKeyboardButton("⚙️ Продолжить настройку", callback_data=f"proj_settings_{pid}"))
+            # Если не донастроен - показываем что осталось
+            if not progress.get("info_done"): markup.add(types.InlineKeyboardButton("📝 Опрос", callback_data=f"srv_{pid}"))
+            if not progress.get("competitors_done"): markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"comp_start_{pid}"))
+            if not kw_db: markup.add(types.InlineKeyboardButton("🔑 Ключи", callback_data=f"kw_ask_count_{pid}"))
+            if not cms_login: markup.add(types.InlineKeyboardButton("⚙️ Настроить CMS", callback_data=f"cms_select_{pid}"))
+            
+            markup.add(types.InlineKeyboardButton("⚙️ Все настройки", callback_data=f"proj_settings_{pid}"))
 
     markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
 
@@ -457,7 +472,7 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
 def project_settings_menu(call):
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}")) # Заглушка
+    markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("📝 Данные опроса", callback_data=f"srv_{pid}"))
     markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"comp_start_{pid}"))
     markup.add(types.InlineKeyboardButton("⚙️ Подключение CMS", callback_data=f"cms_select_{pid}"))
@@ -483,11 +498,9 @@ def analyze_competitor_step(message, pid):
     msg = bot.send_message(message.chat.id, "🕵️‍♂️ Анализирую конкурента...")
     
     try:
-        # Имитация глубокого анализа (реальный запрос был бы долгим)
         prompt = f"Проанализируй сайт конкурента {url}. Выдели 5 лучших ключей и дай 1 предложение мнения."
         ai_resp = get_gemini_response(prompt)
         
-        # Сохранение
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
         info = cur.fetchone()[0] or {}
@@ -640,7 +653,8 @@ def write_article(call):
        - Use HTML tags like `<ul>`, `<ol>`, `<h2>`.
     2. **SEO**: 
        - Insert 3 internal links from: {links_text}
-       - Short paragraphs.
+       - Outbound links: 2 authoritative links.
+       - Active voice, short sentences.
     
     OUTPUT JSON:
     {{
@@ -713,7 +727,7 @@ def approve_publish(call):
             # Журнальная верстка: чередование + обтекание
             align = "left" if i % 2 == 0 else "right"
             margin = "margin-right: 20px;" if align == "left" else "margin-left: 20px;"
-            img_html = f'<div style="float: {align}; {margin} margin-bottom: 20px; max-width: 50%;"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}" /></div>'
+            img_html = f'<div class="wp-block-image" style="float: {align}; {margin} margin-bottom: 20px; max-width: 50%;"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}" /></div>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
             final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
@@ -844,7 +858,7 @@ def cms_save_pass(message, pid):
     conn.commit(); cur.close(); conn.close()
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-    bot.send_message(message.chat.id, "✅ Настройки сохранены!", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "✅ Настройки сохранены!", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rewrite_"))
 def rewrite_once(call):
