@@ -9,7 +9,8 @@ import datetime
 import io
 import re
 import base64
-from urllib.parse import urlparse, urljoin, quote
+import random
+from urllib.parse import quote
 from telebot import TeleBot, types
 from flask import Flask
 from google import genai
@@ -132,10 +133,6 @@ def update_last_active(user_id):
     except: pass
 
 # --- 3. УТИЛИТЫ ---
-def escape_md(text):
-    if not text: return ""
-    return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
-
 def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     if not text: return
     parts = []
@@ -226,24 +223,66 @@ def update_project_progress(pid, step_key):
 def format_html_for_chat(html_content):
     """Очищает HTML и JSON мусор для красивого вывода в чат"""
     text = str(html_content).replace('\\n', '\n')
-    
-    if '", "seo_title":' in text:
-        text = text.split('", "seo_title":')[0]
-    if '","seo_title":' in text:
-        text = text.split('","seo_title":')[0]
+    if '", "seo_title":' in text: text = text.split('", "seo_title":')[0]
+    if '","seo_title":' in text: text = text.split('","seo_title":')[0]
     
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
     
     soup = BeautifulSoup(text, "html.parser")
-    for script in soup(["script", "style", "head", "title", "meta"]):
-        script.decompose()
+    for script in soup(["script", "style", "head", "title", "meta", "table"]):
+        script.decompose() # Таблицы в чат не влезают красиво, удаляем их из превью
     
     clean_text = soup.get_text(separator="\n\n")
     clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
     clean_text = clean_text.strip('",}').strip()
-    
     return clean_text
+
+def upload_image_to_wp(api_url, login, pwd, image_prompt, alt_text):
+    """Генерирует и загружает изображение в WP"""
+    try:
+        # 1. Генерация через Flux (Pollinations)
+        seed = random.randint(1, 99999)
+        safe_prompt = quote(image_prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=768&seed={seed}&nologo=true"
+        
+        # 2. Скачивание
+        img_resp = requests.get(image_url, timeout=30)
+        if img_resp.status_code != 200: return None
+        
+        # 3. Подготовка к загрузке в WP
+        file_name = f"seo-image-{seed}.jpg"
+        
+        creds = f"{login}:{pwd}"
+        token = base64.b64encode(creds.encode()).decode()
+        headers = {
+            'Authorization': 'Basic ' + token,
+            'Content-Disposition': f'attachment; filename={file_name}',
+            'Content-Type': 'image/jpeg',
+            'User-Agent': 'Mozilla/5.0'
+        }
+        
+        # 4. Загрузка файла
+        upload_api = f"{api_url}/wp-json/wp/v2/media"
+        r = requests.post(upload_api, headers=headers, data=img_resp.content, timeout=40)
+        
+        if r.status_code == 201:
+            media_id = r.json().get('id')
+            
+            # 5. Обновление ALT текста
+            update_url = f"{upload_api}/{media_id}"
+            headers_update = {
+                'Authorization': 'Basic ' + token,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0'
+            }
+            requests.post(update_url, headers=headers_update, json={'alt_text': alt_text}, timeout=10)
+            
+            return media_id
+        return None
+    except Exception as e:
+        print(f"Image upload error: {e}")
+        return None
 
 # --- 4. МЕНЮ ---
 def main_menu_markup(user_id):
@@ -323,7 +362,6 @@ def check_url_step(message):
         return
     
     msg_check = bot.send_message(message.chat.id, "⏳ Проверяю доступность и уникальность...")
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT user_id FROM projects WHERE url = %s", (url,))
     existing = cur.fetchone()
@@ -344,7 +382,6 @@ def check_url_step(message):
     cur.execute("INSERT INTO projects (user_id, type, url, info, progress) VALUES (%s, 'site', %s, '{}', '{}') RETURNING id", (message.from_user.id, url))
     pid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
-    
     USER_CONTEXT[message.from_user.id] = pid
     bot.delete_message(message.chat.id, msg_check.message_id)
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
@@ -355,11 +392,9 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     res = cur.fetchone()
     cur.close(); conn.close()
     if not res: return
-    
     url, kw_db, progress = res
     if not progress: progress = {}
     has_keywords = kw_db is not None and len(kw_db) > 20
-
     markup = types.InlineKeyboardMarkup(row_width=1)
     
     if mode == "onboarding":
@@ -378,21 +413,17 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
             else:
                 markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
                 markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-                
     else:
         if has_keywords:
             markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-        
         markup.add(types.InlineKeyboardButton("📝 Добавить информацию (Опрос)", callback_data=f"srv_{pid}"))
         markup.add(types.InlineKeyboardButton("🔗 Добавить ссылки на конкурентов", callback_data=f"addcomp_{pid}"))
         markup.add(types.InlineKeyboardButton("📊 Анализ сайта (Глубокий)", callback_data=f"anz_{pid}"))
         markup.add(types.InlineKeyboardButton("📂 Загрузить файлы", callback_data=f"upf_{pid}"))
-    
         if has_keywords:
             markup.add(types.InlineKeyboardButton("❌ Удалить ключи", callback_data=f"delkw_{pid}"))
         elif progress.get("info_done"):
             markup.add(types.InlineKeyboardButton("🔑 Создать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
-        
         markup.add(types.InlineKeyboardButton("⚙️ Настройки сайта (CMS)", callback_data=f"cms_select_{pid}"))
         markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}"))
 
@@ -402,7 +433,6 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     safe_url = url
     text = f"✅ Сайт {safe_url} успешно добавлен!" if new_site_url else f"📂 **Проект:** {safe_url}"
     if mode == "onboarding": text += "\n⬇️ Следующий шаг:"
-    
     try:
         if msg_id and not new_site_url:
             bot.edit_message_text(text, chat_id, msg_id, reply_markup=markup, parse_mode='Markdown')
@@ -429,14 +459,7 @@ def ask_delete_project(call):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ ДА, Удалить", callback_data=f"delete_proj_confirm_{pid}"))
     markup.add(types.InlineKeyboardButton("❌ НЕТ, Отмена", callback_data=f"open_proj_mgmt_{pid}"))
-    
-    bot.edit_message_text(
-        "⚠️ **Вы точно хотите удалить проект?**\n\nВаши статьи, созданные ранее, **останутся** на вашем сайте. Бот просто забудет этот проект.", 
-        call.message.chat.id, 
-        call.message.message_id, 
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+    bot.edit_message_text("⚠️ **Вы точно хотите удалить проект?**\n\nВаши статьи, созданные ранее, **останутся** на вашем сайте.", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_proj_confirm_"))
 def delete_project_confirm(call):
@@ -448,12 +471,10 @@ def delete_project_confirm(call):
         conn.commit()
         bot.answer_callback_query(call.id, "🗑 Проект удален.")
     except Exception as e:
-        print(f"Delete Error: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка удаления")
     finally:
         if cur: cur.close()
         if conn: conn.close()
-    
     list_projects(call.from_user.id, call.message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delkw_"))
@@ -482,51 +503,36 @@ def save_competitors(message, pid):
     if message.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
         menu_handler(message)
         return
-
     if not message.text:
         msg = bot.send_message(message.chat.id, "⚠️ Пожалуйста, пришлите ссылку текстом.")
         bot.register_next_step_handler(msg, save_competitors, pid)
         return
-
     try:
         links = message.text.strip()
         conn = get_db_connection()
-        if not conn:
-            bot.send_message(message.chat.id, "❌ Ошибка БД.")
-            return
-            
+        if not conn: return
         cur = conn.cursor()
         cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
         res = cur.fetchone()
-        
-        if not res:
-            bot.send_message(message.chat.id, "❌ Проект не найден.")
-            cur.close(); conn.close()
-            return
-            
+        if not res: return
         info = res[0] or {}
         info["competitors"] = links
-        
         cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info, ensure_ascii=False), pid))
         conn.commit(); cur.close(); conn.close()
-        
         update_project_progress(pid, "competitors_done")
         bot.send_message(message.chat.id, "✅ Конкуренты сохранены!")
         open_project_menu(message.chat.id, pid, mode="onboarding")
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Произошла ошибка: {e}")
 
-
 # --- 7. ОПРОСНИК ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
 def start_survey_6q(call):
     pid = call.data.split("_")[1]
     USER_CONTEXT[call.from_user.id] = pid
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET info = '{}', keywords = NULL WHERE id = %s", (pid,))
     conn.commit(); cur.close(); conn.close()
-    
     msg = bot.send_message(call.message.chat.id, "❓ Вопрос 1/5:\nКакая главная цель вашего сайта? (Продажи, Трафик, Бренд?)")
     bot.register_next_step_handler(msg, q2, {"pid": pid, "answers": []}, "Цель")
 
@@ -563,18 +569,14 @@ def finish_survey(m, d, prev_q):
     valid, err = validate_input(m.text, prev_q)
     if not valid: bot.send_message(m.chat.id, f"⛔ Некорректный ввод.\n\n❓ {prev_q}"); bot.register_next_step_handler(m, finish_survey, d, prev_q); return
     d["answers"].append(f"Доп. инфо: {m.text}")
-    
     full_text = "\n".join(d["answers"])
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info FROM projects WHERE id=%s", (d["pid"],))
     old_info = cur.fetchone()[0] or {}
     old_info["survey"] = full_text
-    
     cur.execute("UPDATE projects SET info = %s WHERE id=%s", (json.dumps(old_info, ensure_ascii=False), d["pid"]))
     conn.commit(); cur.close(); conn.close()
-    
     update_project_progress(d["pid"], "info_done")
-    
     bot.send_message(m.chat.id, "✅ Опрос пройден!")
     open_project_menu(m.chat.id, d['pid'], mode="onboarding")
 
@@ -582,18 +584,14 @@ def finish_survey(m, d, prev_q):
 def deep_analysis(call):
     pid = call.data.split("_")[1]
     msg = bot.send_message(call.message.chat.id, "🕵️‍♂️ Сканирую сайт (Title, Desc, Content)...")
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url FROM projects WHERE id=%s", (pid,))
     url = cur.fetchone()[0]
-    
     raw_data, links = deep_analyze_site(url)
-    
     cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
     info = cur.fetchone()[0] or {}
     info['internal_links'] = links
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info, ensure_ascii=False), pid))
-    
     prompt = f"""
     Проведи SEO-анализ данных сайта:
     {raw_data}
@@ -601,13 +599,11 @@ def deep_analysis(call):
     Формат: Кратко, по делу.
     """
     advice = get_gemini_response(prompt)
-    
     cur.execute("SELECT knowledge_base FROM projects WHERE id=%s", (pid,))
     kb = cur.fetchone()[0] or []
     kb.append(f"Deep Analysis: {advice[:1000]}")
     cur.execute("UPDATE projects SET knowledge_base=%s WHERE id=%s", (json.dumps(kb, ensure_ascii=False), pid))
     conn.commit(); cur.close(); conn.close()
-    
     update_project_progress(pid, "analysis_done")
     bot.delete_message(call.message.chat.id, msg.message_id)
     send_safe_message(call.message.chat.id, f"📊 **Результат анализа:**\n\n{advice}")
@@ -626,10 +622,8 @@ def global_file_handler(message):
         return
     if message.text and message.text.startswith("/"):
         return
-
     uid = message.from_user.id
     pid = USER_CONTEXT.get(uid)
-    
     if not pid:
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute("SELECT id, url FROM projects WHERE user_id = %s ORDER BY id DESC LIMIT 1", (uid,))
@@ -643,10 +637,8 @@ def global_file_handler(message):
             if message.content_type == 'document':
                 bot.reply_to(message, "⚠️ Нет активных проектов. Создайте новый.")
             return
-
     content = ""
     is_txt = False
-    
     if message.content_type == 'text': 
         content = message.text
     elif message.content_type == 'document':
@@ -663,17 +655,13 @@ def global_file_handler(message):
             bot.delete_message(message.chat.id, msg_loading.message_id)
             bot.reply_to(message, f"⚠️ Ошибка чтения файла: {e}\nУбедитесь, что это текстовый файл (.txt).")
             return
-
     if not content: return
-
     conn = get_db_connection(); cur = conn.cursor()
-    
     if is_txt or len(content) > 10:
         msg_ai = bot.send_message(message.chat.id, "🧠 AI анализирует контент...")
         try:
             check = get_gemini_response(f"Проанализируй текст: '{content[:500]}...'. Это похоже на список ключевых слов (SEO keys)? Ответь ТОЛЬКО 'ДА' или 'НЕТ'.")
             bot.delete_message(message.chat.id, msg_ai.message_id)
-            
             if "ДА" in check.upper():
                 cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (content, pid))
                 msg_text = "✅ Файл распознан как Ключевые слова! Доступ к стратегии открыт."
@@ -690,7 +678,6 @@ def global_file_handler(message):
             msg_text = "⚠️ Ошибка AI анализа."
     else: 
         msg_text = "⚠️ Слишком короткое сообщение для анализа."
-
     conn.commit(); cur.close(); conn.close()
     bot.reply_to(message, msg_text)
     open_project_menu(message.chat.id, pid, mode="onboarding")
@@ -712,7 +699,6 @@ def kw_ask_count(call):
 def generate_keywords_action(call):
     _, pid, count = call.data.split("_")
     bot.edit_message_text(f"🧠 AI составляет ядро из {count} запросов...", call.message.chat.id, call.message.message_id)
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT knowledge_base, url, info FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
@@ -720,30 +706,24 @@ def generate_keywords_action(call):
     survey = info_json.get("survey", "")
     competitors = info_json.get("competitors", "Не указаны")
     kb = str(res[0])[:3000] 
-    
     prompt = f"""
     Роль: SEO Эксперт.
     Задача: Составь Семантическое Ядро (СЯ) из {count} ключевых слов для сайта {res[1]}.
-    
     Контекст: {survey}
     Конкуренты: {competitors}
     База знаний: {kb}
-    
     СТРОГОЕ ТРЕБОВАНИЕ К ВЫВОДУ:
     Сгруппируй слова по КЛАСТЕРАМ.
     Укажи примерную частотность (ВЧ, СЧ, НЧ) и Интент (Коммерческий/Инфо).
-    
     Формат:
     ## Кластер: [Название]
     * [Ключевое слово] (ВЧ/СЧ, Коммерческий)
     * [Ключевое слово] ...
-    
     Без лишнего текста.
     """
     keywords = get_gemini_response(prompt)
     cur.execute("UPDATE projects SET keywords = %s WHERE id=%s", (keywords, pid))
     conn.commit(); cur.close(); conn.close()
-    
     send_safe_message(call.message.chat.id, keywords)
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"approve_kw_{pid}"),
@@ -831,19 +811,16 @@ def cms_save_pass(message, pid):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
 def strategy_start(call):
     pid = call.data.split("_")[1]
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT cms_login, frequency FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cms_ok = res[0]
     freq = res[1]
-    
     if not cms_ok:
         cur.close(); conn.close()
         bot.send_message(call.message.chat.id, "⚠️ Сначала настройте CMS (Логин/Пароль)!")
         cms_select_start(call) 
         return
-    
     if freq and freq > 0:
         cur.close(); conn.close()
         markup = types.InlineKeyboardMarkup()
@@ -851,7 +828,6 @@ def strategy_start(call):
         markup.add(types.InlineKeyboardButton("❌ Нет, оставить", callback_data=f"keep_strat_{pid}"))
         bot.send_message(call.message.chat.id, f"📅 У вас уже выбрана стратегия: **{freq} публикации в неделю**.\nХотите изменить стратегию?", reply_markup=markup, parse_mode='Markdown')
         return
-
     cur.close(); conn.close()
     show_freq_selection(call.message.chat.id, pid)
 
@@ -884,38 +860,29 @@ def propose_articles(chat_id, pid):
     cur.execute("SELECT user_id, info, keywords FROM projects WHERE id=%s", (pid,))
     proj = cur.fetchone()
     user_id = proj[0]
-    
     cur.execute("SELECT gens_left, is_admin FROM users WHERE user_id=%s", (user_id,))
     u_data = cur.fetchone()
     if u_data[0] <= 0 and not u_data[1]:
         cur.close(); conn.close()
         bot.send_message(chat_id, "⚠️ **Лимит генераций исчерпан!** Пополните баланс.", parse_mode='Markdown')
         return
-
     bot.send_message(chat_id, f"⚡ Осталось генераций: {u_data[0]}. Генерирую 5 тем (ВЧ)...")
-    
     info_json = proj[1] or {}
     survey = info_json.get("survey", "")
     competitors = info_json.get("competitors", "")
     kw = proj[2] or "Общие"
-    
     prompt = f"""
     You are a Senior SEO Specialist and Yoast SEO Expert.
-    
     Goal: Create 5 viral, high-ranking blog post titles optimized for the following context and keywords.
-    
     Context: {survey}
     Keywords: {kw[:1000]}
-    
     MANDATORY RULES:
     1. Focus on High-Volume Keywords from the provided list.
     2. Titles must be catchy but SEO-friendly (under 60 characters preferred).
     3. Return EXACTLY 5 titles as a JSON list of strings.
-    
     Example Output:
     ["Title 1", "Title 2", "Title 3", "Title 4", "Title 5"]
     """
-    
     topics = []
     try:
         raw_text = get_gemini_response(prompt)
@@ -925,44 +892,34 @@ def propose_articles(chat_id, pid):
         if len(topics) < 2: topics = ["SEO Topic 1", "SEO Topic 2", "SEO Topic 3", "SEO Topic 4", "SEO Topic 5"]
     except: 
         topics = ["Error generating topics"]
-
     info_json["temp_topics"] = topics
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info_json), pid))
     conn.commit(); cur.close(); conn.close()
-
     markup = types.InlineKeyboardMarkup(row_width=1)
     msg_text = "📝 **Выберите тему для статьи:**\n\n"
     for i, t in enumerate(topics):
         if i >= 5: break
         msg_text += f"{i+1}. **{t}**\n"
         markup.add(types.InlineKeyboardButton(f"Вариант {i+1}", callback_data=f"write_{pid}_topic_{i}"))
-        
     bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article(call):
     parts = call.data.split("_")
     pid, idx = parts[1], int(parts[3])
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     info, keywords = res[0], res[1] or ""
-    
     internal_links = info.get('internal_links', [])
     links_text = json.dumps(internal_links[:50], ensure_ascii=False)
-    
     topics = info.get("temp_topics", [])
     selected_topic = topics[idx] if len(topics) > idx else "SEO Article"
-    
     main_keyword = selected_topic.split(':')[0] if ':' in selected_topic else selected_topic
-    
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью (~2500 слов) с учетом Yoast SEO...", parse_mode='Markdown')
-    
     prompt = f"""
     You are a Senior SEO Copywriter. Write a blog post for the topic: "{selected_topic}".
-    
     CONTEXT & DATA:
     - Focus Keyword: "{main_keyword}" (Optimize STRICTLY for this).
     - Secondary Keywords: {keywords[:500]}...
@@ -979,17 +936,19 @@ def write_article(call):
        - Use transition words (However, Therefore, In addition) in >30% of sentences.
        - Passive voice <10%.
     6. **Structure**: Intro -> H2 -> H3 -> H2 -> H3 -> Conclusion. Total 2000+ words.
+    7. **Visuals**: Use <blockquote> for key takeaways. Use <table> for comparisons.
     
     OUTPUT FORMAT (Strict JSON):
     {{
-        "html_content": "Full article HTML content (h2, h3, p, ul, li). NO <html>, <head>, or <body> tags.",
+        "html_content": "Full article HTML content (h2, h3, p, ul, li, blockquote, table). NO <html>, <head>, or <body> tags.",
         "seo_title": "SEO Title (Start with Focus Keyword, max 60 chars)",
         "meta_desc": "Meta Description (Include Focus Keyword, max 155 chars)",
-        "focus_kw": "{main_keyword}"
+        "focus_kw": "{main_keyword}",
+        "image_prompt": "A highly detailed, photorealistic image of {main_keyword} in a modern setting, cinematic lighting",
+        "image_alt": "{main_keyword} close-up view"
     }}
     """
     response_text = get_gemini_response(prompt)
-    
     try:
         clean_json = response_text.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json)
@@ -997,11 +956,13 @@ def write_article(call):
         seo_data = {
             "seo_title": str(data.get("seo_title", "")),
             "meta_desc": str(data.get("meta_desc", "")),
-            "focus_kw": str(data.get("focus_kw", ""))
+            "focus_kw": str(data.get("focus_kw", "")),
+            "image_prompt": str(data.get("image_prompt", "")),
+            "image_alt": str(data.get("image_alt", ""))
         }
     except:
         article_html = response_text
-        seo_data = {"seo_title": selected_topic, "meta_desc": "", "focus_kw": main_keyword}
+        seo_data = {"seo_title": selected_topic, "meta_desc": "", "focus_kw": main_keyword, "image_prompt": "", "image_alt": ""}
 
     cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
     cur.execute("INSERT INTO articles (project_id, title, content, seo_data, status) VALUES (%s, %s, %s, %s, 'draft') RETURNING id", 
@@ -1011,7 +972,6 @@ def write_article(call):
     
     clean_view = format_html_for_chat(article_html)
     send_safe_message(call.message.chat.id, clean_view)
-    
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"),
                types.InlineKeyboardButton("✏️ Переписать (1 раз)", callback_data=f"rewrite_{aid}"))
@@ -1023,18 +983,14 @@ def rewrite_once(call):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT rewrite_count, title FROM articles WHERE id=%s", (aid,))
     res = cur.fetchone()
-    
     if res[0] > 0:
         bot.answer_callback_query(call.id, "⛔ Лимит переписываний (1 раз) исчерпан!")
         cur.close(); conn.close(); return
-        
     bot.edit_message_text("🔄 Переписываю...", call.message.chat.id, call.message.message_id)
-    prompt = f"Rewrite the article: "{res[1]}". Maintain strictly HTML format. Ensure short sentences and active voice. Return ONLY the HTML content."
+    prompt = f"Rewrite the article: '{res[1]}'. Maintain strictly HTML format. Ensure short sentences and active voice. Return ONLY the HTML content."
     text = get_gemini_response(prompt)
-    
     cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (text, aid))
     conn.commit(); cur.close(); conn.close()
-    
     clean_view = format_html_for_chat(text)
     send_safe_message(call.message.chat.id, clean_view)
     markup = types.InlineKeyboardMarkup()
@@ -1048,13 +1004,11 @@ def approve_publish(call):
     cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
     row = cur.fetchone()
     pid, title, content, seo_json = row
-    
     seo_data = seo_json
     if isinstance(seo_json, str):
         try: seo_data = json.loads(seo_json)
         except: seo_data = {}
-    elif seo_json is None:
-        seo_data = {}
+    elif seo_json is None: seo_data = {}
     
     cur.execute("SELECT cms_url, cms_login, cms_password FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
@@ -1066,20 +1020,27 @@ def approve_publish(call):
 
     url, login, pwd = res[0], res[1], res[2]
     formatted_content = content.replace("\n", "<br>")
-    
     if url.endswith('/'): url = url[:-1]
     api_url = f"{url}/wp-json/wp/v2/posts"
-    
     msg = bot.send_message(call.message.chat.id, "🚀 Публикую на сайт...")
     
     try:
+        # --- Image Generation and Upload ---
+        media_id = None
+        img_prompt = seo_data.get('image_prompt')
+        img_alt = seo_data.get('image_alt', title)
+        
+        if img_prompt:
+            bot.edit_message_text("🎨 Рисую обложку для статьи...", call.message.chat.id, msg.message_id)
+            media_id = upload_image_to_wp(url, login, pwd, img_prompt, img_alt)
+
+        # --- Publishing Article ---
         creds = f"{login}:{pwd}"
         token = base64.b64encode(creds.encode()).decode()
-        
         headers = {
             'Authorization': 'Basic ' + token,
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             'Cookie': 'beget=begetok'
         }
         
@@ -1093,10 +1054,13 @@ def approve_publish(call):
             'title': title,
             'content': formatted_content,
             'status': 'publish',
-            'meta': meta_payload 
+            'meta': meta_payload
         }
         
-        r = requests.post(api_url, headers=headers, json=post_data, timeout=20)
+        if media_id:
+            post_data['featured_media'] = media_id
+
+        r = requests.post(api_url, headers=headers, json=post_data, timeout=30)
         
         if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
              bot.delete_message(call.message.chat.id, msg.message_id)
@@ -1108,11 +1072,10 @@ def approve_publish(call):
             conn = get_db_connection(); cur = conn.cursor()
             cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
             conn.commit(); cur.close(); conn.close()
-            
             bot.delete_message(call.message.chat.id, msg.message_id)
             succ_msg = f"✅ **Успешно опубликовано!**\n🔗 {link}\n\n"
             succ_msg += f"🔑 Фокус: {seo_data.get('focus_kw')}\n"
-            succ_msg += f"🏷 SEO Title: {seo_data.get('seo_title')}"
+            if media_id: succ_msg += "🖼 Картинка сгенерирована и добавлена."
             bot.send_message(call.message.chat.id, succ_msg, parse_mode='Markdown')
         else:
             bot.delete_message(call.message.chat.id, msg.message_id)
@@ -1123,7 +1086,6 @@ def approve_publish(call):
             except:
                 err_msg = r.text[:200]
                 err_code = r.status_code
-
             err_text = f"❌ Ошибка WP ({err_code}): {err_msg}"
             if r.status_code == 401: err_text += "\n\nПроверьте Логин и Пароль приложения!"
             bot.send_message(call.message.chat.id, err_text)
@@ -1132,7 +1094,7 @@ def approve_publish(call):
         bot.delete_message(call.message.chat.id, msg.message_id)
         bot.send_message(call.message.chat.id, f"❌ Ошибка соединения: {e}")
 
-# --- 7. ТАРИФЫ ---
+# --- 7. ТАРИФЫ (и остальное) ---
 def show_tariff_periods(user_id):
     txt = ("💎 **ТАРИФНЫЕ ПЛАНЫ**\n\n"
            "1️⃣ **Тест-драйв** — 500р\n"
@@ -1146,7 +1108,6 @@ def show_tariff_periods(user_id):
            "4️⃣ **PBN Агент** — 7500р/мес\n"
            "• 100 генераций\n"
            "• Год: 62999р")
-
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("🏎 Тест-драйв (500р)", callback_data="period_test"))
     markup.add(types.InlineKeyboardButton("📅 На Месяц", callback_data="period_month"))
