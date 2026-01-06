@@ -223,6 +223,30 @@ def update_project_progress(pid, step_key):
     except: pass
     finally: cur.close(); conn.close()
 
+def format_html_for_chat(html_content):
+    """Превращает HTML статьи в читаемый вид для Telegram"""
+    # Заменяем заголовки на жирный текст с отступами
+    text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', html_content)
+    # Списки
+    text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
+    text = text.replace('<ul>', '').replace('</ul>', '').replace('<ol>', '').replace('</ol>', '')
+    # Параграфы
+    text = text.replace('<p>', '').replace('</p>', '\n\n')
+    # Переносы
+    text = text.replace('<br>', '\n').replace('<br/>', '\n')
+    # Удаляем лишние теги (оставляем только поддерживаемые телеграмом)
+    # BeautifulSoup get_text съедает всё, поэтому лучше regex для конкретных замен
+    # Но для безопасности прогоним через BS чтобы убрать head/body
+    soup = BeautifulSoup(text, "html.parser")
+    # Удаляем скрипты и стили
+    for script in soup(["script", "style", "head", "title"]):
+        script.decompose()
+    
+    clean_text = str(soup)
+    # Убираем двойные-тройные переносы
+    clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
+    return clean_text
+
 # --- 4. МЕНЮ ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -354,8 +378,9 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
             if not has_keywords:
                 markup.add(types.InlineKeyboardButton("🔑 Создать ключевые слова", callback_data=f"kw_ask_count_{pid}"))
             else:
+                markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
                 markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-                markup.add(types.InlineKeyboardButton("⚙️ Настройки сайта (CMS)", callback_data=f"cms_select_{pid}"))
+                
     else:
         if has_keywords:
             markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
@@ -494,7 +519,7 @@ def save_competitors(message, pid):
         bot.send_message(message.chat.id, f"❌ Произошла ошибка: {e}")
 
 
-# --- 7. ОПРОСНИК (5 вопросов) ---
+# --- 7. ОПРОСНИК ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
 def start_survey_6q(call):
     pid = call.data.split("_")[1]
@@ -733,9 +758,8 @@ def generate_keywords_action(call):
 def approve_keywords(call):
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup()
-    # NEW: Добавлена кнопка настройки сайта
+    # ТОЛЬКО КНОПКА НАСТРОЙКИ (Как просили)
     markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
-    markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
     bot.send_message(call.message.chat.id, "✅ Ключи утверждены! Рекомендую сразу настроить подключение к сайту.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("download_kw_"))
@@ -763,7 +787,7 @@ def cms_select_start(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cms_setup_wp_"))
 def cms_setup_wp(call):
     pid = call.data.split("_")[3]
-    # NEW: Инструкция перед вводом
+    # Инструкция
     instructions = (
         "🔐 **Как подключить WordPress:**\n\n"
         "1. Зайдите в админку сайта (`/wp-admin`).\n"
@@ -803,8 +827,12 @@ def cms_save_pass(message, pid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET cms_password=%s WHERE id=%s", (message.text.strip(), pid))
     conn.commit(); cur.close(); conn.close()
-    bot.send_message(message.chat.id, "✅ Настройки WordPress сохранены!")
-    open_project_menu(message.chat.id, pid, "management")
+    
+    # ПОСЛЕ НАСТРОЙКИ ТОЛЬКО ОДНА КНОПКА
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
+    
+    bot.send_message(message.chat.id, "✅ Настройки сохранены!", reply_markup=markup)
 
 # --- СТРАТЕГИЯ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
@@ -878,7 +906,7 @@ def propose_articles(chat_id, pid):
     competitors = info_json.get("competitors", "")
     kw = proj[2] or "Общие"
     
-    # NEW: Исправленный промпт для 5 тем (JSON список)
+    # ИСПРАВЛЕНО: JSON LIST для 5 тем
     prompt = f"""
     Роль: SEO Стратег. 
     Контекст: {survey}
@@ -958,10 +986,11 @@ def write_article(call):
         clean_json = response_text.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json)
         article_html = data.get("html_content", "")
+        # Убедимся, что данные - строки, а не None
         seo_data = {
-            "seo_title": data.get("seo_title", ""),
-            "meta_desc": data.get("meta_desc", ""),
-            "focus_kw": data.get("focus_kw", "")
+            "seo_title": str(data.get("seo_title", "")),
+            "meta_desc": str(data.get("meta_desc", "")),
+            "focus_kw": str(data.get("focus_kw", ""))
         }
     except:
         article_html = response_text
@@ -973,11 +1002,9 @@ def write_article(call):
     aid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
-    # NEW: Чистый текст для чата (удаляем теги)
-    soup_chat = BeautifulSoup(article_html, "html.parser")
-    clean_text_for_chat = soup_chat.get_text(separator="\n\n")
-    
-    send_safe_message(call.message.chat.id, clean_text_for_chat)
+    # ИСПРАВЛЕНО: Чистый, красивый вид в чате
+    clean_view = format_html_for_chat(article_html)
+    send_safe_message(call.message.chat.id, clean_view)
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"),
@@ -1002,11 +1029,8 @@ def rewrite_once(call):
     cur.execute("UPDATE articles SET content=%s, rewrite_count=1 WHERE id=%s", (text, aid))
     conn.commit(); cur.close(); conn.close()
     
-    # Clean text for chat
-    soup_chat = BeautifulSoup(text, "html.parser")
-    clean_text = soup_chat.get_text(separator="\n\n")
-    
-    send_safe_message(call.message.chat.id, clean_text)
+    clean_view = format_html_for_chat(text)
+    send_safe_message(call.message.chat.id, clean_view)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"))
     bot.send_message(call.message.chat.id, "👇 Обновленная версия.", reply_markup=markup)
@@ -1018,6 +1042,8 @@ def approve_publish(call):
     cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
     row = cur.fetchone()
     pid, title, content, seo_json = row
+    
+    # Загружаем SEO данные и проверяем их
     seo_data = seo_json if seo_json else {}
     
     cur.execute("SELECT cms_url, cms_login, cms_password FROM projects WHERE id=%s", (pid,))
@@ -1043,9 +1069,10 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
-        # NEW: Метаданные для Yoast в поле meta
+        # ИСПРАВЛЕНО: Meta payload для Yoast (стандартные ключи)
+        # ВАЖНО: Требует прав администратора у юзера API
         meta_payload = {
-            '_yoast_wpseo_title': seo_data.get('seo_title', title),
+            '_yoast_wpseo_title': seo_data.get('seo_title', ''),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
             '_yoast_wpseo_focuskw': seo_data.get('focus_kw', '')
         }
