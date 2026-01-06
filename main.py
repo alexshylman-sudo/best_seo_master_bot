@@ -224,27 +224,34 @@ def update_project_progress(pid, step_key):
     finally: cur.close(); conn.close()
 
 def format_html_for_chat(html_content):
-    """Превращает HTML статьи в читаемый вид для Telegram"""
-    # Заменяем заголовки на жирный текст с отступами
-    text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', html_content)
-    # Списки
+    """Очищает HTML и JSON мусор для красивого вывода в чат"""
+    # 1. Заменяем литералы \n на реальные переносы
+    text = html_content.replace('\\n', '\n')
+    
+    # 2. Убираем всё, что похоже на JSON в конце (если вдруг прилипло)
+    # Ищем закрывающую фигурную скобку и всё что после неё, если это похоже на мусор
+    if "}" in text and ("seo_title" in text or "focus_kw" in text):
+        text = text.split('"seo_title"')[0].rsplit(',', 1)[0] # Грубая обрезка JSON хвоста
+        text = text.strip().rstrip('}')
+
+    # 3. Форматирование HTML тегов для Telegram
+    text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
-    text = text.replace('<ul>', '').replace('</ul>', '').replace('<ol>', '').replace('</ol>', '')
-    # Параграфы
-    text = text.replace('<p>', '').replace('</p>', '\n\n')
-    # Переносы
-    text = text.replace('<br>', '\n').replace('<br/>', '\n')
-    # Удаляем лишние теги (оставляем только поддерживаемые телеграмом)
-    # BeautifulSoup get_text съедает всё, поэтому лучше regex для конкретных замен
-    # Но для безопасности прогоним через BS чтобы убрать head/body
+    
+    # Удаляем лишние теги
     soup = BeautifulSoup(text, "html.parser")
     # Удаляем скрипты и стили
-    for script in soup(["script", "style", "head", "title"]):
+    for script in soup(["script", "style", "head", "title", "meta"]):
         script.decompose()
     
-    clean_text = str(soup)
-    # Убираем двойные-тройные переносы
+    clean_text = soup.get_text(separator="\n\n")
+    
+    # Финальная чистка от множественных переносов
     clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
+    
+    # Убираем кавычки JSON если остались по краям
+    clean_text = clean_text.strip('",')
+    
     return clean_text
 
 # --- 4. МЕНЮ ---
@@ -758,7 +765,6 @@ def generate_keywords_action(call):
 def approve_keywords(call):
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup()
-    # ТОЛЬКО КНОПКА НАСТРОЙКИ (Как просили)
     markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
     bot.send_message(call.message.chat.id, "✅ Ключи утверждены! Рекомендую сразу настроить подключение к сайту.", reply_markup=markup)
 
@@ -787,7 +793,6 @@ def cms_select_start(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cms_setup_wp_"))
 def cms_setup_wp(call):
     pid = call.data.split("_")[3]
-    # Инструкция
     instructions = (
         "🔐 **Как подключить WordPress:**\n\n"
         "1. Зайдите в админку сайта (`/wp-admin`).\n"
@@ -827,11 +832,8 @@ def cms_save_pass(message, pid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET cms_password=%s WHERE id=%s", (message.text.strip(), pid))
     conn.commit(); cur.close(); conn.close()
-    
-    # ПОСЛЕ НАСТРОЙКИ ТОЛЬКО ОДНА КНОПКА
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-    
     bot.send_message(message.chat.id, "✅ Настройки сохранены!", reply_markup=markup)
 
 # --- СТРАТЕГИЯ ---
@@ -906,7 +908,6 @@ def propose_articles(chat_id, pid):
     competitors = info_json.get("competitors", "")
     kw = proj[2] or "Общие"
     
-    # ИСПРАВЛЕНО: JSON LIST для 5 тем
     prompt = f"""
     Роль: SEO Стратег. 
     Контекст: {survey}
@@ -923,6 +924,7 @@ def propose_articles(chat_id, pid):
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         topics = json.loads(clean_json)
         if not isinstance(topics, list): topics = ["Ошибка формата тем"]
+        if len(topics) < 2: topics = ["Тема 1", "Тема 2", "Тема 3", "Тема 4", "Тема 5"] # Fallback
     except: 
         topics = ["Ошибка генерации тем"]
 
@@ -933,6 +935,7 @@ def propose_articles(chat_id, pid):
     markup = types.InlineKeyboardMarkup(row_width=1)
     msg_text = "📝 **Выберите тему для статьи:**\n\n"
     for i, t in enumerate(topics):
+        if i >= 5: break
         msg_text += f"{i+1}. **{t}**\n"
         markup.add(types.InlineKeyboardButton(f"Вариант {i+1}", callback_data=f"write_{pid}_topic_{i}"))
         
@@ -986,7 +989,6 @@ def write_article(call):
         clean_json = response_text.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json)
         article_html = data.get("html_content", "")
-        # Убедимся, что данные - строки, а не None
         seo_data = {
             "seo_title": str(data.get("seo_title", "")),
             "meta_desc": str(data.get("meta_desc", "")),
@@ -1002,7 +1004,6 @@ def write_article(call):
     aid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     
-    # ИСПРАВЛЕНО: Чистый, красивый вид в чате
     clean_view = format_html_for_chat(article_html)
     send_safe_message(call.message.chat.id, clean_view)
     
@@ -1043,8 +1044,13 @@ def approve_publish(call):
     row = cur.fetchone()
     pid, title, content, seo_json = row
     
-    # Загружаем SEO данные и проверяем их
-    seo_data = seo_json if seo_json else {}
+    # Декодируем JSON если это строка, иначе берем как есть (psycopg2 авто-декод)
+    seo_data = seo_json
+    if isinstance(seo_json, str):
+        try: seo_data = json.loads(seo_json)
+        except: seo_data = {}
+    elif seo_json is None:
+        seo_data = {}
     
     cur.execute("SELECT cms_url, cms_login, cms_password FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
@@ -1069,8 +1075,7 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
-        # ИСПРАВЛЕНО: Meta payload для Yoast (стандартные ключи)
-        # ВАЖНО: Требует прав администратора у юзера API
+        # Meta payload для Yoast (ключи которые обычно работают через REST)
         meta_payload = {
             '_yoast_wpseo_title': seo_data.get('seo_title', ''),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
