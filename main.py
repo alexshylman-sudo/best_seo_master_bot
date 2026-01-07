@@ -1686,7 +1686,14 @@ def write_article_handler(call):
     pid, idx = parts[1], int(parts[3])
     
     bot.delete_message(call.message.chat.id, call.message.message_id)
-    bot.send_message(call.message.chat.id, f"⏳ Начинаю писать статью... Это займет около минуты.", parse_mode='Markdown')
+    # --- ADDED: SENDING GIF ---
+    gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif"
+    caption = "⏳ Начинаю писать статью... Это займет около минуты."
+    try:
+        bot.send_animation(call.message.chat.id, gif_url, caption=caption, parse_mode='Markdown')
+    except:
+        bot.send_message(call.message.chat.id, caption, parse_mode='Markdown')
+    # --------------------------
     
     def _write_art():
         try:
@@ -2078,5 +2085,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Nano Banana & Survey Fixed)...")
+    print("🤖 Бот запущен (Stable Image Gen & Safe MSG)...")
     bot.infinity_polling(skip_pending=True)
