@@ -34,7 +34,7 @@ bot = TeleBot(TOKEN)
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 UPLOAD_STATE = {} 
-SURVEY_STATE = {} # Temporary storage for survey steps
+SURVEY_STATE = {} 
 
 # --- 2. DATABASE ---
 def get_db_connection():
@@ -167,24 +167,46 @@ def escape_md(text):
 
 def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     if not text: return
+    
+    # Максимальная длина сообщения в Telegram - 4096
+    # Оставляем запас
+    MAX_LENGTH = 3800 
+    
     parts = []
-    chunk_size = 3500 
     while len(text) > 0:
-        if len(text) > chunk_size:
-            split_pos = text.rfind('\n', 0, chunk_size)
-            if split_pos == -1: split_pos = chunk_size
+        if len(text) > MAX_LENGTH:
+            # Ищем ближайший перенос строки, чтобы не рвать слова
+            split_pos = text.rfind('\n', 0, MAX_LENGTH)
+            if split_pos == -1:
+                split_pos = text.rfind(' ', 0, MAX_LENGTH) # Если нет переноса строки, ищем пробел
+            if split_pos == -1: 
+                split_pos = MAX_LENGTH # Если нет ни того, ни другого, режем жестко
+                
             parts.append(text[:split_pos])
             text = text[split_pos:]
         else:
             parts.append(text)
             text = ""
+            
     for i, part in enumerate(parts):
-        markup = reply_markup if i == len(parts) - 1 else None
-        try: bot.send_message(chat_id, part, parse_mode=parse_mode, reply_markup=markup)
-        except: 
-            try: bot.send_message(chat_id, part, parse_mode=None, reply_markup=markup)
-            except: pass
-        time.sleep(0.1)
+        # Если это последнее сообщение в цепочке, добавляем кнопки (если есть)
+        # НО: если текст был разбит на части, лучше прислать кнопки отдельным сообщением, 
+        # чтобы они не прилипли к середине текста, если логика сложная.
+        # В данном коде мы будем присылать кнопки только с последним куском.
+        
+        is_last = (i == len(parts) - 1)
+        current_markup = reply_markup if is_last else None
+        
+        try:
+            bot.send_message(chat_id, part, parse_mode=parse_mode, reply_markup=current_markup)
+        except Exception as e:
+            # Если не вышло с HTML (частая ошибка), пробуем без форматирования
+            try:
+                bot.send_message(chat_id, part, parse_mode=None, reply_markup=current_markup)
+            except Exception as e2:
+                print(f"❌ Failed to send message part: {e2}")
+        
+        time.sleep(0.3) # Небольшая пауза, чтобы порядок сообщений не сбился
 
 def get_gemini_response(prompt):
     try:
@@ -301,6 +323,8 @@ def format_html_for_chat(html_content):
     text = re.sub(r'\[IMG:.*?\]', '', text)
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
+    text = re.sub(r'<br\s*/?>', '\n', text) # Handle BR tags
+    text = re.sub(r'<p>(.*?)</p>', r'\1\n\n', text) # Handle P tags for better spacing
     
     soup = BeautifulSoup(text, "html.parser")
     for script in soup(["script", "style", "head", "title", "meta", "table", "style"]):
@@ -312,7 +336,6 @@ def format_html_for_chat(html_content):
 # --- 4. IMAGE GENERATION (NANO BANANA / GEMINI FLASH IMAGE) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
     image_bytes = None
-    # ✅ MODEL CHANGED TO NANO BANANA (GEMINI 2.5 FLASH IMAGE)
     target_model = 'gemini-2.5-flash-image'
     
     base_negative = "exclude text, writing, letters, watermarks, signature, words"
@@ -1074,8 +1097,7 @@ def kw_gen_handler(call):
     pid = parts[2]
     count = parts[3]
     
-    bot.edit_message_text(f"⏳ Генерирую {count} ключевых слов и разбиваю на кластеры... Это может занять время.", 
-                          call.message.chat.id, call.message.message_id)
+    bot.send_message(call.message.chat.id, f"⏳ Генерирую {count} ключевых слов и разбиваю на кластеры... Это может занять время.")
     
     def _gen_keywords():
         try:
@@ -1114,8 +1136,8 @@ def kw_gen_handler(call):
             cur.execute("UPDATE projects SET keywords=%s WHERE id=%s", (ai_resp, pid))
             conn.commit(); cur.close(); conn.close()
             
-            # Send result snippet and menu
-            snippet = ai_resp[:3000] + ("..." if len(ai_resp) > 3000 else "")
+            # --- FIXED: Use safe message sender instead of truncation ---
+            send_safe_message(call.message.chat.id, f"🔑 **Семантическое ядро ({count} шт):**\n\n{ai_resp}", parse_mode=None)
             
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"kw_approve_{pid}"),
@@ -1123,8 +1145,7 @@ def kw_gen_handler(call):
                        types.InlineKeyboardButton("🔄 Пройти опрос заново", callback_data=f"srv_{pid}"),
                        types.InlineKeyboardButton("🔢 Изменить количество", callback_data=f"kw_ask_count_{pid}"))
             
-            bot.send_message(call.message.chat.id, f"🔑 **Семантическое ядро (предпросмотр):**\n\n{snippet}", 
-                             reply_markup=markup, parse_mode=None) # No markdown to avoid breakage on lists
+            bot.send_message(call.message.chat.id, "👇 Действия:", reply_markup=markup)
             
         except Exception as e:
             bot.send_message(call.message.chat.id, f"❌ Ошибка генерации: {e}")
@@ -1709,10 +1730,9 @@ def write_article_handler(call):
             conn.commit(); cur.close(); conn.close()
             
             clean_view = format_html_for_chat(article_html)
-            try:
-                send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
-            except:
-                send_safe_message(call.message.chat.id, clean_view, parse_mode=None)
+            
+            # --- SAFE SENDING ---
+            send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
             
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"pre_approve_{aid}"),
@@ -1816,10 +1836,9 @@ def rewrite_article(call):
             conn.commit(); cur.close(); conn.close()
 
             clean_view = format_html_for_chat(article_html)
-            try:
-                send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
-            except:
-                send_safe_message(call.message.chat.id, clean_view, parse_mode=None)
+            
+            # --- SAFE SENDING ---
+            send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
             
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"pre_approve_{aid}"))
