@@ -17,6 +17,7 @@ from google import genai
 from google.genai import types as genai_types
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import xml.etree.ElementTree as ET
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
@@ -53,6 +54,7 @@ def patch_db_schema():
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_url TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_key TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS content_plan JSONB DEFAULT '[]'")
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS sitemap_links JSONB DEFAULT '[]'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seo_data JSONB DEFAULT '{}'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS scheduled_time TIMESTAMP")
         conn.commit()
@@ -94,6 +96,7 @@ def init_db():
             platform TEXT,
             frequency INT DEFAULT 0,
             content_plan JSONB DEFAULT '[]',
+            sitemap_links JSONB DEFAULT '[]',
             progress JSONB DEFAULT '{"info_done": false, "analysis_done": false, "upload_done": false, "competitors_done": false, "settings_done": false}', 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -185,6 +188,42 @@ def check_site_availability(url):
         return response.status_code == 200
     except: return False
 
+def parse_sitemap(url):
+    """Пытается найти sitemap.xml и извлечь ссылки"""
+    links = []
+    try:
+        # 1. Пробуем стандартные пути
+        sitemap_url = url.rstrip('/') + '/sitemap.xml'
+        resp = requests.get(sitemap_url, timeout=10)
+        
+        if resp.status_code == 200:
+            try:
+                root = ET.fromstring(resp.content)
+                # Обработка namespaces в XML (частая проблема sitemap)
+                ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+                for url_tag in root.findall('.//s:loc', ns):
+                    links.append(url_tag.text)
+                if not links: # Если ns не сработал, пробуем без него (иногда бывает)
+                    for url_tag in root.findall('.//loc'):
+                        links.append(url_tag.text)
+            except: pass
+        
+        # 2. Если sitemap пуст, парсим главную страницу на предмет ссылок
+        if not links:
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            domain = urlparse(url).netloc
+            for a in soup.find_all('a', href=True):
+                full_url = urljoin(url, a['href'])
+                if urlparse(full_url).netloc == domain:
+                    links.append(full_url)
+        
+        # Фильтрация мусора (картинки, админка)
+        clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed'])]
+        return clean_links[:100] # Берем топ-100 для экономии токенов
+    except:
+        return []
+
 def deep_analyze_site(url):
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 Bot"})
@@ -194,18 +233,7 @@ def deep_analyze_site(url):
         desc = desc["content"] if desc else "No Description"
         headers = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
         raw_text = soup.get_text()[:5000].strip()
-        internal_links = []
-        domain = urlparse(url).netloc
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag['href']
-            full_url = urljoin(url, href)
-            parsed_href = urlparse(full_url)
-            if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.pdf', '.css', '.js']):
-                link_text = a_tag.get_text().strip()
-                if link_text and len(link_text) > 3: 
-                    internal_links.append({"url": full_url, "anchor": link_text})
-        unique_links = list({v['url']: v for v in internal_links}.values())[:100]
-        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nContent: {raw_text}", unique_links
+        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nContent: {raw_text}", []
     except Exception as e:
         return f"Error: {e}", []
 
@@ -302,6 +330,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
+            # Critical for Yoast SEO Green Light on Images
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
@@ -394,10 +423,15 @@ def check_url_step(message):
         bot.register_next_step_handler(msg, check_url_step)
         return
     
+    # Сразу парсим sitemap при добавлении
+    sitemap_links = parse_sitemap(url)
+    
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("INSERT INTO projects (user_id, type, url, info, progress) VALUES (%s, 'site', %s, '{}', '{}') RETURNING id", (message.from_user.id, url))
+    cur.execute("INSERT INTO projects (user_id, type, url, info, sitemap_links, progress) VALUES (%s, 'site', %s, '{}', %s, '{}') RETURNING id", 
+                (message.from_user.id, url, json.dumps(sitemap_links)))
     pid = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
+    
     USER_CONTEXT[message.from_user.id] = pid
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
@@ -797,6 +831,7 @@ def save_freq_and_plan(call):
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
     
+    # Кнопки замены (Пн, Вт...)
     short_days = {"Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср", "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"}
     repl_btns = []
     for i, item in enumerate(calendar_plan):
@@ -915,11 +950,12 @@ def write_article_handler(call):
     pid, idx = parts[1], int(parts[3])
     
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
+    cur.execute("SELECT info, keywords, sitemap_links FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     info, keywords = res[0], res[1] or ""
-    internal_links = info.get('internal_links', [])
-    links_text = json.dumps(internal_links[:50], ensure_ascii=False)
+    # Get Real Sitemap Links for Internal Linking
+    sitemap_list = res[2] if res[2] else []
+    links_text = json.dumps(sitemap_list[:50], ensure_ascii=False) if sitemap_list else "No internal links found."
     
     topics = info.get("temp_topics", [])
     topic_text = topics[idx] if len(topics) > idx else "SEO Article"
@@ -946,7 +982,7 @@ def write_article_handler(call):
     2. **Keyphrase Density**: Use the keyword 0.5-2% of the text length (~15-30 times).
     3. **Subheadings**: Include focus keyword in 50% of H2 and H3 tags.
     4. **Links**:
-       - Internal Links: Pick 3 relevant from: {links_text}
+       - Internal Links: Pick 3 RELEVANT from this list: {links_text}
        - Outbound Links: Insert 2 links to authoritative sites (Wikipedia, specialized portals) in new tab.
     5. **Readability**:
        - Short paragraphs (max 150 words).
