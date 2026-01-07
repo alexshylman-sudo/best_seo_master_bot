@@ -297,35 +297,27 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     Returns: (media_id, source_url, debug_message)
     """
     image_bytes = None
-    debug_msg = ""
     
     # 1. Используем модель для Tier 1
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # 2. Улучшаем промпт
+    # 2. Улучшенный промпт для фотореализма
     final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting"
     
     print(f"🎨 Imagen 4 Generating: {final_prompt[:40]}...")
     
     try:
+        # Убрали safety_settings из config, так как это вызывает ошибку валидации
         response = client.models.generate_images(
             model=target_model, 
             prompt=final_prompt,
             config=genai_types.GenerateImagesConfig(
                 number_of_images=1,
-                aspect_ratio='16:9', # Формат 16:9 для блога
-                # Минимальные фильтры безопасности для платного тарифа
-                safety_settings=[
-                    genai_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
-                    genai_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
-                    genai_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
-                    genai_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
-                ]
+                aspect_ratio='16:9'
             )
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-            debug_msg += "✅ Imagen OK. "
         else:
             return None, None, "⚠️ Imagen вернул пустоту (Safety)."
             
@@ -390,7 +382,7 @@ def start(message):
         cur = conn.cursor()
         cur.execute("INSERT INTO users (user_id, gens_left) VALUES (%s, 2) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit(); cur.close(); conn.close()
-    bot.send_message(user_id, "👋 AI SEO Master (Tier 1 Enabled).", reply_markup=main_menu_markup(user_id))
+    bot.send_message(user_id, "👋 Привет! Я AI SEO Master.\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
 
 @bot.message_handler(func=lambda m: m.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"])
 def menu_handler(message):
