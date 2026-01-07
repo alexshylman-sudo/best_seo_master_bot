@@ -311,10 +311,12 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
     image_bytes = None
     target_model = 'imagen-4.0-fast-generate-001'
     
+    # --- UPDATED: NO TEXT INSTRUCTION ---
     if project_style and len(project_style) > 5:
-        final_prompt = f"{project_style}. {image_prompt}. High resolution, 8k, cinematic lighting."
+        final_prompt = f"{project_style}. {image_prompt}. High resolution, 8k, cinematic lighting. NO TEXT, NO WORDS, NO LETTERS, CLEAN IMAGE."
     else:
-        final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting"
+        final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting. NO TEXT, NO WORDS, NO LETTERS."
+    # ------------------------------------
     
     print(f"🎨 Imagen 4 Generating: {final_prompt[:60]}...")
     
@@ -1452,7 +1454,7 @@ def write_article_handler(call):
             
             style_prompt = res[3] or "" # Стиль из базы знаний
             
-            links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
+            links_text = "\n".join(sitemap_list[:50]) if sitemap_list else "No internal links found."
             
             topics = info.get("temp_topics", [])
             topic_text = topics[idx] if len(topics) > idx else "SEO Article"
@@ -1462,7 +1464,7 @@ def write_article_handler(call):
             cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
             conn.commit()
             
-            # 2. ПРОМПТ С КЛЮЧАМИ ИЗ БАЗЫ
+            # --- UPDATED PROMPT: YOAST RULES & INTERNAL LINKS ---
             prompt = f"""
             Role: Professional Magazine Editor & Yoast SEO Expert.
             Topic: "{topic_text}"
@@ -1473,20 +1475,21 @@ def write_article_handler(call):
             
             IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
             
-            SEO SEMANTIC CORE (Integrate these keywords naturally into the text):
+            SEO SEMANTIC CORE (Integrate these keywords naturally):
             {keywords_raw}
             
-            MANDATORY YOAST SEO RULES (GREEN BULLET):
-            1. **Focus Keyword**: Pick ONE main keyword from the list above that best fits the topic. Use it in the Title, first paragraph, and subheadings.
-            2. **Keyphrase Density**: Use the focus keyword 0.5-2% of the text length.
-            3. **Subheadings**: Include focus keyword in 50% of H2 and H3 tags.
-            4. **Internal Linking**: You MUST insert 2-3 links to other pages from this list:
+            MANDATORY YOAST SEO RULES (STRICT):
+            1. **Focus Keyword**: Pick ONE main keyword. It MUST appear in the **First Sentence of the First Paragraph**.
+            2. **Keyphrase Density**: Use the focus keyword frequently (0.5-2%).
+            3. **Subheadings**: The Focus Keyword MUST appear in at least 50% of H2 and H3 subheadings.
+            4. **Internal Linking**: Pick 2-3 specific URLs from the list below. Integrate them naturally using relevant anchor text (do NOT link to sitemap.xml, do NOT use "read here"):
+            LIST OF PROJECT URLS:
             {links_text}
-            (Insert them naturally in context using <a href="...">anchor</a>).
-            5. **Readability**: Short paragraphs. Use transition words.
-            6. **Images**: Insert 5 [IMG: description containing keyword] placeholders.
-            7. **Meta Description**: Max 155 characters. Must contain keyword.
-            8. **Title**: Max 60 chars. Start with Keyword.
+            5. **Outbound Linking**: Include 1 relevant external link to a high-authority domain (e.g., Wikipedia, Industry News) for reference.
+            6. **Readability**: Short paragraphs. Use transition words.
+            7. **Images**: Insert 5 [IMG: description containing keyword] placeholders.
+            8. **Meta Description**: Max 155 characters. The Focus Keyword MUST be included.
+            9. **Title**: Start exactly with the Focus Keyword.
             
             OUTPUT JSON ONLY:
             {{
@@ -1494,9 +1497,11 @@ def write_article_handler(call):
                 "seo_title": "SEO Title (Max 60 chars)",
                 "meta_desc": "Meta Description (Max 155 chars)",
                 "focus_kw": "Selected Focus Keyword",
-                "featured_img_prompt": "Photorealistic image of {topic_text}, interior design style"
+                "featured_img_prompt": "Photorealistic image of {topic_text}, interior design style, NO TEXT"
             }}
             """
+            # ----------------------------------------------------
+
             response_text = get_gemini_response(prompt)
             
             data = clean_and_parse_json(response_text)
@@ -1573,10 +1578,11 @@ def rewrite_article(call):
                 sitemap_list = []
             # ---------------------------------
             
-            links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
+            links_text = "\n".join(sitemap_list[:50]) if sitemap_list else "No internal links found."
             
             current_year = datetime.datetime.now().year
             
+            # --- UPDATED PROMPT: YOAST RULES & INTERNAL LINKS ---
             prompt = f"""
             TASK: REWRITE this article completely. Make it more engaging, human-like, and professional.
             Topic: "{title}"
@@ -1585,10 +1591,14 @@ def rewrite_article(call):
             Current Year: {current_year}.
             Style Prompt: {style_prompt}
             
-            KEEP SEO OPTIMIZATION:
-            Keywords: {keywords_raw}
-            Yoast Rules: Focus keyword in title, headers, first paragraph.
-            Internal Links: {links_text}
+            KEEP SEO OPTIMIZATION (STRICT YOAST RULES):
+            1. **Focus Keyword**: MUST appear in the **First Sentence**.
+            2. **Internal Linking**: Pick 2-3 specific URLs from this list:
+            {links_text}
+            Integrate them naturally (do NOT link to sitemap.xml).
+            3. **Outbound Linking**: Include 1 relevant external link (e.g., Wikipedia).
+            4. **Subheadings**: Include focus keyword in 50% of subheaders.
+            5. **Meta Description**: Must include the focus keyword.
             
             OUTPUT JSON ONLY (Same format):
             {{
@@ -1596,9 +1606,10 @@ def rewrite_article(call):
                 "seo_title": "...",
                 "meta_desc": "...",
                 "focus_kw": "...",
-                "featured_img_prompt": "..."
+                "featured_img_prompt": "... NO TEXT"
             }}
             """
+            # ----------------------------------------------------
             
             response_text = get_gemini_response(prompt)
             data = clean_and_parse_json(response_text)
