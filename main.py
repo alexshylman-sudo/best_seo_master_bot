@@ -223,48 +223,73 @@ def update_project_progress(pid, step_key):
     finally: cur.close(); conn.close()
 
 def clean_and_parse_json(text):
-    """Надежно извлекает JSON из ответа AI"""
-    try:
-        # 1. Попытка найти JSON блок между ```json и ```
-        match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1))
+    """Строго извлекает JSON из ответа, убирая мусор вокруг"""
+    text = str(text).strip()
+    
+    # Попытка 1: Найти блок ```json ... ```
+    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if match:
+        try: return json.loads(match.group(1))
+        except: pass
+    
+    # Попытка 2: Найти самую первую { и самую последнюю }
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1:
+        json_str = text[start:end+1]
+        try: return json.loads(json_str)
+        except: pass
         
-        # 2. Попытка найти просто объект {}
-        match = re.search(r'(\{.*\})', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1))
-            
-        return None
-    except:
-        return None
+    return None
 
 def format_html_for_chat(html_content):
-    """Очищает HTML для чата"""
+    """Чистит HTML для чата и убирает технический JSON в конце"""
     text = str(html_content).replace('\\n', '\n')
     
-    # Удаляем JSON из конца, если он прилип
-    if '"seo_title":' in text: 
-        text = text.split('"seo_title":')[0].rsplit(',', 1)[0].rsplit('{', 1)[0]
+    # 1. Жесткая чистка JSON хвоста
+    # Если в тексте встречается "seo_title": или "meta_desc":, обрезаем все начиная с последней { перед этим
+    if '"seo_title":' in text or '"meta_desc":' in text:
+        # Ищем последнюю закрывающую фигурную скобку JSON-блока или начало блока
+        # Простой метод: если видим начало JSON структуры в конце файла
+        split_candidates = text.split('",\n"seo_title":')
+        if len(split_candidates) > 1:
+             # Это грязный хак, но он работает для формата Gemini
+             text = split_candidates[0].rsplit('"', 1)[0]
+    
+    # Дополнительная проверка на остаточные артефакты JSON в конце
+    text = re.sub(r'\}\s*$', '', text)
+    text = re.sub(r'```json.*', '', text, flags=re.DOTALL)
+    text = re.sub(r'```', '', text)
 
-    # Убираем плейсхолдеры картинок из чата
+    # 2. Убираем плейсхолдеры картинок
     text = re.sub(r'\[IMG:.*?\]', '', text)
     
+    # 3. Форматирование заголовков и списков
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
     
+    # 4. Чистка тегов
     soup = BeautifulSoup(text, "html.parser")
     for script in soup(["script", "style", "head", "title", "meta", "table", "style"]):
         script.decompose()
     
     clean_text = soup.get_text(separator="\n\n")
     clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
+    
+    # Финальная зачистка краев
     return clean_text.strip('",}').strip()
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
-    """ТОЛЬКО GOOGLE. Без Pollinations."""
+    """
+    Генерация ИСКЛЮЧИТЕЛЬНО через Google Imagen.
+    Если не работает - возвращаем None (статья без картинки).
+    НИКАКИХ Pollinations!
+    """
     image_bytes = None
+    
+    print(f"🎨 Пробую генерировать изображение через Google Imagen: {image_prompt[:50]}...")
     try:
+        # Используем модель imagen-3.0-generate-001
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
             prompt=image_prompt,
@@ -272,13 +297,17 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-            print("Generated via Google Imagen")
+            print("✅ Успешная генерация (Google)")
     except Exception as e:
-        print(f"Google Imagen Error: {e}")
-        # Если здесь ошибка - картинки не будет. Это по вашему требованию.
+        print(f"❌ Ошибка Google Imagen: {e}")
+        # Здесь мы просто выходим. Никаких фоллбеков.
+        return None, None
 
-    if not image_bytes: return None, None
+    if not image_bytes: 
+        print("❌ Google не вернул изображение (пустой ответ).")
+        return None, None
 
+    # Загрузка в WP
     try:
         if api_url.endswith('/'): api_url = api_url[:-1]
         seed = random.randint(1, 99999)
@@ -291,6 +320,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             'Content-Type': 'image/png',
             'User-Agent': 'Mozilla/5.0'
         }
+        
         upload_api = f"{api_url}/wp-json/wp/v2/media"
         r = requests.post(upload_api, headers=headers, data=image_bytes, timeout=60)
         
@@ -304,10 +334,14 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
                 json={'alt_text': alt_text}, 
                 timeout=10
             )
+            print(f"✅ Картинка загружена в WP: {source_url}")
             return media_id, source_url
+        else:
+            print(f"❌ Ошибка загрузки в WP: {r.status_code} {r.text}")
+            return None, None
     except Exception as e:
-        print(f"WP Upload Error: {e}")
-    return None, None
+        print(f"❌ Ошибка соединения с WP: {e}")
+        return None, None
 
 # --- 4. МЕНЮ ---
 def main_menu_markup(user_id):
@@ -466,11 +500,11 @@ def open_proj_mgmt(call):
 def project_settings_menu(call):
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("🔑 Ключи", callback_data=f"view_kw_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("📝 Опрос", callback_data=f"srv_{pid}"))
     markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"comp_start_{pid}"))
     markup.add(types.InlineKeyboardButton("⚙️ CMS", callback_data=f"cms_select_{pid}"))
-    markup.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"ask_del_{pid}"))
+    markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -591,7 +625,8 @@ def process_payment(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ask_del_"))
 def ask_del(call):
-    pid = call.data.split("_")[2]
+    # Fix: Get PID from the last element to avoid 'plan' error
+    pid = call.data.split("_")[-1]
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("DELETE FROM projects WHERE id=%s", (pid,))
     conn.commit(); cur.close(); conn.close()
@@ -690,16 +725,49 @@ def perform_analysis(call):
 def strategy_start(call):
     pid = call.data.split("_")[1]
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT cms_login FROM projects WHERE id=%s", (pid,))
-    if not cur.fetchone()[0]:
-        cur.close(); conn.close()
+    
+    cur.execute("SELECT cms_login, content_plan FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    cur.close(); conn.close()
+    
+    if not res[0]:
         bot.send_message(call.message.chat.id, "⚠️ Настройте CMS в настройках проекта!")
         return
-    cur.close(); conn.close()
+    
+    plan = res[1]
+    if plan and len(plan) > 0:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Показать текущий план", callback_data=f"show_plan_{pid}"))
+        markup.add(types.InlineKeyboardButton("🗑 Удалить и создать новый", callback_data=f"reset_plan_{pid}"))
+        bot.send_message(call.message.chat.id, "📅 У вас уже утвержден план на эту неделю.", reply_markup=markup)
+        return
+
     markup = types.InlineKeyboardMarkup(row_width=4)
     btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
     markup.add(*btns)
     bot.send_message(call.message.chat.id, "📅 Сколько статей в неделю?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("show_plan_"))
+def show_current_plan(call):
+    pid = call.data.split("_")[2]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT content_plan FROM projects WHERE id=%s", (pid,))
+    plan = cur.fetchone()[0] or []
+    cur.close(); conn.close()
+    
+    msg = "🗓 **Ваш текущий план:**\n\n"
+    for item in plan:
+        msg += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
+    
+    bot.send_message(call.message.chat.id, msg, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reset_plan_"))
+def reset_plan(call):
+    pid = call.data.split("_")[2]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
+    conn.commit(); cur.close(); conn.close()
+    strategy_start(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("freq_"))
 def save_freq_and_plan(call):
@@ -725,9 +793,10 @@ def save_freq_and_plan(call):
     survey = info_json.get("survey", "")
     kw = res[1] or ""
     
+    days_str = ", ".join(remaining_days[:actual_count])
     prompt = f"""
     Роль: SEO Маркетолог.
-    Задача: Составь контент-план только на эти дни: {", ".join(remaining_days[:actual_count])}.
+    Задача: Составь контент-план только на эти дни: {days_str}.
     Всего статей: {actual_count}.
     Ниша: {survey}. Ключи: {kw[:1000]}
     
@@ -739,7 +808,6 @@ def save_freq_and_plan(call):
     """
     ai_resp = get_gemini_response(prompt)
     
-    # Надежный парсинг JSON
     calendar_plan = clean_and_parse_json(ai_resp)
     if not calendar_plan:
         calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации, попробуйте сбросить"}]
@@ -755,7 +823,6 @@ def save_freq_and_plan(call):
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
     
-    # Кнопки замены (Пн, Вт...)
     short_days = {"Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср", "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"}
     repl_btns = []
     for i, item in enumerate(calendar_plan):
@@ -781,7 +848,6 @@ def replace_topic(call):
     
     if idx < len(plan):
         old_topic = plan[idx]['topic']
-        # Исправлено: Добавлен контекст для избежания галлюцинаций
         prompt = f"""
         Задача: Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. 
         Контекст ниши: {keywords[:500]}
@@ -829,7 +895,6 @@ def approve_plan(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
-    # Генерация 1 статьи сразу
     write_article_handler(call) 
 
 # --- НАПИСАНИЕ СТАТЬИ ---
@@ -898,7 +963,6 @@ def write_article_handler(call):
     """
     response_text = get_gemini_response(prompt)
     
-    # Используем новый надежный парсер JSON
     data = clean_and_parse_json(response_text)
     
     if data:
@@ -949,7 +1013,6 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
-            # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
