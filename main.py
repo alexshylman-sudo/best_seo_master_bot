@@ -1834,7 +1834,14 @@ def rewrite_article(call):
     cur.execute("UPDATE articles SET rewrite_count = rewrite_count + 1 WHERE id=%s", (aid,))
     conn.commit()
     
-    bot.send_message(call.message.chat.id, "⏳ Переписываю статью (это займет около минуты)...")
+    # --- ADDED: SENDING GIF FOR REWRITE ---
+    gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif"
+    caption = "⏳ Переписываю статью (это займет около минуты)..."
+    try:
+        bot.send_animation(call.message.chat.id, gif_url, caption=caption, parse_mode='Markdown')
+    except:
+        bot.send_message(call.message.chat.id, caption, parse_mode='Markdown')
+    # --------------------------
     
     def _do_rewrite():
         try:
@@ -1861,8 +1868,10 @@ def rewrite_article(call):
             
             current_year = datetime.datetime.now().year
             
-            # --- UPDATED PROMPT: YOAST RULES & INTERNAL LINKS ---
+            # --- UPDATED PROMPT: STRICT RUSSIAN LANGUAGE ---
             prompt = f"""
+            STRICTLY RUSSIAN LANGUAGE (Русский язык). NO ENGLISH.
+            
             TASK: REWRITE this article completely. Make it more engaging, human-like, and professional.
             Topic: "{title}"
             Length: 2000-2500 words.
@@ -1901,6 +1910,8 @@ def rewrite_article(call):
                 "focus_kw": "...",
                 "featured_img_prompt": "... NO TEXT"
             }}
+            
+            REMEMBER: OUTPUT MUST BE IN RUSSIAN.
             """
             # ----------------------------------------------------
             
@@ -2050,7 +2061,8 @@ def approve_publish(call):
                     try: bot.delete_message(call.message.chat.id, call.message.message_id) 
                     except: pass
                     
-                    success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
+                    # --- UPDATED GIF FOR SUCCESSFUL PUBLISH ---
+                    success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080228.gif"
                     
                     markup_final = types.InlineKeyboardMarkup()
                     markup_final.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
