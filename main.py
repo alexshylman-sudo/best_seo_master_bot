@@ -18,7 +18,7 @@ from google.genai import types as genai_types
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# --- 1. КОНФИГУРАЦИЯ ---
+# --- 1. CONFIGURATION ---
 load_dotenv()
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "203473623")) 
@@ -32,7 +32,7 @@ bot = TeleBot(TOKEN)
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 
-# --- 2. БАЗА ДАННЫХ ---
+# --- 2. DATABASE ---
 def get_db_connection():
     try:
         return psycopg2.connect(DB_URL)
@@ -57,7 +57,7 @@ def patch_db_schema():
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS scheduled_time TIMESTAMP")
         conn.commit()
     except Exception as e: 
-        print(f"⚠️ Ошибка патчинга БД: {e}")
+        print(f"⚠️ Schema Patch Error: {e}")
     finally: cur.close(); conn.close()
 
 def init_db():
@@ -68,7 +68,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
             balance INT DEFAULT 0,
-            tariff TEXT DEFAULT 'Нет тарифа',
+            tariff TEXT DEFAULT 'No Tariff',
             tariff_expires TIMESTAMP,
             gens_left INT DEFAULT 2,
             is_admin BOOLEAN DEFAULT FALSE,
@@ -137,7 +137,7 @@ def update_last_active(user_id):
         conn.commit(); cur.close(); conn.close()
     except: pass
 
-# --- 3. УТИЛИТЫ ---
+# --- 3. UTILITIES ---
 def escape_md(text):
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
@@ -168,13 +168,13 @@ def get_gemini_response(prompt):
         response = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
         return response.text
     except Exception as e:
-        return f"Ошибка AI: {e}"
+        return f"AI Error: {e}"
 
 def validate_input(text, question_context):
     if text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
         return False, "MENU_CLICK"
     try:
-        prompt = f"Модератор. Вопрос: '{question_context}'. Ответ: '{text}'. Проверь на мат, спам или бессмыслицу. Если плохо - ответь BAD. Если нормально - ответь OK."
+        prompt = f"Moderator. Question: '{question_context}'. Answer: '{text}'. Check for spam. If bad respond BAD. If ok respond OK."
         res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt]).text.strip()
         return ("BAD" not in res.upper()), "AI_CHECK"
     except: return True, "SKIP"
@@ -194,21 +194,9 @@ def deep_analyze_site(url):
         desc = desc["content"] if desc else "No Description"
         headers = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
         raw_text = soup.get_text()[:5000].strip()
-        internal_links = []
-        domain = urlparse(url).netloc
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag['href']
-            full_url = urljoin(url, href)
-            parsed_href = urlparse(full_url)
-            if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.pdf', '.css', '.js']):
-                link_text = a_tag.get_text().strip()
-                if link_text and len(link_text) > 3: 
-                    internal_links.append({"url": full_url, "anchor": link_text})
-        unique_links = list({v['url']: v for v in internal_links}.values())[:100]
-        analysis_text = f"URL: {url}\nTitle: {title}\nDesc: {desc}\nHeaders: {headers}\nContent Sample: {raw_text}"
-        return analysis_text, top_links
+        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nContent: {raw_text}", []
     except Exception as e:
-        return f"Ошибка доступа к сайту: {e}", []
+        return f"Error: {e}", []
 
 def update_project_progress(pid, step_key):
     conn = get_db_connection(); cur = conn.cursor()
@@ -223,37 +211,44 @@ def update_project_progress(pid, step_key):
     finally: cur.close(); conn.close()
 
 def clean_and_parse_json(text):
-    """Строго извлекает JSON из ответа"""
+    """Robust JSON extraction"""
     text = str(text).strip()
     match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
     if match:
         try: return json.loads(match.group(1))
         except: pass
     
+    # Try list format [ ... ]
+    match_list = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
+    if match_list:
+        try: return json.loads(match_list.group(1))
+        except: pass
+
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1:
-        json_str = text[start:end+1]
-        try: return json.loads(json_str)
+        try: return json.loads(text[start:end+1])
         except: pass
+        
+    # Fallback for simple list
+    start_list = text.find('[')
+    end_list = text.rfind(']')
+    if start_list != -1 and end_list != -1:
+        try: return json.loads(text[start_list:end_list+1])
+        except: pass
+
     return None
 
 def format_html_for_chat(html_content):
-    """Чистит HTML для чата и убирает технический JSON в конце"""
+    """Cleans HTML for chat"""
     text = str(html_content).replace('\\n', '\n')
-    
-    # 1. Жесткая чистка JSON хвоста
     if '"seo_title":' in text:
         text = text.split('"seo_title":')[0].rsplit(',', 1)[0].rsplit('{', 1)[0]
     
     text = re.sub(r'\}\s*$', '', text)
     text = re.sub(r'```json.*', '', text, flags=re.DOTALL)
     text = re.sub(r'```', '', text)
-
-    # 2. Убираем плейсхолдеры картинок
     text = re.sub(r'\[IMG:.*?\]', '', text)
-    
-    # 3. Форматирование
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
     
@@ -262,18 +257,13 @@ def format_html_for_chat(html_content):
         script.decompose()
     
     clean_text = soup.get_text(separator="\n\n")
-    clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
-    
-    return clean_text.strip('",}').strip()
+    return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
-    """
-    Генерация ИСКЛЮЧИТЕЛЬНО через Google Imagen.
-    Если ошибка — возвращаем None. НИКАКИХ Pollinations!
-    """
+    """ONLY GOOGLE IMAGEN. NO POLLINATIONS FALLBACK."""
     image_bytes = None
     
-    print(f"🎨 Пробую Google Imagen для: {image_prompt[:30]}...")
+    print(f"🎨 Generating image via Google Imagen: {image_prompt[:30]}...")
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -282,9 +272,9 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-            print("✅ Успешная генерация (Google)")
+            print("✅ Google Image Generated")
     except Exception as e:
-        print(f"❌ Ошибка Google Imagen: {e}")
+        print(f"❌ Google Imagen Error: {e}")
         return None, None
 
     if not image_bytes: return None, None
@@ -318,7 +308,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         print(f"WP Upload Error: {e}")
     return None, None
 
-# --- 4. МЕНЮ ---
+# --- 4. MENUS ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("➕ Новый проект", "📂 Мои проекты")
@@ -368,7 +358,7 @@ def menu_handler(message):
 @bot.callback_query_handler(func=lambda call: call.data == "soon")
 def soon_alert(call): bot.answer_callback_query(call.id, "🚧 В разработке...")
 
-# --- 5. ПРОЕКТЫ ---
+# --- 5. PROJECTS ---
 def list_projects(user_id, chat_id):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, url FROM projects WHERE user_id = %s ORDER BY id ASC", (user_id,))
@@ -406,7 +396,7 @@ def check_url_step(message):
     USER_CONTEXT[message.from_user.id] = pid
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
-# --- МЕНЮ ПРОЕКТА ---
+# --- MENU ---
 def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url, keywords, progress, cms_login, cms_password FROM projects WHERE id = %s", (pid,))
@@ -483,7 +473,7 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-# --- ДОП. ФУНКЦИИ ---
+# --- UTILS (PROFILE) ---
 def show_profile(uid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT tariff, gens_left, balance, joined_at, total_paid_rub FROM users WHERE user_id=%s", (uid,))
@@ -620,7 +610,7 @@ def back_main(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, "Главное меню", reply_markup=main_menu_markup(call.from_user.id))
 
-# --- ЛОГИКА ---
+# --- LOGIC ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_start_"))
 def comp_start(call):
     pid = call.data.split("_")[2]
@@ -699,7 +689,6 @@ def perform_analysis(call):
 def strategy_start(call):
     pid = call.data.split("_")[1]
     conn = get_db_connection(); cur = conn.cursor()
-    
     cur.execute("SELECT cms_login, content_plan FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
@@ -741,11 +730,7 @@ def reset_plan(call):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
     conn.commit(); cur.close(); conn.close()
-    strategy_start_fixed(call)
-
-def strategy_start_fixed(call):
-    # Вспомогательная функция для рестарта стратегии
-    pid = call.data.split("_")[2]
+    # Manual call to strategy start
     markup = types.InlineKeyboardMarkup(row_width=4)
     btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
     markup.add(*btns)
@@ -763,7 +748,7 @@ def save_freq_and_plan(call):
     actual_count = min(freq, len(remaining_days)) if remaining_days else 0
     
     if actual_count == 0:
-        bot.send_message(call.message.chat.id, f"📅 Эта неделя заканчивается. План на {freq} статей будет создан в следующий понедельник.\nСейчас вы можете написать **Тестовую статью**.")
+        bot.send_message(call.message.chat.id, f"📅 Эта неделя заканчивается. План на {freq} статей будет создан в следующий понедельник.")
         return
 
     bot.edit_message_text(f"📅 Генерирую план на остаток недели ({actual_count} статей)...", call.message.chat.id, call.message.message_id)
@@ -877,7 +862,6 @@ def approve_plan(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
-    # Проверка лимитов перед запуском теста
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
     res = cur.fetchone()
@@ -887,7 +871,6 @@ def test_article_start(call):
         bot.send_message(call.message.chat.id, "⚠️ У вас закончились генерации. Пожалуйста, пополните баланс.")
         return
 
-    # Запускаем предложение 5 тем
     pid = call.data.split("_")[2]
     propose_test_topics(call.message.chat.id, pid)
 
@@ -918,7 +901,6 @@ def propose_test_topics(chat_id, pid):
         
     bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
-# --- НАПИСАНИЕ СТАТЬИ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
     parts = call.data.split("_")
@@ -933,7 +915,6 @@ def write_article_handler(call):
     topic_text = topics[idx] if len(topics) > idx else "SEO Article"
     main_keyword = topic_text.split(':')[0]
     
-    # Списание лимитов
     cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
     conn.commit()
     
@@ -1017,7 +998,6 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
-            # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
@@ -1036,12 +1016,8 @@ def approve_publish(call):
             'User-Agent': 'Mozilla/5.0',
             'Cookie': 'beget=begetok'
         }
-        # Использование нормального заголовка H1
         seo_title = seo_data.get('seo_title', title)
-        if len(seo_title) > 70 or ":" in seo_title:
-             final_title = title
-        else:
-             final_title = seo_title
+        final_title = title if len(seo_title) > 70 or ":" in seo_title else seo_title
 
         meta_payload = {
             '_yoast_wpseo_title': seo_title,
@@ -1063,7 +1039,6 @@ def approve_publish(call):
             link = r.json().get('link')
             cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
             
-            # Получаем остаток лимитов для сообщения
             cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
             left = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
