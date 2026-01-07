@@ -223,20 +223,11 @@ def update_project_progress(pid, step_key):
     finally: cur.close(); conn.close()
 
 def clean_json_tail(text):
-    """Вырезает JSON-мусор из конца статьи"""
-    # Ищем начало JSON блока (часто начинается с seo_title или фигурной скобки в конце)
-    # Самый надежный способ - найти последнюю } и обрезать по ней, если она в конце
     text = str(text)
-    
-    # Паттерн: ищем комбинацию "seo_title": "..." в конце текста
-    # и обрезаем всё начиная с открывающей скобки этого JSON объекта
     match = re.search(r'\{[\s\S]*"seo_title"[\s\S]*\}', text)
     if match:
-        # Если нашли JSON блок, вырезаем его из оригинала
         json_block = match.group(0)
         text = text.replace(json_block, "")
-    
-    # Дополнительная чистка висячих запятых или кавычек
     text = text.strip().rstrip(',').strip()
     return text
 
@@ -253,7 +244,7 @@ def format_html_for_chat(html_content):
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
-    # 1. Google (Nano Banana / Imagen)
+    # 1. Google (Nano Banana / Imagen 3) - ONLY OPTION
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -262,22 +253,10 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-            print("Generated via Google")
+            print("Generated via Google Imagen")
     except Exception as e:
-        print(f"Google img fail: {e}")
-
-    # 2. Flux Fallback (с паузой)
-    if not image_bytes:
-        time.sleep(3) # Увеличил паузу до 3 сек
-        try:
-            seed = random.randint(1, 99999)
-            safe_prompt = quote(image_prompt)
-            image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=768&seed={seed}&nologo=true&model=flux"
-            img_resp = requests.get(image_url, timeout=30)
-            if img_resp.status_code == 200:
-                image_bytes = img_resp.content
-        except Exception:
-            pass
+        print(f"Google Imagen Error: {e}")
+        # НИКАКОГО ФОЛЛБЕКА БОЛЬШЕ НЕТ
 
     if not image_bytes: return None, None
 
@@ -708,12 +687,10 @@ def save_freq_and_plan(call):
     _, pid, freq = call.data.split("_")
     freq = int(freq)
     
-    # 1. Расчет оставшихся дней недели
     days_map = {0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"}
     today_idx = datetime.datetime.today().weekday()
-    remaining_days = [days_map[i] for i in range(today_idx + 1, 7)] # Дни с завтрашнего
+    remaining_days = [days_map[i] for i in range(today_idx + 1, 7)] 
     
-    # Если дней осталось меньше чем запрошено статей, планируем на оставшиеся
     actual_count = min(freq, len(remaining_days)) if remaining_days else 0
     
     if actual_count == 0:
@@ -729,7 +706,7 @@ def save_freq_and_plan(call):
     survey = info_json.get("survey", "")
     kw = res[1] or ""
     
-    # Промпт для генерации
+    # Prompt for Generation
     days_str = ", ".join(remaining_days[:actual_count])
     prompt = f"""
     Роль: SEO Маркетолог.
@@ -750,14 +727,12 @@ def save_freq_and_plan(call):
         clean_json = ai_resp.replace("```json", "").replace("```", "").strip()
         calendar_plan = json.loads(clean_json)
     except:
-        calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации"}]
+        calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации, попробуйте сбросить"}]
 
-    # Сохраняем план
     info_json["temp_plan"] = calendar_plan
     cur.execute("UPDATE projects SET frequency=%s, info=%s WHERE id=%s", (freq, json.dumps(info_json), pid))
     conn.commit(); cur.close(); conn.close()
     
-    # Сообщение
     msg_text = "🗓 **План на остаток недели:**\n\n"
     for item in calendar_plan:
         msg_text += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
@@ -765,7 +740,6 @@ def save_freq_and_plan(call):
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
     
-    # Кнопки замены (Пн, Вт...)
     short_days = {"Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср", "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"}
     repl_btns = []
     for i, item in enumerate(calendar_plan):
@@ -780,6 +754,7 @@ def save_freq_and_plan(call):
 def replace_topic(call):
     _, _, pid, idx = call.data.split("_")
     idx = int(idx)
+    
     bot.answer_callback_query(call.id, "🔄 Меняю тему...")
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -838,7 +813,6 @@ def approve_plan(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
-    # Генерация 1 статьи сразу
     write_article_handler(call) 
 
 # --- НАПИСАНИЕ СТАТЬИ (ИСПРАВЛЕНО) ---
@@ -863,15 +837,13 @@ def write_article_handler(call):
         if plan: topic_text = plan[0]['topic']
         else: topic_text = f"Тренды: {keywords.split(',')[0] if keywords else 'Ремонт'}"
     else:
-        # Для ручного выбора
         topics = info.get("temp_topics", [])
         if topics: topic_text = topics[idx]
 
     main_keyword = topic_text.split(':')[0]
     
     if is_test:
-        # Используем HTML, так как Markdown падает на спецсимволах
-        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: <b>{topic_text}</b>...", parse_mode='HTML')
+        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: {escape_md(topic_text)}...", parse_mode='Markdown')
     else:
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, f"⏳ Пишу статью...", parse_mode='Markdown')
@@ -922,7 +894,6 @@ def write_article_handler(call):
     conn.commit(); cur.close(); conn.close()
     
     clean_view = format_html_for_chat(article_html)
-    # Используем HTML для предпросмотра, чтобы избежать Markdown ошибок
     try:
         send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
     except:
@@ -957,7 +928,6 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
-            # Use safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
@@ -999,7 +969,6 @@ def approve_publish(call):
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
-            # Используем безопасное форматирование без Markdown
             bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n{link}\n\nВозврат в главное меню...")
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
