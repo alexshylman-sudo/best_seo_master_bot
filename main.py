@@ -30,7 +30,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 APP_URL = os.getenv("APP_URL")
 
 bot = TeleBot(TOKEN)
-# Инициализация клиента Google GenAI
+# Initialize Google GenAI Client
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 
@@ -169,6 +169,7 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
 
 def get_gemini_response(prompt):
     try:
+        # Using Gemini 2.0 Flash (Fast & Tier 1 Ready)
         response = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
         return response.text
     except Exception as e:
@@ -290,17 +291,21 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
-# --- 4. IMAGE GENERATION (IMAGEN 4 FAST - TIER 1) ---
+# --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
+    """
+    Returns: (media_id, source_url, debug_message)
+    """
     image_bytes = None
+    debug_msg = ""
     
-    # 1. Используем актуальную модель для Tier 1
+    # 1. Используем модель для Tier 1
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # 2. Улучшенный промпт для фотореализма
-    final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, cinematic lighting, 8k"
+    # 2. Улучшаем промпт
+    final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting"
     
-    print(f"🎨 Imagen 4 Fast (Tier 1): {final_prompt[:40]}...")
+    print(f"🎨 Imagen 4 Generating: {final_prompt[:40]}...")
     
     try:
         response = client.models.generate_images(
@@ -308,71 +313,64 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             prompt=final_prompt,
             config=genai_types.GenerateImagesConfig(
                 number_of_images=1,
-                # 3. Формат 16:9
-                aspect_ratio='16:9',
-                # 4. Безопасность - минимизация блокировок
+                aspect_ratio='16:9', # Формат 16:9 для блога
+                # Минимальные фильтры безопасности для платного тарифа
                 safety_settings=[
-                    genai_types.SafetySetting(
-                        category="HARM_CATEGORY_HATE_SPEECH",
-                        threshold="BLOCK_ONLY_HIGH"
-                    ),
-                    genai_types.SafetySetting(
-                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                        threshold="BLOCK_ONLY_HIGH"
-                    ),
-                    genai_types.SafetySetting(
-                        category="HARM_CATEGORY_HARASSMENT",
-                        threshold="BLOCK_ONLY_HIGH"
-                    ),
-                    genai_types.SafetySetting(
-                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        threshold="BLOCK_ONLY_HIGH"
-                    ),
+                    genai_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
+                    genai_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
+                    genai_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
+                    genai_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
                 ]
             )
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
+            debug_msg += "✅ Imagen OK. "
         else:
-            print("⚠️ Изображение не создано (Safety Filter)")
-            return None, None
+            return None, None, "⚠️ Imagen вернул пустоту (Safety)."
             
     except Exception as e:
         print(f"❌ Google Imagen Error: {e}")
-        return None, None
+        return None, None, f"❌ API Error: {e}"
 
-    if not image_bytes: return None, None
+    if not image_bytes: return None, None, "❌ No bytes."
 
+    # Загрузка в WordPress
     try:
-        if api_url.endswith('/'): api_url = api_url[:-1]
-        seed = random.randint(1, 99999)
-        file_name = f"img-{seed}.png"
-        creds = f"{login}:{pwd}"
-        token = base64.b64encode(creds.encode()).decode()
+        api_url = api_url.rstrip('/')
+        creds = base64.b64encode(f"{login}:{pwd}".encode()).decode()
         headers = {
-            'Authorization': 'Basic ' + token,
-            'Content-Disposition': f'attachment; filename={file_name}',
+            'Authorization': 'Basic ' + creds,
+            'Content-Disposition': f'attachment; filename="img_{random.randint(100,999)}.png"',
             'Content-Type': 'image/png',
-            'User-Agent': 'Mozilla/5.0',
-            'Cookie': 'beget=begetok'
+            'User-Agent': 'Mozilla/5.0'
         }
-        upload_api = f"{api_url}/wp-json/wp/v2/media"
-        r = requests.post(upload_api, headers=headers, data=image_bytes, timeout=60)
+        
+        # Попытка загрузки
+        r = requests.post(f"{api_url}/wp-json/wp/v2/media", headers=headers, data=image_bytes, timeout=60)
         
         if r.status_code == 201:
-            media_id = r.json().get('id')
-            source_url = r.json().get('source_url')
-            # Заполняем ALT и Title для SEO
+            res = r.json()
+            media_id = res.get('id')
+            source_url = res.get('source_url')
+            
+            # SEO: Alt & Title
             requests.post(
-                f"{upload_api}/{media_id}", 
-                headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
-                json={'alt_text': alt_text, 'title': alt_text, 'caption': alt_text}, 
-                timeout=10
+                f"{api_url}/wp-json/wp/v2/media/{media_id}", 
+                headers={'Authorization': 'Basic ' + creds}, 
+                json={'alt_text': alt_text, 'title': alt_text}
             )
-            return media_id, source_url
+            return media_id, source_url, f"✅ WP Upload OK (ID: {media_id})"
+        elif r.status_code == 401:
+            return None, None, "❌ WP 401: Неверный пароль."
+        elif r.status_code == 403:
+            return None, None, "❌ WP 403: Доступ запрещен."
+        else:
+            return None, None, f"❌ WP Error {r.status_code}"
+            
     except Exception as e:
         print(f"WP Upload Error: {e}")
-    return None, None
+        return None, None, f"❌ WP Connection Error: {e}"
 
 # --- 5. MENUS ---
 def main_menu_markup(user_id):
@@ -392,7 +390,7 @@ def start(message):
         cur = conn.cursor()
         cur.execute("INSERT INTO users (user_id, gens_left) VALUES (%s, 2) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit(); cur.close(); conn.close()
-    bot.send_message(user_id, "👋 Привет! Я AI SEO Master.\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
+    bot.send_message(user_id, "👋 AI SEO Master (Tier 1 Enabled).", reply_markup=main_menu_markup(user_id))
 
 @bot.message_handler(func=lambda m: m.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"])
 def menu_handler(message):
@@ -963,6 +961,7 @@ def propose_test_topics(chat_id, pid):
     Придумай 5 вирусных заголовков для статьи в блог.
     Ниша сайта: {info.get('survey', 'Общая тема')}. 
     SEO Ключевые слова: {kw[:500]}
+    Язык: Русский.
     
     Строго верни ТОЛЬКО JSON массив строк, например:
     ["Как выбрать...", "ТОП 10 ошибок...", "Секреты..."]
@@ -1029,6 +1028,9 @@ def write_article_handler(call):
     Focus Keyword: "{main_keyword}"
     Current Year: {current_year} (Use {current_year} or {current_year+1} for future trends).
     
+    IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
+    Do not use English phrases like "In conclusion", "Introduction", etc.
+    
     MANDATORY YOAST SEO RULES (GREEN BULLET):
     1. **Keyphrase in Intro**: The focus keyword MUST appear in the very first sentence.
     2. **Keyphrase Density**: Use the keyword 0.5-2% of the text length (~15-30 times).
@@ -1084,11 +1086,16 @@ def write_article_handler(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
 def approve_publish(call):
     aid = call.data.split("_")[1]
+    
+    # Отправляем сообщение о начале процесса
+    bot.send_message(call.message.chat.id, "🚀 Начинаю генерацию картинок и публикацию...")
+    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
     row = cur.fetchone()
     pid, title, content, seo_json = row
     seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
+    
     cur.execute("SELECT cms_url, cms_login, cms_password FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     
@@ -1097,12 +1104,23 @@ def approve_publish(call):
         cur.close(); conn.close(); return
 
     url, login, pwd = res
-    msg = bot.send_message(call.message.chat.id, "🚀 Генерирую 5-7 картинок и публикую...")
     
+    # Переменная для сбора логов отладки
+    debug_report = []
+    
+    # 1. Обработка картинок внутри текста
     img_matches = re.findall(r'\[IMG: (.*?)\]', content)
     final_content = content
+    
+    if img_matches:
+        debug_report.append(f"🔎 Найдено {len(img_matches)} тегов [IMG].")
+        
     for i, prompt in enumerate(img_matches):
-        media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
+        # Генерируем и загружаем
+        media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
+        
+        debug_report.append(f"🖼 Картинка {i+1}: {msg}")
+        
         if source_url:
             # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
@@ -1110,10 +1128,19 @@ def approve_publish(call):
         else:
             final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
 
+    # 2. Обложка (Featured Image)
     feat_media_id = None
     if seo_data.get('featured_img_prompt'):
-        feat_media_id, _ = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], seo_data.get('featured_img_alt', title))
+        feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], seo_data.get('featured_img_alt', title))
+        debug_report.append(f"🎨 Обложка: {feat_msg}")
 
+    # Отправляем отчет пользователю, если были ошибки
+    error_found = any("❌" in x or "⚠️" in x for x in debug_report)
+    if error_found:
+        report_text = "\n".join(debug_report)
+        bot.send_message(call.message.chat.id, f"📋 **Отчет по медиа:**\n{report_text}", parse_mode='Markdown')
+
+    # 3. Публикация поста
     try:
         creds = f"{login}:{pwd}"
         token = base64.b64encode(creds.encode()).decode()
@@ -1152,7 +1179,7 @@ def approve_publish(call):
             left = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
             
-            bot.delete_message(call.message.chat.id, msg.message_id)
+            bot.delete_message(call.message.chat.id, call.message.message_id) # Удаляем старое меню
             
             success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
             try:
@@ -1163,11 +1190,11 @@ def approve_publish(call):
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
             conn.close()
-            bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code}")
+            bot.send_message(call.message.chat.id, f"❌ Ошибка WP Публикации: {r.status_code} - {r.text[:100]}")
             
     except Exception as e:
         if conn: conn.close()
-        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка соединения: {e}")
 
 # ЗАПУСК
 def run_scheduler():
