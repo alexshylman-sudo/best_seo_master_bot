@@ -18,11 +18,11 @@ from google.genai import types as genai_types
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# --- 1. CONFIGURATION ---
+# --- 1. КОНФИГУРАЦИЯ ---
 load_dotenv()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "203473623"))
-SUPPORT_ID = 203473623
+ADMIN_ID = int(os.getenv("ADMIN_ID", "203473623")) 
+SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -30,9 +30,9 @@ APP_URL = os.getenv("APP_URL")
 
 bot = TeleBot(TOKEN)
 client = genai.Client(api_key=GEMINI_KEY)
-USER_CONTEXT = {}
+USER_CONTEXT = {} 
 
-# --- 2. DATABASE ---
+# --- 2. БАЗА ДАННЫХ ---
 def get_db_connection():
     try:
         return psycopg2.connect(DB_URL)
@@ -53,11 +53,11 @@ def patch_db_schema():
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_url TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS cms_key TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS content_plan JSONB DEFAULT '[]'")
-        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seo_data JSONB DEFAULT '{}'")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seo_data JSONB DEFAULT '{}'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS scheduled_time TIMESTAMP")
         conn.commit()
-    except Exception as e:
-        print(f"⚠️ Schema Patch Error: {e}")
+    except Exception as e: 
+        print(f"⚠️ Ошибка патчинга БД: {e}")
     finally: cur.close(); conn.close()
 
 def init_db():
@@ -68,7 +68,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
             balance INT DEFAULT 0,
-            tariff TEXT DEFAULT 'No Tariff',
+            tariff TEXT DEFAULT 'Нет тарифа',
             tariff_expires TIMESTAMP,
             gens_left INT DEFAULT 2,
             is_admin BOOLEAN DEFAULT FALSE,
@@ -84,8 +84,8 @@ def init_db():
             user_id BIGINT,
             type TEXT DEFAULT 'site',
             url TEXT,
-            info JSONB DEFAULT '{}',
-            knowledge_base JSONB DEFAULT '[]',
+            info JSONB DEFAULT '{}', 
+            knowledge_base JSONB DEFAULT '[]', 
             keywords TEXT,
             cms_url TEXT,
             cms_login TEXT,
@@ -94,7 +94,7 @@ def init_db():
             platform TEXT,
             frequency INT DEFAULT 0,
             content_plan JSONB DEFAULT '[]',
-            progress JSONB DEFAULT '{"info_done": false, "analysis_done": false, "upload_done": false, "competitors_done": false, "settings_done": false}',
+            progress JSONB DEFAULT '{"info_done": false, "analysis_done": false, "upload_done": false, "competitors_done": false, "settings_done": false}', 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -123,8 +123,8 @@ def init_db():
         )
     """)
     cur.execute("""
-        INSERT INTO users (user_id, is_admin, tariff, gens_left)
-        VALUES (%s, TRUE, 'GOD_MODE', 9999)
+        INSERT INTO users (user_id, is_admin, tariff, gens_left) 
+        VALUES (%s, TRUE, 'GOD_MODE', 9999) 
         ON CONFLICT (user_id) DO UPDATE SET is_admin = TRUE, tariff = 'GOD_MODE', gens_left = 9999
     """, (ADMIN_ID,))
     conn.commit(); cur.close(); conn.close()
@@ -137,7 +137,7 @@ def update_last_active(user_id):
         conn.commit(); cur.close(); conn.close()
     except: pass
 
-# --- 3. UTILITIES ---
+# --- 3. УТИЛИТЫ ---
 def escape_md(text):
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
@@ -145,7 +145,7 @@ def escape_md(text):
 def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     if not text: return
     parts = []
-    chunk_size = 3500
+    chunk_size = 3500 
     while len(text) > 0:
         if len(text) > chunk_size:
             split_pos = text.rfind('\n', 0, chunk_size)
@@ -158,7 +158,7 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
         try: bot.send_message(chat_id, part, parse_mode=parse_mode, reply_markup=markup)
-        except:
+        except: 
             try: bot.send_message(chat_id, part, parse_mode=None, reply_markup=markup)
             except: pass
         time.sleep(0.3)
@@ -168,42 +168,47 @@ def get_gemini_response(prompt):
         response = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
         return response.text
     except Exception as e:
-        return f"AI Error: {e}"
+        return f"Ошибка AI: {e}"
 
 def validate_input(text, question_context):
     if text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"]:
         return False, "MENU_CLICK"
     try:
-        prompt = f"Moderator. Question: '{question_context}'. Answer: '{text}'. Check for spam or nonsense. If bad respond BAD. If ok respond OK."
+        prompt = f"Модератор. Вопрос: '{question_context}'. Ответ: '{text}'. Проверь на мат, спам или бессмыслицу. Если плохо - ответь BAD. Если нормально - ответь OK."
         res = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt]).text.strip()
         return ("BAD" not in res.upper()), "AI_CHECK"
     except: return True, "SKIP"
 
 def check_site_availability(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        response = requests.get(url, timeout=10, headers=headers, verify=False)
+        response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         return response.status_code == 200
     except: return False
 
 def deep_analyze_site(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 Bot"
-        }
-        resp = requests.get(url, timeout=15, headers=headers, verify=False)
-        if resp.encoding is None: resp.encoding = 'utf-8'
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 Bot"})
         soup = BeautifulSoup(resp.text, 'html.parser')
         title = soup.title.string if soup.title else "No Title"
         desc = soup.find("meta", attrs={"name": "description"})
         desc = desc["content"] if desc else "No Description"
-        for s in soup(["script", "style"]): s.decompose()
-        raw_text = soup.get_text(separator=' ', strip=True)[:5000]
-        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nContent: {raw_text}", []
+        headers = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
+        raw_text = soup.get_text()[:5000].strip()
+        internal_links = []
+        domain = urlparse(url).netloc
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            full_url = urljoin(url, href)
+            parsed_href = urlparse(full_url)
+            if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.pdf', '.css', '.js']):
+                link_text = a_tag.get_text().strip()
+                if link_text and len(link_text) > 3: 
+                    internal_links.append({"url": full_url, "anchor": link_text})
+        unique_links = list({v['url']: v for v in internal_links}.values())[:100]
+        analysis_text = f"URL: {url}\nTitle: {title}\nDesc: {desc}\nHeaders: {headers}\nContent Sample: {raw_text}"
+        return analysis_text, top_links
     except Exception as e:
-        return f"Error accessing site: {e}", []
+        return f"Ошибка доступа к сайту: {e}", []
 
 def update_project_progress(pid, step_key):
     conn = get_db_connection(); cur = conn.cursor()
@@ -217,36 +222,38 @@ def update_project_progress(pid, step_key):
     except: pass
     finally: cur.close(); conn.close()
 
-def format_html_for_chat(html_content):
-    """Cleans HTML for chat and removes JSON artifacts"""
-    text = str(html_content).replace('\\n', '\n')
+def clean_json_tail(text):
+    """Вырезает JSON-мусор из конца статьи"""
+    # Ищем начало JSON блока (часто начинается с seo_title или фигурной скобки в конце)
+    # Самый надежный способ - найти последнюю } и обрезать по ней, если она в конце
+    text = str(text)
     
-    # Aggressively remove JSON block at the end
-    # We look for the last occurrence of "seo_title" and cut everything before the preceding comma or brace
-    if '"seo_title":' in text:
-        # Split by the start of the JSON block usually indicated by the first key we asked for
-        parts = text.split('"seo_title":')
-        text = parts[0].rsplit(',', 1)[0].rsplit('{', 1)[0]
+    # Паттерн: ищем комбинацию "seo_title": "..." в конце текста
+    # и обрезаем всё начиная с открывающей скобки этого JSON объекта
+    match = re.search(r'\{[\s\S]*"seo_title"[\s\S]*\}', text)
+    if match:
+        # Если нашли JSON блок, вырезаем его из оригинала
+        json_block = match.group(0)
+        text = text.replace(json_block, "")
+    
+    # Дополнительная чистка висячих запятых или кавычек
+    text = text.strip().rstrip(',').strip()
+    return text
 
-    # Remove image placeholders from chat view
+def format_html_for_chat(html_content):
+    text = clean_json_tail(html_content).replace('\\n', '\n')
     text = re.sub(r'\[IMG:.*?\]', '', text)
-    
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
-    
     soup = BeautifulSoup(text, "html.parser")
     for script in soup(["script", "style", "head", "title", "meta", "table", "style"]):
         script.decompose()
-    
     clean_text = soup.get_text(separator="\n\n")
-    clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
-    clean_text = clean_text.strip('",}').strip()
-    return clean_text
+    return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
-    
-    # 1. Google (Nano Banana / Imagen) - High Quality
+    # 1. Google (Nano Banana / Imagen)
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -256,27 +263,25 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
             print("Generated via Google")
-    except Exception:
-        pass 
+    except Exception as e:
+        print(f"Google img fail: {e}")
 
-    # 2. Flux Fallback with delay to avoid rate limits
+    # 2. Flux Fallback (с паузой)
     if not image_bytes:
-        time.sleep(2) # Slight delay
+        time.sleep(3) # Увеличил паузу до 3 сек
         try:
-            seed = random.randint(1, 999999)
-            # flux-realism model often gives better results
+            seed = random.randint(1, 99999)
             safe_prompt = quote(image_prompt)
-            image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=768&seed={seed}&nologo=true&model=flux-realism"
+            image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=768&seed={seed}&nologo=true&model=flux"
             img_resp = requests.get(image_url, timeout=30)
             if img_resp.status_code == 200:
                 image_bytes = img_resp.content
-                print("Generated via Flux")
-        except Exception as e:
-            print(f"Flux fail: {e}")
+        except Exception:
+            pass
 
     if not image_bytes: return None, None
 
-    # 3. Upload to WP
+    # 3. Upload WP
     try:
         if api_url.endswith('/'): api_url = api_url[:-1]
         seed = random.randint(1, 99999)
@@ -289,14 +294,12 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             'Content-Type': 'image/png',
             'User-Agent': 'Mozilla/5.0'
         }
-        
         upload_api = f"{api_url}/wp-json/wp/v2/media"
         r = requests.post(upload_api, headers=headers, data=image_bytes, timeout=60)
         
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
-            # Set ALT text
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
@@ -306,10 +309,9 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             return media_id, source_url
     except Exception as e:
         print(f"WP Upload Error: {e}")
-    
     return None, None
 
-# --- 4. MENUS ---
+# --- 4. МЕНЮ ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("➕ Новый проект", "📂 Мои проекты")
@@ -350,7 +352,7 @@ def menu_handler(message):
     elif txt == "🆘 Техподдержка":
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("Написать", url=f"tg://user?id={SUPPORT_ID}"))
-        bot.send_message(uid, "Возникли вопросы? Напишите нам:", reply_markup=markup)
+        bot.send_message(uid, "Напишите в поддержку:", reply_markup=markup)
     elif txt == "⚙️ Админка" and uid == ADMIN_ID:
         show_admin_panel(uid)
     elif txt == "🔙 В меню":
@@ -359,7 +361,7 @@ def menu_handler(message):
 @bot.callback_query_handler(func=lambda call: call.data == "soon")
 def soon_alert(call): bot.answer_callback_query(call.id, "🚧 В разработке...")
 
-# --- 5. PROJECTS ---
+# --- 5. ПРОЕКТЫ ---
 def list_projects(user_id, chat_id):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, url FROM projects WHERE user_id = %s ORDER BY id ASC", (user_id,))
@@ -397,7 +399,7 @@ def check_url_step(message):
     USER_CONTEXT[message.from_user.id] = pid
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
-# --- PROJECT MENU ---
+# --- МЕНЮ ПРОЕКТА ---
 def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url, keywords, progress, cms_login, cms_password FROM projects WHERE id = %s", (pid,))
@@ -410,7 +412,6 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
     url, kw_db, progress, cms_login, cms_pass = res
     if not progress: progress = {}
     
-    # Check if fully configured
     is_fully_configured = (kw_db is not None and len(kw_db) > 5) and progress.get("info_done") and cms_login
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -475,7 +476,7 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-# --- UTILS (PROFILE, TARIFFS) ---
+# --- ДОП. ФУНКЦИИ ---
 def show_profile(uid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT tariff, gens_left, balance, joined_at, total_paid_rub FROM users WHERE user_id=%s", (uid,))
@@ -612,7 +613,7 @@ def back_main(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, "Главное меню", reply_markup=main_menu_markup(call.from_user.id))
 
-# --- LOGIC: COMPETITORS ---
+# --- ЛОГИКА ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_start_"))
 def comp_start(call):
     pid = call.data.split("_")[2]
@@ -687,68 +688,32 @@ def perform_analysis(call):
     update_project_progress(pid, "analysis_done")
     open_project_menu(call.message.chat.id, pid, mode="onboarding")
 
-# --- STRATEGY & PLAN ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
 def strategy_start(call):
     pid = call.data.split("_")[1]
     conn = get_db_connection(); cur = conn.cursor()
-    
-    # 1. Check CMS
-    cur.execute("SELECT cms_login, content_plan FROM projects WHERE id=%s", (pid,))
-    res = cur.fetchone()
-    cur.close(); conn.close()
-    
-    if not res[0]:
+    cur.execute("SELECT cms_login FROM projects WHERE id=%s", (pid,))
+    if not cur.fetchone()[0]:
+        cur.close(); conn.close()
         bot.send_message(call.message.chat.id, "⚠️ Настройте CMS в настройках проекта!")
         return
-    
-    plan = res[1]
-    # 2. If plan exists - show it
-    if plan and len(plan) > 0:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Показать текущий план", callback_data=f"show_plan_{pid}"))
-        markup.add(types.InlineKeyboardButton("🗑 Удалить и создать новый", callback_data=f"reset_plan_{pid}"))
-        bot.send_message(call.message.chat.id, "📅 У вас уже утвержден план на эту неделю.", reply_markup=markup)
-        return
-
-    # 3. If no plan - select frequency
+    cur.close(); conn.close()
     markup = types.InlineKeyboardMarkup(row_width=4)
     btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
     markup.add(*btns)
     bot.send_message(call.message.chat.id, "📅 Сколько статей в неделю?", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("show_plan_"))
-def show_current_plan(call):
-    pid = call.data.split("_")[2]
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT content_plan FROM projects WHERE id=%s", (pid,))
-    plan = cur.fetchone()[0] or []
-    cur.close(); conn.close()
-    
-    msg = "🗓 **Ваш текущий план:**\n\n"
-    for item in plan:
-        msg += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
-    
-    bot.send_message(call.message.chat.id, msg, parse_mode='Markdown')
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("reset_plan_"))
-def reset_plan(call):
-    # FIXED: SQL Error regarding 'plan' type. pid is safe here.
-    pid = call.data.split("_")[2]
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
-    conn.commit(); cur.close(); conn.close()
-    strategy_start(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("freq_"))
 def save_freq_and_plan(call):
     _, pid, freq = call.data.split("_")
     freq = int(freq)
     
+    # 1. Расчет оставшихся дней недели
     days_map = {0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"}
     today_idx = datetime.datetime.today().weekday()
-    remaining_days = [days_map[i] for i in range(today_idx + 1, 7)] 
+    remaining_days = [days_map[i] for i in range(today_idx + 1, 7)] # Дни с завтрашнего
     
+    # Если дней осталось меньше чем запрошено статей, планируем на оставшиеся
     actual_count = min(freq, len(remaining_days)) if remaining_days else 0
     
     if actual_count == 0:
@@ -764,17 +729,18 @@ def save_freq_and_plan(call):
     survey = info_json.get("survey", "")
     kw = res[1] or ""
     
-    # Prompt for Generation
+    # Промпт для генерации
     days_str = ", ".join(remaining_days[:actual_count])
     prompt = f"""
-    Role: SEO Marketer.
-    Task: Create a content plan for specific days: {days_str}.
-    Niche Context: {survey}.
-    Keywords: {kw[:1000]}
+    Роль: SEO Маркетолог.
+    Задача: Составь контент-план только на эти дни: {days_str}.
+    Всего статей: {actual_count}.
+    Ниша: {survey}. Ключи: {kw[:1000]}
     
-    Format: JSON Array of Objects ONLY. No markdown.
+    Верни ТОЛЬКО JSON массив объектов (без Markdown, без ```json):
     [
-      {{"day": "Четверг", "time": "10:00", "topic": "Interesting Topic Title"}}
+      {{"day": "Четверг", "time": "10:00", "topic": "Тема 1"}},
+      {{"day": "Пятница", "time": "15:00", "topic": "Тема 2"}}
     ]
     """
     ai_resp = get_gemini_response(prompt)
@@ -784,12 +750,14 @@ def save_freq_and_plan(call):
         clean_json = ai_resp.replace("```json", "").replace("```", "").strip()
         calendar_plan = json.loads(clean_json)
     except:
-        calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации, попробуйте сбросить"}]
+        calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации"}]
 
+    # Сохраняем план
     info_json["temp_plan"] = calendar_plan
     cur.execute("UPDATE projects SET frequency=%s, info=%s WHERE id=%s", (freq, json.dumps(info_json), pid))
     conn.commit(); cur.close(); conn.close()
     
+    # Сообщение
     msg_text = "🗓 **План на остаток недели:**\n\n"
     for item in calendar_plan:
         msg_text += f"**{item['day']} {item['time']}**\n{item['topic']}\n\n"
@@ -797,6 +765,7 @@ def save_freq_and_plan(call):
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
     
+    # Кнопки замены (Пн, Вт...)
     short_days = {"Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср", "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"}
     repl_btns = []
     for i, item in enumerate(calendar_plan):
@@ -811,7 +780,6 @@ def save_freq_and_plan(call):
 def replace_topic(call):
     _, _, pid, idx = call.data.split("_")
     idx = int(idx)
-    
     bot.answer_callback_query(call.id, "🔄 Меняю тему...")
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -823,12 +791,10 @@ def replace_topic(call):
     
     if idx < len(plan):
         old_topic = plan[idx]['topic']
-        # FIXED: Added context to prevent hallucinations
         prompt = f"""
-        Task: Generate 1 NEW blog post title relevant to the niche.
-        Niche Keywords: {keywords[:500]}
-        Previous Topic (to avoid): {old_topic}
-        Return ONLY the title as text.
+        Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. 
+        Контекст: {keywords[:500]}
+        Верни только тему текстом.
         """
         new_topic = get_gemini_response(prompt).strip().replace('"', '')
         plan[idx]['topic'] = new_topic
@@ -872,9 +838,10 @@ def approve_plan(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
+    # Генерация 1 статьи сразу
     write_article_handler(call) 
 
-# --- ARTICLE WRITING ---
+# --- НАПИСАНИЕ СТАТЬИ (ИСПРАВЛЕНО) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
     is_test = "test_article" in call.data
@@ -894,19 +861,17 @@ def write_article_handler(call):
     if is_test:
         plan = info.get("content_plan", [])
         if plan: topic_text = plan[0]['topic']
-        else: topic_text = f"Обзор трендов: {keywords.split(',')[0] if keywords else 'Ремонт'}"
+        else: topic_text = f"Тренды: {keywords.split(',')[0] if keywords else 'Ремонт'}"
     else:
+        # Для ручного выбора
         topics = info.get("temp_topics", [])
         if topics: topic_text = topics[idx]
 
     main_keyword = topic_text.split(':')[0]
     
     if is_test:
-        # Use HTML for safe parsing
-        try:
-            bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: <b>{topic_text}</b>...", parse_mode='HTML')
-        except:
-            bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью...", parse_mode=None)
+        # Используем HTML, так как Markdown падает на спецсимволах
+        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: <b>{topic_text}</b>...", parse_mode='HTML')
     else:
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, f"⏳ Пишу статью...", parse_mode='Markdown')
@@ -957,7 +922,11 @@ def write_article_handler(call):
     conn.commit(); cur.close(); conn.close()
     
     clean_view = format_html_for_chat(article_html)
-    send_safe_message(call.message.chat.id, clean_view)
+    # Используем HTML для предпросмотра, чтобы избежать Markdown ошибок
+    try:
+        send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
+    except:
+        send_safe_message(call.message.chat.id, clean_view, parse_mode=None)
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"),
@@ -1030,6 +999,7 @@ def approve_publish(call):
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
+            # Используем безопасное форматирование без Markdown
             bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n{link}\n\nВозврат в главное меню...")
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
