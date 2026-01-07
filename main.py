@@ -60,7 +60,7 @@ def patch_db_schema():
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seo_data JSONB DEFAULT '{}'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS scheduled_time TIMESTAMP")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_prompt TEXT")
-        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_negative_prompt TEXT") # NEW
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_negative_prompt TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_images JSONB DEFAULT '[]'")
         conn.commit()
     except Exception as e: 
@@ -313,17 +313,13 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
     image_bytes = None
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # --- UPDATED: NO TEXT INSTRUCTION + NEGATIVE PROMPT ---
-    # Мы добавляем жесткие ограничения на текст прямо в промпт
     base_negative = "exclude text, writing, letters, watermarks, signature, words"
-    
     full_negative = f"{base_negative}, {negative_prompt}" if negative_prompt else base_negative
     
     if project_style and len(project_style) > 5:
         final_prompt = f"{project_style}. {image_prompt}. High resolution, 8k, cinematic lighting. Exclude: {full_negative}."
     else:
         final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting. Exclude: {full_negative}."
-    # ------------------------------------
     
     print(f"🎨 Imagen 4 Generating: {final_prompt[:80]}...")
     
@@ -901,7 +897,6 @@ def kb_menu_wrapper(chat_id, pid):
     cur.execute("SELECT style_prompt, style_images, style_negative_prompt FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
-    
     style_text = res[0] if res and res[0] else "Не задан"
     images = res[1] if res and res[1] else []
     neg_prompt = res[2] if res and res[2] else "Не задан"
@@ -1096,6 +1091,44 @@ def back_main(call):
     bot.send_message(call.message.chat.id, "Главное меню", reply_markup=main_menu_markup(call.from_user.id))
 
 # --- LOGIC ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
+def start_survey_handler(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[1]
+    
+    msg = bot.send_message(call.message.chat.id, 
+                           "📝 **Опрос о проекте**\n\n"
+                           "Пожалуйста, кратко опишите суть вашего сайта/бизнеса.\n"
+                           "Эта информация поможет ИИ подбирать темы и ключевые слова.\n\n"
+                           "*Пример:* Интернет-магазин корейской косметики, доставка по РФ, средний ценовой сегмент.",
+                           parse_mode='Markdown')
+    bot.register_next_step_handler(msg, save_survey_step, pid)
+
+def save_survey_step(message, pid):
+    if message.text.startswith('/'): return
+    
+    user_input = message.text
+    conn = get_db_connection(); cur = conn.cursor()
+    
+    # Update info
+    cur.execute("SELECT info, progress FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    if not res: cur.close(); conn.close(); return
+    
+    info = res[0] or {}
+    progress = res[1] or {}
+    
+    info['survey'] = user_input
+    progress['info_done'] = True
+    
+    cur.execute("UPDATE projects SET info=%s, progress=%s WHERE id=%s", 
+                (json.dumps(info), json.dumps(progress), pid))
+    conn.commit(); cur.close(); conn.close()
+    
+    bot.send_message(message.chat.id, "✅ Данные сохранены! Теперь можно генерировать темы и ключи.")
+    open_project_menu(message.chat.id, pid, mode="management")
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_start_"))
 def comp_start(call):
     try: bot.answer_callback_query(call.id)
@@ -1838,5 +1871,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Test Article & Lock Fixed)...")
+    print("🤖 Бот запущен (Survey Fixed)...")
     bot.infinity_polling(skip_pending=True)
