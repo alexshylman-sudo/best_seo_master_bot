@@ -746,7 +746,7 @@ def handle_photo_upload(message):
 
     threading.Thread(target=_save_photo).start()
 
-# --- NEW: GALLERY & DELETE ---
+# --- NEW: GALLERY & DELETE (FIXED) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gallery_"))
 def kb_gallery(call):
     try: bot.answer_callback_query(call.id)
@@ -766,8 +766,31 @@ def kb_gallery(call):
     markup.add(*btns)
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
     
-    bot.edit_message_text(f"📂 **Галерея ({len(images)} фото)**\nНажмите на кнопку, чтобы увидеть фото и удалить его.", 
-                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    msg_text = f"📁 **Галерея ({len(images)} фото)**\n\nНажмите на кнопку, чтобы увидеть фото и удалить его."
+    
+    try:
+        # Попытка отредактировать сообщение (если это текст)
+        bot.edit_message_text(
+            text=msg_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+    except Exception:
+        # Если редактирование не удалось (например, предыдущее сообщение было фото),
+        # удаляем старое и отправляем новое.
+        try:
+            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+        except:
+            pass
+        
+        bot.send_message(
+            chat_id=call.message.chat.id,
+            text=msg_text,
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_view_"))
 def kb_view_photo(call):
@@ -817,7 +840,10 @@ def kb_delete_single(call):
         del images[idx]
         cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
         conn.commit()
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        # Попытка удалить фото перед возвратом в галерею
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         bot.send_message(call.message.chat.id, f"✅ Фото удалено. Осталось: {len(images)}")
     else:
         conn.rollback()
@@ -825,7 +851,7 @@ def kb_delete_single(call):
         
     cur.close(); conn.close()
     
-    # Возвращаем в галерею (текстовое меню)
+    # Возвращаем в галерею
     kb_gallery(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_clear_photos_"))
