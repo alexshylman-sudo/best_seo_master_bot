@@ -189,6 +189,7 @@ def check_site_availability(url):
     except: return False
 
 def parse_sitemap(url):
+    """Пытается найти sitemap.xml и извлечь ссылки"""
     links = []
     try:
         sitemap_url = url.rstrip('/') + '/sitemap.xml'
@@ -200,7 +201,7 @@ def parse_sitemap(url):
                 ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
                 for url_tag in root.findall('.//s:loc', ns):
                     links.append(url_tag.text)
-                if not links:
+                if not links: 
                     for url_tag in root.findall('.//loc'):
                         links.append(url_tag.text)
             except: pass
@@ -298,7 +299,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     # --- 2. КАЧЕСТВО: Улучшаем промпт ---
     final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, cinematic lighting, 8k"
     
-    print(f"🎨 Google Imagen 4 Fast: {final_prompt[:40]}...")
+    print(f"🎨 Google Imagen 4 Fast: {final_prompt[:30]}...")
     
     try:
         response = client.models.generate_images(
@@ -332,7 +333,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
         else:
-            print("⚠️ Изображение не создано (фильтры безопасности или ошибка)")
+            print("⚠️ Изображение не создано (Safety Filter или пустой ответ)")
             return None, None
             
     except Exception as e:
@@ -351,8 +352,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             'Authorization': 'Basic ' + token,
             'Content-Disposition': f'attachment; filename={file_name}',
             'Content-Type': 'image/png',
-            'User-Agent': 'Mozilla/5.0',
-            'Cookie': 'beget=begetok'
+            'User-Agent': 'Mozilla/5.0'
         }
         upload_api = f"{api_url}/wp-json/wp/v2/media"
         r = requests.post(upload_api, headers=headers, data=image_bytes, timeout=60)
@@ -947,6 +947,10 @@ def test_article_start(call):
 
 def propose_test_topics(chat_id, pid):
     bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
+    
+    # --- ДОБАВЛЕНО: Пауза, чтобы избежать ошибки 429 ---
+    time.sleep(2)
+    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
