@@ -23,7 +23,8 @@ import xml.etree.ElementTree as ET
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) 
+# ВАЖНО: Укажите здесь ваш ID как администратора для доступа к панели
+ADMIN_ID = 203473623 
 SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -682,8 +683,10 @@ def kb_menu(call):
     markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
     if images:
         markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
+        markup.add(types.InlineKeyboardButton("🗑 Очистить все фото", callback_data=f"kb_clear_photos_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
-    bot.send_message(chat_id, msg, reply_markup=markup, parse_mode='Markdown')
+    
+    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_text_"))
 def kb_set_text(call):
@@ -976,16 +979,62 @@ def show_tariff_periods(user_id):
     bot.send_message(user_id, txt, reply_markup=markup, parse_mode='Markdown')
 
 def show_admin_panel(uid):
-    conn = get_db_connection(); cur = conn.cursor()
-    try: cur.execute("SELECT count(*) FROM users WHERE last_active > NOW() - INTERVAL '15 minutes'")
-    except: pass
-    online = cur.fetchone()[0] if cur.description else 0
-    cur.execute("SELECT sum(amount) FROM payments WHERE currency='rub'")
-    rub = cur.fetchone()[0] or 0
-    cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name")
-    tariffs = "\n".join([f"{r[0]}: {r[1]} шт." for r in cur.fetchall()])
-    cur.close(); conn.close()
-    bot.send_message(uid, f"⚙️ **АДМИНКА**\n\n🟢 Онлайн (15 мин): {online}\n💰 Прибыль: {rub}₽\n📊 Продажи:\n{tariffs}")
+    if uid != 203473623: return
+
+    conn = get_db_connection()
+    if not conn: return
+    cur = conn.cursor()
+
+    try:
+        # 1. Посетители за сегодня (DAU)
+        cur.execute("SELECT count(DISTINCT user_id) FROM users WHERE last_active >= CURRENT_DATE")
+        dau = cur.fetchone()[0]
+
+        # 2. Прибыль за месяц (с 1 числа)
+        cur.execute("SELECT sum(amount) FROM payments WHERE created_at >= date_trunc('month', CURRENT_DATE) AND currency='rub'")
+        profit_rub = cur.fetchone()[0] or 0
+        cur.execute("SELECT sum(amount) FROM payments WHERE created_at >= date_trunc('month', CURRENT_DATE) AND currency='stars'")
+        profit_stars = cur.fetchone()[0] or 0
+
+        # 3. Опубликовано статей за сегодня
+        cur.execute("SELECT count(*) FROM articles WHERE status='published' AND published_url IS NOT NULL AND created_at >= CURRENT_DATE")
+        articles_today = cur.fetchone()[0]
+
+        # 4. Новые пользователи (Сегодня / Месяц)
+        cur.execute("SELECT count(*) FROM users WHERE joined_at >= CURRENT_DATE")
+        new_today = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM users WHERE joined_at >= date_trunc('month', CURRENT_DATE)")
+        new_month = cur.fetchone()[0]
+
+        # 5. Проекты (Всего)
+        cur.execute("SELECT count(*) FROM projects")
+        total_projects = cur.fetchone()[0]
+
+        # 6. Тарифы (Статистика покупок за все время)
+        cur.execute("SELECT tariff_name, count(*) FROM payments GROUP BY tariff_name ORDER BY count(*) DESC")
+        tariff_stats = cur.fetchall()
+        tariff_text = "\n".join([f"• {t[0]}: {t[1]} шт." for t in tariff_stats]) if tariff_stats else "Нет продаж"
+
+        text = (
+            f"⚙️ **АДМИН ПАНЕЛЬ**\n\n"
+            f"👥 **Активность:**\n"
+            f"• Заходили сегодня: {dau}\n"
+            f"• Новых сегодня: {new_today}\n"
+            f"• Новых за месяц: {new_month}\n\n"
+            f"💰 **Финансы (Месяц):**\n"
+            f"• Рубли: {profit_rub}₽\n"
+            f"• Звезды: {profit_stars}⭐️\n\n"
+            f"📄 **Контент:**\n"
+            f"• Статей за сегодня: {articles_today}\n"
+            f"• Всего проектов: {total_projects}\n\n"
+            f"📊 **Продажи тарифов:**\n{tariff_text}"
+        )
+        
+        bot.send_message(uid, text, parse_mode='Markdown')
+    except Exception as e:
+        bot.send_message(uid, f"Ошибка админки: {e}")
+    finally:
+        cur.close(); conn.close()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("period_"))
 def tariff_period_select(call):
