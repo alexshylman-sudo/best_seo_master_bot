@@ -194,7 +194,18 @@ def deep_analyze_site(url):
         desc = desc["content"] if desc else "No Description"
         headers = [h.get_text().strip() for h in soup.find_all(['h1', 'h2', 'h3'])]
         raw_text = soup.get_text()[:5000].strip()
-        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nContent: {raw_text}", []
+        internal_links = []
+        domain = urlparse(url).netloc
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            full_url = urljoin(url, href)
+            parsed_href = urlparse(full_url)
+            if parsed_href.netloc == domain and not any(ext in parsed_href.path for ext in ['.jpg', '.png', '.pdf', '.css', '.js']):
+                link_text = a_tag.get_text().strip()
+                if link_text and len(link_text) > 3: 
+                    internal_links.append({"url": full_url, "anchor": link_text})
+        unique_links = list({v['url']: v for v in internal_links}.values())[:100]
+        return f"URL: {url}\nTitle: {title}\nDesc: {desc}\nContent: {raw_text}", unique_links
     except Exception as e:
         return f"Error: {e}", []
 
@@ -211,34 +222,20 @@ def update_project_progress(pid, step_key):
     finally: cur.close(); conn.close()
 
 def clean_and_parse_json(text):
-    """Robust JSON extraction"""
     text = str(text).strip()
     match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
     if match:
         try: return json.loads(match.group(1))
         except: pass
     
-    match_list = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
-    if match_list:
-        try: return json.loads(match_list.group(1))
-        except: pass
-
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1:
         try: return json.loads(text[start:end+1])
         except: pass
-    
-    start_list = text.find('[')
-    end_list = text.rfind(']')
-    if start_list != -1 and end_list != -1:
-        try: return json.loads(text[start_list:end_list+1])
-        except: pass
-
     return None
 
 def format_html_for_chat(html_content):
-    """Cleans HTML for chat"""
     text = str(html_content).replace('\\n', '\n')
     if '"seo_title":' in text:
         text = text.split('"seo_title":')[0].rsplit(',', 1)[0].rsplit('{', 1)[0]
@@ -258,10 +255,7 @@ def format_html_for_chat(html_content):
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
-    """ONLY GOOGLE IMAGEN."""
     image_bytes = None
-    
-    print(f"🎨 Google Imagen: {image_prompt[:30]}...")
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -294,10 +288,11 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
+            # Critical for Yoast SEO Green Light on Images
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
-                json={'alt_text': alt_text}, 
+                json={'alt_text': alt_text, 'title': alt_text, 'caption': alt_text}, 
                 timeout=10
             )
             return media_id, source_url
@@ -727,7 +722,6 @@ def reset_plan(call):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
     conn.commit(); cur.close(); conn.close()
-    # Manual call to strategy start (need helper)
     strategy_start_helper(call, pid)
 
 def strategy_start_helper(call, pid):
@@ -901,7 +895,7 @@ def propose_test_topics(chat_id, pid):
         
     bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
-# --- НАПИСАНИЕ СТАТЬИ ---
+# --- WRITE ARTICLE ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
     parts = call.data.split("_")
@@ -911,10 +905,14 @@ def write_article_handler(call):
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     info, keywords = res[0], res[1] or ""
+    internal_links = info.get('internal_links', [])
+    links_text = json.dumps(internal_links[:50], ensure_ascii=False)
     
     topics = info.get("temp_topics", [])
     topic_text = topics[idx] if len(topics) > idx else "SEO Article"
     main_keyword = topic_text.split(':')[0]
+    
+    current_year = datetime.datetime.now().year
     
     cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
     conn.commit()
@@ -923,30 +921,31 @@ def write_article_handler(call):
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью: {topic_text}...", parse_mode='Markdown')
     
     prompt = f"""
-    Role: Senior SEO Copywriter & Yoast SEO Expert.
-    Task: Write a blog post for the topic: "{topic_text}".
-    Language: STRICTLY RUSSIAN.
+    Role: Professional Magazine Editor & Yoast SEO Expert.
+    Topic: "{topic_text}"
+    Language: STRICTLY RUSSIAN (NO ENGLISH IN TEXT).
     Focus Keyword: "{main_keyword}"
+    Current Year: {current_year} (Use {current_year} or {current_year+1} for trends).
     
-    MANDATORY YOAST SEO CHECKLIST (STRICT COMPLIANCE):
-    1. **Title**: Start with the Focus Keyword.
-    2. **Introduction**: The Focus Keyword MUST appear in the very first sentence.
-    3. **Subheadings**: Use the Focus Keyword in at least one H2 and one H3.
-    4. **Density**: Repeat the Focus Keyword 5-7 times naturally throughout the text.
-    5. **Links**:
-       - Insert 2-3 Internal Links contextually.
-       - Insert 1-2 Outbound Links to authoritative sites (Wikipedia, etc.) in new tab.
-    6. **Readability**: Short paragraphs (max 4 lines). Sentences max 20 words.
-    7. **Images**: Insert 5 [IMG:...] placeholders.
+    CRITICAL YOAST SEO RULES:
+    1. **Keyphrase in Intro**: The focus keyword MUST appear in the very first sentence.
+    2. **Keyphrase Density**: Use the keyword 1-2% of the text length.
+    3. **Subheadings**: Include focus keyword in H2 and H3 tags.
+    4. **Links**:
+       - Internal Links: Pick 3 relevant from: {links_text}
+       - Outbound Links: Insert 2 links to Wikipedia/YouTube.
+    5. **Meta Description**: Max 155 characters. Must contain keyword.
+    6. **Title**: Max 60 chars. Start with Keyword.
+    7. **Structure**: Short paragraphs.
     
     OUTPUT JSON ONLY:
     {{
-        "html_content": "Full HTML content with [IMG:...] tags.",
-        "seo_title": "Russian SEO Title",
-        "meta_desc": "Russian Meta Description",
+        "html_content": "Full HTML content with 5 [IMG:...] placeholders.",
+        "seo_title": "SEO Title (Max 60 chars)",
+        "meta_desc": "Meta Description (Max 155 chars)",
         "focus_kw": "{main_keyword}",
-        "featured_img_prompt": "Cover image prompt (English)",
-        "featured_img_alt": "Cover alt text (Russian)"
+        "featured_img_prompt": "Prompt",
+        "featured_img_alt": "Alt text"
     }}
     """
     response_text = get_gemini_response(prompt)
@@ -999,7 +998,6 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
-            # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
@@ -1018,17 +1016,14 @@ def approve_publish(call):
             'User-Agent': 'Mozilla/5.0',
             'Cookie': 'beget=begetok'
         }
-        # Use clean H1 title
-        seo_title = seo_data.get('seo_title', title)
-        final_title = title if len(seo_title) > 70 or ":" in seo_title else seo_title
-
+        
         meta_payload = {
-            '_yoast_wpseo_title': seo_title,
+            '_yoast_wpseo_title': seo_data.get('seo_title', title),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
             '_yoast_wpseo_focuskw': seo_data.get('focus_kw', '')
         }
         post_data = {
-            'title': final_title,
+            'title': title,
             'content': final_content.replace("\n", "<br>"),
             'status': 'publish',
             'meta': meta_payload
@@ -1042,17 +1037,15 @@ def approve_publish(call):
             link = r.json().get('link')
             cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
             
-            # Check limits
             cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
             left = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
             
-            # Success GIF + Message
-            gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
+            success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
             try:
-                bot.send_animation(call.message.chat.id, gif_url, caption=f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+                bot.send_animation(call.message.chat.id, success_gif, caption=f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
             except:
                 bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
                 
