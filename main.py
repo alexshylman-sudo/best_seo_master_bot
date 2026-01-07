@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "203473623")) 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) 
 SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -30,7 +30,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 APP_URL = os.getenv("APP_URL")
 
 bot = TeleBot(TOKEN)
-# Initialize Google GenAI Client
+# Инициализация клиента Google GenAI
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 
@@ -307,7 +307,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     print(f"🎨 Imagen 4 Generating: {final_prompt[:40]}...")
     
     try:
-        # Убрали safety_settings из config, так как это вызывает ошибку валидации
+        # Без safety_settings для избежания ошибок валидации в новой либе
         response = client.models.generate_images(
             model=target_model, 
             prompt=final_prompt,
@@ -382,7 +382,7 @@ def start(message):
         cur = conn.cursor()
         cur.execute("INSERT INTO users (user_id, gens_left) VALUES (%s, 2) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit(); cur.close(); conn.close()
-    bot.send_message(user_id, "👋 Привет! Я AI SEO Master.\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
+    bot.send_message(user_id, "👋 Привет! Я AI SEO Master (Tier 1).\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
 
 @bot.message_handler(func=lambda m: m.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"])
 def menu_handler(message):
@@ -993,10 +993,13 @@ def write_article_handler(call):
     pid, idx = parts[1], int(parts[3])
     
     conn = get_db_connection(); cur = conn.cursor()
+    # ИСПРАВЛЕНИЕ: Теперь запрашиваем keywords из базы
     cur.execute("SELECT info, keywords, sitemap_links FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
-    info, keywords = res[0], res[1] or ""
-    # Get Real Sitemap Links for Internal Linking
+    
+    # ИСПРАВЛЕНИЕ: Распаковываем keywords корректно
+    info = res[0]
+    keywords_raw = res[1] or ""
     sitemap_list = res[2] if res[2] else []
     links_text = json.dumps(sitemap_list[:50], ensure_ascii=False) if sitemap_list else "No internal links found."
     
@@ -1012,6 +1015,7 @@ def write_article_handler(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью: {topic_text}...", parse_mode='Markdown')
     
+    # ИСПРАВЛЕНИЕ: Передаем весь список ключей (или большую его часть)
     prompt = f"""
     Role: Professional Magazine Editor & Yoast SEO Expert.
     Topic: "{topic_text}"
@@ -1021,7 +1025,9 @@ def write_article_handler(call):
     Current Year: {current_year} (Use {current_year} or {current_year+1} for future trends).
     
     IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
-    Do not use English phrases like "In conclusion", "Introduction", etc.
+    
+    SEO SEMANTIC CORE (Integrate these keywords naturally into the text):
+    {keywords_raw}
     
     MANDATORY YOAST SEO RULES (GREEN BULLET):
     1. **Keyphrase in Intro**: The focus keyword MUST appear in the very first sentence.
