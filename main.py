@@ -1438,7 +1438,18 @@ def write_article_handler(call):
             
             info = res[0]
             keywords_raw = res[1] or ""
-            sitemap_list = json.loads(res[2]) if res[2] else []
+            
+            # --- FIX: SAFE SITEMAP LOADING ---
+            sitemap_data = res[2]
+            if isinstance(sitemap_data, list):
+                sitemap_list = sitemap_data
+            elif isinstance(sitemap_data, str):
+                try: sitemap_list = json.loads(sitemap_data)
+                except: sitemap_list = []
+            else:
+                sitemap_list = []
+            # ---------------------------------
+            
             style_prompt = res[3] or "" # Стиль из базы знаний
             
             links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
@@ -1517,7 +1528,7 @@ def write_article_handler(call):
 
     threading.Thread(target=_write_art).start()
 
-# --- REWRITE LOGIC ---
+# --- REWRITE LOGIC (FIXED) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rewrite_"))
 def rewrite_article(call):
     try: bot.answer_callback_query(call.id, "Переписываю...")
@@ -1550,7 +1561,18 @@ def rewrite_article(call):
             proj = cur.fetchone()
             keywords_raw = proj[1] or ""
             style_prompt = proj[3] or ""
-            sitemap_list = json.loads(proj[2]) if proj[2] else []
+            
+            # --- FIX: SAFE SITEMAP LOADING ---
+            sitemap_data = proj[2]
+            if isinstance(sitemap_data, list):
+                sitemap_list = sitemap_data
+            elif isinstance(sitemap_data, str):
+                try: sitemap_list = json.loads(sitemap_data)
+                except: sitemap_list = []
+            else:
+                sitemap_list = []
+            # ---------------------------------
+            
             links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
             
             current_year = datetime.datetime.now().year
