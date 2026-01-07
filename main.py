@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "203473623")) 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) 
 SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -30,9 +30,9 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 APP_URL = os.getenv("APP_URL")
 
 bot = TeleBot(TOKEN)
-# Инициализация клиента Google GenAI
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
+UPLOAD_STATE = {} # Для отслеживания состояния загрузки фото
 
 # --- 2. DATABASE ---
 def get_db_connection():
@@ -47,6 +47,7 @@ def patch_db_schema():
     if not conn: return
     cur = conn.cursor()
     try:
+        # Существующие поля
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_paid_rub INT DEFAULT 0")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_paid_stars INT DEFAULT 0")
@@ -58,6 +59,11 @@ def patch_db_schema():
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS sitemap_links JSONB DEFAULT '[]'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seo_data JSONB DEFAULT '{}'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS scheduled_time TIMESTAMP")
+        
+        # --- НОВЫЕ ПОЛЯ ДЛЯ БАЗЫ ЗНАНИЙ ---
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_prompt TEXT")
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_images JSONB DEFAULT '[]'")
+        
         conn.commit()
     except Exception as e: 
         print(f"⚠️ Schema Patch Error: {e}")
@@ -90,6 +96,8 @@ def init_db():
             info JSONB DEFAULT '{}', 
             knowledge_base JSONB DEFAULT '[]', 
             keywords TEXT,
+            style_prompt TEXT,
+            style_images JSONB DEFAULT '[]',
             cms_url TEXT,
             cms_login TEXT,
             cms_password TEXT,
@@ -143,7 +151,6 @@ def update_last_active(user_id):
 
 # --- 3. UTILITIES ---
 def slugify(text):
-    """Транслитерация для имен файлов (SEO)"""
     if not text: return "image"
     symbols = (u"абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
                u"abvgdeejzijklmnoprstufhzcss_y_euaABVGDEEJZIJKLMNOPRSTUFHZCSS_Y_EUA")
@@ -179,7 +186,6 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
 
 def get_gemini_response(prompt):
     try:
-        # Using Gemini 2.0 Flash (Fast & Tier 1 Ready)
         response = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
         return response.text
     except Exception as e:
@@ -301,8 +307,8 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
-# --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) ---
-def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename=None):
+# --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) WITH KNOWLEDGE BASE ---
+def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style=""):
     """
     Returns: (media_id, source_url, debug_message)
     """
@@ -311,13 +317,16 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
     # 1. Используем модель для Tier 1
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # 2. Улучшенный промпт для фотореализма
-    final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting"
+    # 2. Улучшенный промпт + СТИЛЬ ПРОЕКТА
+    # Если задан стиль проекта, используем его, иначе стандартный фотореализм
+    if project_style and len(project_style) > 5:
+        final_prompt = f"{project_style}. {image_prompt}. High resolution, 8k, cinematic lighting."
+    else:
+        final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting"
     
-    print(f"🎨 Imagen 4 Generating: {final_prompt[:40]}...")
+    print(f"🎨 Imagen 4 Generating: {final_prompt[:60]}...")
     
     try:
-        # Без safety_settings для избежания ошибок валидации
         response = client.models.generate_images(
             model=target_model, 
             prompt=final_prompt,
@@ -399,7 +408,7 @@ def start(message):
         cur = conn.cursor()
         cur.execute("INSERT INTO users (user_id, gens_left) VALUES (%s, 2) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit(); cur.close(); conn.close()
-    bot.send_message(user_id, "👋 Привет! Я AI SEO Master (Tier 1 + Green SEO).\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
+    bot.send_message(user_id, "👋 Привет! Я AI SEO Master (Tier 1 + Knowledge Base).\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
 
 @bot.message_handler(func=lambda m: m.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"])
 def menu_handler(message):
@@ -426,6 +435,8 @@ def menu_handler(message):
     elif txt == "⚙️ Админка" and uid == ADMIN_ID:
         show_admin_panel(uid)
     elif txt == "🔙 В меню":
+        # Сброс состояния загрузки
+        if uid in UPLOAD_STATE: del UPLOAD_STATE[uid]
         bot.send_message(uid, "Главное меню", reply_markup=main_menu_markup(uid))
 
 @bot.callback_query_handler(func=lambda call: call.data == "soon")
@@ -542,6 +553,7 @@ def open_proj_mgmt(call):
 def project_settings_menu(call):
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🧠 База Знаний (Стиль)", callback_data=f"kb_menu_{pid}"))
     markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("📝 Опрос", callback_data=f"srv_{pid}"))
     markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"comp_start_{pid}"))
@@ -549,6 +561,113 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+# --- KNOWLEDGE BASE HANDLERS ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_menu_"))
+def kb_menu(call):
+    pid = call.data.split("_")[2]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT style_prompt, style_images FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    cur.close(); conn.close()
+    
+    style_text = res[0] if res and res[0] else "Не задан"
+    images = res[1] if res and res[1] else []
+    
+    msg = f"🧠 **База Знаний (Стиль)**\n\n📝 **Промпт:**\n_{escape_md(style_text)}_\n\n🖼 **Фото:** {len(images)}/30 загружено."
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📝 Изменить Стиль (Текст)", callback_data=f"kb_set_text_{pid}"))
+    markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото ({len(images)}/30)", callback_data=f"kb_add_photo_{pid}"))
+    if images:
+        markup.add(types.InlineKeyboardButton("🗑 Очистить все фото", callback_data=f"kb_clear_photos_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
+    
+    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_text_"))
+def kb_set_text(call):
+    pid = call.data.split("_")[3]
+    msg = bot.send_message(call.message.chat.id, "📝 Опишите идеальный стиль картинок (промпт).\nПример: *Реалистичные фото, теплый свет, современный стиль, пастельные тона.*")
+    bot.register_next_step_handler(msg, save_kb_text, pid)
+
+def save_kb_text(message, pid):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET style_prompt=%s WHERE id=%s", (message.text, pid))
+    conn.commit(); cur.close(); conn.close()
+    bot.send_message(message.chat.id, "✅ Стиль сохранен! Теперь генератор будет его использовать.")
+    kb_menu_wrapper(message.chat.id, pid)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_add_photo_"))
+def kb_add_photo(call):
+    pid = call.data.split("_")[3]
+    UPLOAD_STATE[call.from_user.id] = pid
+    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (JPG/PNG) до 1МБ.\nМожно отправить несколько по очереди.")
+
+@bot.message_handler(content_types=['photo', 'document'])
+def handle_photo_upload(message):
+    uid = message.from_user.id
+    if uid not in UPLOAD_STATE: return # Игнорируем, если пользователь не в режиме загрузки
+    
+    pid = UPLOAD_STATE[uid]
+    
+    # Проверка лимита количества (БД запрос)
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
+    images = cur.fetchone()[0] or []
+    if len(images) >= 30:
+        bot.send_message(message.chat.id, "❌ Достигнут лимит 30 фото.")
+        cur.close(); conn.close(); return
+
+    # Получение файла
+    file_info = None
+    if message.photo:
+        file_info = bot.get_file(message.photo[-1].file_id)
+    elif message.document:
+        if message.document.mime_type in ['image/jpeg', 'image/png']:
+            file_info = bot.get_file(message.document.file_id)
+        else:
+            bot.send_message(message.chat.id, "❌ Только JPG или PNG.")
+            cur.close(); conn.close(); return
+
+    # Проверка размера (1МБ = 1048576 байт)
+    if file_info.file_size > 1048576:
+        bot.send_message(message.chat.id, "❌ Файл слишком большой (>1МБ).")
+        cur.close(); conn.close(); return
+
+    # Скачивание и сохранение
+    downloaded_file = bot.download_file(file_info.file_path)
+    b64_img = base64.b64encode(downloaded_file).decode('utf-8')
+    
+    images.append(b64_img)
+    cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
+    conn.commit(); cur.close(); conn.close()
+    
+    bot.send_message(message.chat.id, f"✅ Фото добавлено! ({len(images)}/30)")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_clear_photos_"))
+def kb_clear_photos(call):
+    pid = call.data.split("_")[3]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET style_images='[]' WHERE id=%s", (pid,))
+    conn.commit(); cur.close(); conn.close()
+    bot.answer_callback_query(call.id, "Фото удалены.")
+    kb_menu(call)
+
+def kb_menu_wrapper(chat_id, pid):
+    # Вспомогательная функция для возврата в меню без callback
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT style_prompt, style_images FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    cur.close(); conn.close()
+    style_text = res[0] if res and res[0] else "Не задан"
+    images = res[1] if res and res[1] else []
+    msg = f"🧠 **База Знаний (Стиль)**\n\n📝 **Промпт:**\n_{escape_md(style_text)}_\n\n🖼 **Фото:** {len(images)}/30 загружено."
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📝 Изменить Стиль", callback_data=f"kb_set_text_{pid}"),
+               types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
+    bot.send_message(chat_id, msg, reply_markup=markup, parse_mode='Markdown')
 
 # --- UTILS (PROFILE) ---
 def show_profile(uid):
@@ -965,6 +1084,7 @@ def test_article_start(call):
         return
 
     pid = call.data.split("_")[2]
+    # ОБНОВЛЕНО: Вызов функции без задержек для Tier 1
     propose_test_topics(call.message.chat.id, pid)
 
 def propose_test_topics(chat_id, pid):
@@ -1017,15 +1137,15 @@ def write_article_handler(call):
     pid, idx = parts[1], int(parts[3])
     
     conn = get_db_connection(); cur = conn.cursor()
-    # 1. ЗАПРОС КЛЮЧЕЙ ИЗ БД
-    cur.execute("SELECT info, keywords, sitemap_links FROM projects WHERE id=%s", (pid,))
+    # 1. ЗАПРОС КЛЮЧЕЙ И СТИЛЯ
+    cur.execute("SELECT info, keywords, sitemap_links, style_prompt FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     
     info = res[0]
     keywords_raw = res[1] or ""
-    sitemap_list = json.loads(res[2]) if res[2] else [] # Исправлено: парсим JSON
+    sitemap_list = json.loads(res[2]) if res[2] else []
+    style_prompt = res[3] or "" # Стиль из базы знаний
     
-    # Формируем список ссылок для перелинковки
     links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
     
     topics = info.get("temp_topics", [])
@@ -1062,6 +1182,7 @@ def write_article_handler(call):
     5. **Readability**: Short paragraphs. Use transition words.
     6. **Images**: Insert 5 [IMG: description containing keyword] placeholders.
     7. **Meta Description**: Max 155 characters. Must contain keyword.
+    8. **Title**: Max 60 chars. Start with Keyword.
     
     OUTPUT JSON ONLY:
     {{
@@ -1111,21 +1232,19 @@ def approve_publish(call):
     pid, title, content, seo_json = row
     seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
     
-    cur.execute("SELECT cms_url, cms_login, cms_password FROM projects WHERE id=%s", (pid,))
+    # Получаем стиль проекта для передачи в генератор
+    cur.execute("SELECT cms_url, cms_login, cms_password, style_prompt FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     
     if not res:
         bot.send_message(call.message.chat.id, "❌ Проект не найден.")
         cur.close(); conn.close(); return
 
-    url, login, pwd = res
+    url, login, pwd, project_style = res
     
     debug_report = []
-    
-    # Извлекаем фокусное слово для имен файлов
     focus_kw = seo_data.get('focus_kw', 'seo-article')
     
-    # 1. Обработка картинок внутри текста
     img_matches = re.findall(r'\[IMG: (.*?)\]', content)
     final_content = content
     
@@ -1133,25 +1252,24 @@ def approve_publish(call):
         debug_report.append(f"🔎 Найдено {len(img_matches)} тегов [IMG].")
         
     for i, prompt in enumerate(img_matches):
-        # Генерируем правильное имя файла
         seo_filename = f"{focus_kw}-{i+1}"
-        
-        media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", seo_filename)
+        # Передаем стиль проекта
+        media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", seo_filename, project_style)
         
         debug_report.append(f"🖼 Картинка {i+1}: {msg}")
         
         if source_url:
-            # Safe WP block image class + SEO Title/Alt
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{focus_kw}" title="{focus_kw}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
             final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
 
-    # 2. Обложка
+    # Обложка
     feat_media_id = None
     if seo_data.get('featured_img_prompt'):
         seo_filename_cover = f"{focus_kw}-main"
-        feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, seo_filename_cover)
+        # Передаем стиль проекта
+        feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, seo_filename_cover, project_style)
         debug_report.append(f"🎨 Обложка: {feat_msg}")
 
     error_found = any("❌" in x or "⚠️" in x for x in debug_report)
@@ -1159,7 +1277,7 @@ def approve_publish(call):
         report_text = "\n".join(debug_report)
         bot.send_message(call.message.chat.id, f"📋 **Отчет по медиа:**\n{report_text}", parse_mode='Markdown')
 
-    # 3. Публикация
+    # Публикация
     try:
         creds = f"{login}:{pwd}"
         token = base64.b64encode(creds.encode()).decode()
@@ -1170,14 +1288,13 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
-        # YOAST SEO META FIELDS
         meta_payload = {
             '_yoast_wpseo_title': seo_data.get('seo_title', title),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
             '_yoast_wpseo_focuskw': focus_kw
         }
         post_data = {
-            'title': seo_data.get('seo_title', title), # Используем SEO заголовок
+            'title': seo_data.get('seo_title', title),
             'content': final_content.replace("\n", "<br>"),
             'status': 'publish',
             'meta': meta_payload
@@ -1206,7 +1323,7 @@ def approve_publish(call):
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
             conn.close()
-            bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code} - {r.text[:100]}")
+            bot.send_message(call.message.chat.id, f"❌ Ошибка WP Публикации: {r.status_code} - {r.text[:100]}")
             
     except Exception as e:
         if conn: conn.close()
@@ -1224,5 +1341,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Tier 1 + Full SEO Fix)...")
+    print("🤖 Бот запущен (Tier 1 Optimized)...")
     bot.infinity_polling(skip_pending=True)
