@@ -60,6 +60,7 @@ def patch_db_schema():
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS seo_data JSONB DEFAULT '{}'") 
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS scheduled_time TIMESTAMP")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_prompt TEXT")
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_negative_prompt TEXT") # NEW
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_images JSONB DEFAULT '[]'")
         conn.commit()
     except Exception as e: 
@@ -94,6 +95,7 @@ def init_db():
             knowledge_base JSONB DEFAULT '[]', 
             keywords TEXT,
             style_prompt TEXT,
+            style_negative_prompt TEXT,
             style_images JSONB DEFAULT '[]',
             cms_url TEXT,
             cms_login TEXT,
@@ -307,18 +309,23 @@ def format_html_for_chat(html_content):
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
 # --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) ---
-def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style=""):
+def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
     image_bytes = None
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # --- UPDATED: NO TEXT INSTRUCTION ---
+    # --- UPDATED: NO TEXT INSTRUCTION + NEGATIVE PROMPT ---
+    # Мы добавляем жесткие ограничения на текст прямо в промпт
+    base_negative = "exclude text, writing, letters, watermarks, signature, words"
+    
+    full_negative = f"{base_negative}, {negative_prompt}" if negative_prompt else base_negative
+    
     if project_style and len(project_style) > 5:
-        final_prompt = f"{project_style}. {image_prompt}. High resolution, 8k, cinematic lighting. NO TEXT, NO WORDS, NO LETTERS, CLEAN IMAGE."
+        final_prompt = f"{project_style}. {image_prompt}. High resolution, 8k, cinematic lighting. Exclude: {full_negative}."
     else:
-        final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting. NO TEXT, NO WORDS, NO LETTERS."
+        final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting. Exclude: {full_negative}."
     # ------------------------------------
     
-    print(f"🎨 Imagen 4 Generating: {final_prompt[:60]}...")
+    print(f"🎨 Imagen 4 Generating: {final_prompt[:80]}...")
     
     try:
         response = client.models.generate_images(
@@ -635,17 +642,23 @@ def kb_menu(call):
     except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT style_prompt, style_images FROM projects WHERE id=%s", (pid,))
+    # Запрашиваем также negative prompt
+    cur.execute("SELECT style_prompt, style_images, style_negative_prompt FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
     
     style_text = res[0] if res and res[0] else "Не задан"
     images = res[1] if res and res[1] else []
+    neg_prompt = res[2] if res and res[2] else "Не задан"
     
-    msg = f"🧠 **База Знаний (Стиль)**\n\n📝 **Промпт:**\n_{escape_md(style_text)}_\n\n🖼 **Фото:** {len(images)}/30 загружено."
+    msg = (f"🧠 **База Знаний (Стиль)**\n\n"
+           f"🎨 **Промпт (Позитивный):**\n_{escape_md(style_text)}_\n\n"
+           f"🚫 **Анти-промпт (Запрет):**\n_{escape_md(neg_prompt)}_\n\n"
+           f"🖼 **Фото:** {len(images)}/30 загружено.")
     
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📝 Изменить Стиль (Текст)", callback_data=f"kb_set_text_{pid}"))
+    markup.add(types.InlineKeyboardButton("🎨 Промпт для изображений", callback_data=f"kb_set_text_{pid}"))
+    markup.add(types.InlineKeyboardButton("🚫 Анти-промпт (Запрет)", callback_data=f"kb_set_negative_{pid}"))
     markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото ({len(images)}/30)", callback_data=f"kb_add_photo_{pid}"))
     if images:
         markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
@@ -667,6 +680,22 @@ def save_kb_text(message, pid):
     cur.execute("UPDATE projects SET style_prompt=%s WHERE id=%s", (message.text, pid))
     conn.commit(); cur.close(); conn.close()
     bot.send_message(message.chat.id, "✅ Стиль сохранен! Теперь генератор будет его использовать.")
+    kb_menu_wrapper(message.chat.id, pid)
+
+# --- NEW: ANTI-PROMPT HANDLER ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_negative_"))
+def kb_set_negative(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[3]
+    msg = bot.send_message(call.message.chat.id, "🚫 Напишите, чего НЕ должно быть на фото (на английском лучше, но можно и на русском).\nПример: *people, text, blur, drawing*")
+    bot.register_next_step_handler(msg, save_kb_negative, pid)
+
+def save_kb_negative(message, pid):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET style_negative_prompt=%s WHERE id=%s", (message.text, pid))
+    conn.commit(); cur.close(); conn.close()
+    bot.send_message(message.chat.id, "✅ Анти-промпт сохранен!")
     kb_menu_wrapper(message.chat.id, pid)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_add_photo_"))
@@ -869,15 +898,23 @@ def kb_clear_photos(call):
 
 def kb_menu_wrapper(chat_id, pid):
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT style_prompt, style_images FROM projects WHERE id=%s", (pid,))
+    cur.execute("SELECT style_prompt, style_images, style_negative_prompt FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
+    
     style_text = res[0] if res and res[0] else "Не задан"
     images = res[1] if res and res[1] else []
-    msg = f"🧠 **База Знаний (Стиль)**\n\n📝 **Промпт:**\n_{escape_md(style_text)}_\n\n🖼 **Фото:** {len(images)}/30 загружено."
+    neg_prompt = res[2] if res and res[2] else "Не задан"
+    
+    msg = (f"🧠 **База Знаний (Стиль)**\n\n"
+           f"🎨 **Промпт (Позитивный):**\n_{escape_md(style_text)}_\n\n"
+           f"🚫 **Анти-промпт (Запрет):**\n_{escape_md(neg_prompt)}_\n\n"
+           f"🖼 **Фото:** {len(images)}/30 загружено.")
+    
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📝 Изменить Стиль", callback_data=f"kb_set_text_{pid}"),
-               types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
+    markup.add(types.InlineKeyboardButton("🎨 Промпт для изображений", callback_data=f"kb_set_text_{pid}"))
+    markup.add(types.InlineKeyboardButton("🚫 Анти-промпт (Запрет)", callback_data=f"kb_set_negative_{pid}"))
+    markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
     if images:
         markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
@@ -1040,8 +1077,16 @@ def view_kw(call):
     pid = call.data.split("_")[2]
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT keywords FROM projects WHERE id=%s", (pid,))
-    kw = cur.fetchone()[0]
-    send_safe_message(call.message.chat.id, f"Ключи:\n{kw}")
+    row = cur.fetchone()
+    kw = row[0] if row else None
+    
+    if not kw or len(str(kw).strip()) < 2:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📝 Пройти опрос", callback_data=f"srv_{pid}"))
+        markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
+        bot.send_message(call.message.chat.id, "У вас пока нет ключевых слов, но их обязательно нужно создать с помощью опроса.", reply_markup=markup)
+    else:
+        send_safe_message(call.message.chat.id, f"Ключи:\n{kw}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_main")
 def back_main(call):
@@ -1673,14 +1718,16 @@ def approve_publish(call):
             pid, title, content, seo_json = row
             seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
             
-            cur.execute("SELECT cms_url, cms_login, cms_password, style_prompt FROM projects WHERE id=%s", (pid,))
+            # --- UPDATED: SELECT NEGATIVE PROMPT ---
+            cur.execute("SELECT cms_url, cms_login, cms_password, style_prompt, style_negative_prompt FROM projects WHERE id=%s", (pid,))
             res = cur.fetchone()
             
             if not res:
                 bot.send_message(call.message.chat.id, "❌ Проект не найден.")
                 cur.close(); conn.close(); return
 
-            url, login, pwd, project_style = res
+            url, login, pwd, project_style, neg_style = res
+            # ----------------------------------------
             
             debug_report = []
             focus_kw = seo_data.get('focus_kw', 'seo-article')
@@ -1693,7 +1740,9 @@ def approve_publish(call):
                 
             for i, prompt in enumerate(img_matches):
                 seo_filename = f"{focus_kw}-{i+1}"
-                media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", seo_filename, project_style)
+                # --- UPDATED: Pass negative prompt ---
+                media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", seo_filename, project_style, neg_style)
+                # -------------------------------------
                 
                 debug_report.append(f"🖼 Картинка {i+1}: {msg}")
                 
@@ -1706,7 +1755,9 @@ def approve_publish(call):
             feat_media_id = None
             if seo_data.get('featured_img_prompt'):
                 seo_filename_cover = f"{focus_kw}-main"
-                feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, seo_filename_cover, project_style)
+                # --- UPDATED: Pass negative prompt ---
+                feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, seo_filename_cover, project_style, neg_style)
+                # -------------------------------------
                 debug_report.append(f"🎨 Обложка: {feat_msg}")
 
             error_found = any("❌" in x or "⚠️" in x for x in debug_report)
