@@ -165,7 +165,7 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
         except: 
             try: bot.send_message(chat_id, part, parse_mode=None, reply_markup=markup)
             except: pass
-        time.sleep(0.3)
+        time.sleep(0.1)
 
 def get_gemini_response(prompt):
     try:
@@ -290,17 +290,17 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
-# --- ОБНОВЛЕННАЯ ФУНКЦИЯ ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ (IMAGEN 4 FAST) ---
+# --- 4. IMAGE GENERATION (IMAGEN 4 FAST - TIER 1) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
     
-    # 1. Используем модель Imagen 4 Fast (актуальная на 2026 год)
+    # 1. Используем актуальную модель для Tier 1
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # 2. Добавляем "магические" слова для фотореализма
+    # 2. Улучшенный промпт для фотореализма
     final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, cinematic lighting, 8k"
     
-    print(f"🎨 Google Imagen 4 Fast: {final_prompt[:40]}...")
+    print(f"🎨 Imagen 4 Fast (Tier 1): {final_prompt[:40]}...")
     
     try:
         response = client.models.generate_images(
@@ -308,9 +308,9 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             prompt=final_prompt,
             config=genai_types.GenerateImagesConfig(
                 number_of_images=1,
-                # 3. Формат 16:9 для блога
+                # 3. Формат 16:9
                 aspect_ratio='16:9',
-                # 4. Настройки безопасности (чтобы не блокировало зря)
+                # 4. Безопасность - минимизация блокировок
                 safety_settings=[
                     genai_types.SafetySetting(
                         category="HARM_CATEGORY_HATE_SPEECH",
@@ -334,7 +334,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
         else:
-            print("⚠️ Изображение не создано (Safety Filter или пустой ответ)")
+            print("⚠️ Изображение не создано (Safety Filter)")
             return None, None
             
     except Exception as e:
@@ -374,7 +374,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         print(f"WP Upload Error: {e}")
     return None, None
 
-# --- 4. MENUS ---
+# --- 5. MENUS ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("➕ Новый проект", "📂 Мои проекты")
@@ -424,7 +424,7 @@ def menu_handler(message):
 @bot.callback_query_handler(func=lambda call: call.data == "soon")
 def soon_alert(call): bot.answer_callback_query(call.id, "🚧 В разработке...")
 
-# --- 5. PROJECTS ---
+# --- 6. PROJECTS ---
 def list_projects(user_id, chat_id):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, url FROM projects WHERE user_id = %s ORDER BY id ASC", (user_id,))
@@ -944,14 +944,14 @@ def test_article_start(call):
         return
 
     pid = call.data.split("_")[2]
-    # ОБНОВЛЕНО: Вызов функции с обработкой ошибок лимитов
+    # ОБНОВЛЕНО: Вызов функции без задержек для Tier 1
     propose_test_topics(call.message.chat.id, pid)
 
 def propose_test_topics(chat_id, pid):
-    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи (это может занять пару секунд)...")
+    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
     
-    # 1. Пауза, чтобы снизить риск ошибки 429 на Free тарифе
-    time.sleep(2)
+    # Tier 1: Искусственные задержки не нужны
+    # time.sleep(2) 
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
@@ -968,22 +968,14 @@ def propose_test_topics(chat_id, pid):
     ["Как выбрать...", "ТОП 10 ошибок...", "Секреты..."]
     """
     
-    # 2. Получаем "сырой" ответ
     raw_response = get_gemini_response(prompt)
     
-    # 3. ПРОВЕРКА НА ОШИБКИ ЛИМИТОВ (429)
-    if "429" in raw_response or "RESOURCE_EXHAUSTED" in raw_response:
-        bot.send_message(chat_id, "🔴 **Google API Лимит исчерпан!**\nСлишком много запросов. Подождите 2-3 минуты и попробуйте снова.\n\n(Это ограничение бесплатного ключа)")
-        cur.close(); conn.close()
-        return
-
-    # 4. ПРОВЕРКА НА ДРУГИЕ ОШИБКИ
+    # Простая проверка ошибок, так как на Tier 1 мы ожидаем стабильность
     if "AI Error" in raw_response:
         bot.send_message(chat_id, f"⚠️ Ошибка ИИ:\n{raw_response}")
         cur.close(); conn.close()
         return
 
-    # 5. ПОПЫТКА РАСПОЗНАТЬ JSON
     topics = clean_and_parse_json(raw_response)
     
     if not topics or len(topics) == 0:
@@ -991,7 +983,6 @@ def propose_test_topics(chat_id, pid):
         cur.close(); conn.close()
         return
     
-    # 6. Сохраняем ТОЛЬКО если темы реальные
     info["temp_topics"] = topics
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
     conn.commit(); cur.close(); conn.close()
@@ -1190,5 +1181,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен...")
+    print("🤖 Бот запущен (Tier 1 Optimized)...")
     bot.infinity_polling(skip_pending=True)
