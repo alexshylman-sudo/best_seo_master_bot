@@ -228,11 +228,23 @@ def clean_and_parse_json(text):
         try: return json.loads(match.group(1))
         except: pass
     
+    match_list = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
+    if match_list:
+        try: return json.loads(match_list.group(1))
+        except: pass
+
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1:
         try: return json.loads(text[start:end+1])
         except: pass
+    
+    start_list = text.find('[')
+    end_list = text.rfind(']')
+    if start_list != -1 and end_list != -1:
+        try: return json.loads(text[start_list:end_list+1])
+        except: pass
+
     return None
 
 def format_html_for_chat(html_content):
@@ -256,6 +268,8 @@ def format_html_for_chat(html_content):
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
+    
+    print(f"🎨 Google Imagen: {image_prompt[:30]}...")
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -288,7 +302,6 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
-            # Critical for Yoast SEO Green Light on Images
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
@@ -923,29 +936,34 @@ def write_article_handler(call):
     prompt = f"""
     Role: Professional Magazine Editor & Yoast SEO Expert.
     Topic: "{topic_text}"
-    Language: STRICTLY RUSSIAN (NO ENGLISH IN TEXT).
+    Length: 2000-2500 words.
+    Style: Magazine Layout (Use HTML <blockquote>, <table>, <ul>).
     Focus Keyword: "{main_keyword}"
-    Current Year: {current_year} (Use {current_year} or {current_year+1} for trends).
+    Current Year: {current_year} (Use {current_year} or {current_year+1} for future trends).
     
-    CRITICAL YOAST SEO RULES:
+    MANDATORY YOAST SEO RULES (GREEN BULLET):
     1. **Keyphrase in Intro**: The focus keyword MUST appear in the very first sentence.
-    2. **Keyphrase Density**: Use the keyword 1-2% of the text length.
-    3. **Subheadings**: Include focus keyword in H2 and H3 tags.
+    2. **Keyphrase Density**: Use the keyword 0.5-2% of the text length (~15-30 times).
+    3. **Subheadings**: Include focus keyword in 50% of H2 and H3 tags.
     4. **Links**:
        - Internal Links: Pick 3 relevant from: {links_text}
-       - Outbound Links: Insert 2 links to Wikipedia/YouTube.
-    5. **Meta Description**: Max 155 characters. Must contain keyword.
-    6. **Title**: Max 60 chars. Start with Keyword.
-    7. **Structure**: Short paragraphs.
+       - Outbound Links: Insert 2 links to authoritative sites (Wikipedia, specialized portals) in new tab.
+    5. **Readability**:
+       - Short paragraphs (max 150 words).
+       - Vary sentence length.
+       - Use transition words in >30% of sentences.
+    6. **Images**: Insert 5 [IMG:...] placeholders distributed evenly.
+    7. **Meta Description**: Max 155 characters. Must contain keyword.
+    8. **Title**: Max 60 chars. Start with Keyword.
     
     OUTPUT JSON ONLY:
     {{
-        "html_content": "Full HTML content with 5 [IMG:...] placeholders.",
+        "html_content": "Full HTML content with [IMG:...] tags.",
         "seo_title": "SEO Title (Max 60 chars)",
         "meta_desc": "Meta Description (Max 155 chars)",
         "focus_kw": "{main_keyword}",
-        "featured_img_prompt": "Prompt",
-        "featured_img_alt": "Alt text"
+        "featured_img_prompt": "Cover image prompt (English)",
+        "featured_img_alt": "Cover alt text (Russian)"
     }}
     """
     response_text = get_gemini_response(prompt)
@@ -998,6 +1016,7 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
+            # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
@@ -1017,13 +1036,17 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
+        # Use clean H1 title
+        seo_title = seo_data.get('seo_title', title)
+        final_title = title if len(seo_title) > 70 or ":" in seo_title else seo_title
+
         meta_payload = {
-            '_yoast_wpseo_title': seo_data.get('seo_title', title),
+            '_yoast_wpseo_title': seo_title,
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
             '_yoast_wpseo_focuskw': seo_data.get('focus_kw', '')
         }
         post_data = {
-            'title': title,
+            'title': final_title,
             'content': final_content.replace("\n", "<br>"),
             'status': 'publish',
             'meta': meta_payload
