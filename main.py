@@ -222,29 +222,48 @@ def update_project_progress(pid, step_key):
     except: pass
     finally: cur.close(); conn.close()
 
-def clean_json_tail(text):
-    text = str(text)
-    match = re.search(r'\{[\s\S]*"seo_title"[\s\S]*\}', text)
-    if match:
-        json_block = match.group(0)
-        text = text.replace(json_block, "")
-    text = text.strip().rstrip(',').strip()
-    return text
+def clean_and_parse_json(text):
+    """Надежно извлекает JSON из ответа AI"""
+    try:
+        # 1. Попытка найти JSON блок между ```json и ```
+        match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        
+        # 2. Попытка найти просто объект {}
+        match = re.search(r'(\{.*\})', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+            
+        return None
+    except:
+        return None
 
 def format_html_for_chat(html_content):
-    text = clean_json_tail(html_content).replace('\\n', '\n')
+    """Очищает HTML для чата"""
+    text = str(html_content).replace('\\n', '\n')
+    
+    # Удаляем JSON из конца, если он прилип
+    if '"seo_title":' in text: 
+        text = text.split('"seo_title":')[0].rsplit(',', 1)[0].rsplit('{', 1)[0]
+
+    # Убираем плейсхолдеры картинок из чата
     text = re.sub(r'\[IMG:.*?\]', '', text)
+    
     text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
     text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
+    
     soup = BeautifulSoup(text, "html.parser")
     for script in soup(["script", "style", "head", "title", "meta", "table", "style"]):
         script.decompose()
+    
     clean_text = soup.get_text(separator="\n\n")
-    return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
+    clean_text = re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
+    return clean_text.strip('",}').strip()
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
+    """ТОЛЬКО GOOGLE. Без Pollinations."""
     image_bytes = None
-    # 1. Google (Nano Banana / Imagen 3) - ONLY OPTION
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -256,11 +275,10 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             print("Generated via Google Imagen")
     except Exception as e:
         print(f"Google Imagen Error: {e}")
-        # НИКАКОГО ФОЛЛБЕКА БОЛЬШЕ НЕТ
+        # Если здесь ошибка - картинки не будет. Это по вашему требованию.
 
     if not image_bytes: return None, None
 
-    # 3. Upload WP
     try:
         if api_url.endswith('/'): api_url = api_url[:-1]
         seed = random.randint(1, 99999)
@@ -279,6 +297,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
+            # ALT текст
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
@@ -706,15 +725,13 @@ def save_freq_and_plan(call):
     survey = info_json.get("survey", "")
     kw = res[1] or ""
     
-    # Prompt for Generation
-    days_str = ", ".join(remaining_days[:actual_count])
     prompt = f"""
     Роль: SEO Маркетолог.
-    Задача: Составь контент-план только на эти дни: {days_str}.
+    Задача: Составь контент-план только на эти дни: {", ".join(remaining_days[:actual_count])}.
     Всего статей: {actual_count}.
     Ниша: {survey}. Ключи: {kw[:1000]}
     
-    Верни ТОЛЬКО JSON массив объектов (без Markdown, без ```json):
+    Верни ТОЛЬКО JSON массив объектов (без Markdown):
     [
       {{"day": "Четверг", "time": "10:00", "topic": "Тема 1"}},
       {{"day": "Пятница", "time": "15:00", "topic": "Тема 2"}}
@@ -722,11 +739,9 @@ def save_freq_and_plan(call):
     """
     ai_resp = get_gemini_response(prompt)
     
-    calendar_plan = []
-    try:
-        clean_json = ai_resp.replace("```json", "").replace("```", "").strip()
-        calendar_plan = json.loads(clean_json)
-    except:
+    # Надежный парсинг JSON
+    calendar_plan = clean_and_parse_json(ai_resp)
+    if not calendar_plan:
         calendar_plan = [{"day": remaining_days[0], "time": "10:00", "topic": "Ошибка генерации, попробуйте сбросить"}]
 
     info_json["temp_plan"] = calendar_plan
@@ -740,6 +755,7 @@ def save_freq_and_plan(call):
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(types.InlineKeyboardButton("✅ Утвердить план", callback_data=f"approve_plan_{pid}"))
     
+    # Кнопки замены (Пн, Вт...)
     short_days = {"Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср", "Четверг": "Чт", "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс"}
     repl_btns = []
     for i, item in enumerate(calendar_plan):
@@ -754,7 +770,6 @@ def save_freq_and_plan(call):
 def replace_topic(call):
     _, _, pid, idx = call.data.split("_")
     idx = int(idx)
-    
     bot.answer_callback_query(call.id, "🔄 Меняю тему...")
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -766,10 +781,11 @@ def replace_topic(call):
     
     if idx < len(plan):
         old_topic = plan[idx]['topic']
+        # Исправлено: Добавлен контекст для избежания галлюцинаций
         prompt = f"""
-        Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. 
-        Контекст: {keywords[:500]}
-        Верни только тему текстом.
+        Задача: Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. 
+        Контекст ниши: {keywords[:500]}
+        Верни ТОЛЬКО тему текстом (без кавычек).
         """
         new_topic = get_gemini_response(prompt).strip().replace('"', '')
         plan[idx]['topic'] = new_topic
@@ -813,9 +829,10 @@ def approve_plan(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
+    # Генерация 1 статьи сразу
     write_article_handler(call) 
 
-# --- НАПИСАНИЕ СТАТЬИ (ИСПРАВЛЕНО) ---
+# --- НАПИСАНИЕ СТАТЬИ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
     is_test = "test_article" in call.data
@@ -843,7 +860,10 @@ def write_article_handler(call):
     main_keyword = topic_text.split(':')[0]
     
     if is_test:
-        bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: {escape_md(topic_text)}...", parse_mode='Markdown')
+        try:
+            bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: <b>{topic_text}</b>...", parse_mode='HTML')
+        except:
+            bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью...", parse_mode=None)
     else:
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, f"⏳ Пишу статью...", parse_mode='Markdown')
@@ -866,7 +886,7 @@ def write_article_handler(call):
        - Insert 3 internal links from: {links_text}
        - Short paragraphs.
     
-    OUTPUT JSON:
+    OUTPUT JSON ONLY:
     {{
         "html_content": "Full HTML content with [IMG:...] tags.",
         "seo_title": "Russian SEO Title",
@@ -878,12 +898,13 @@ def write_article_handler(call):
     """
     response_text = get_gemini_response(prompt)
     
-    try:
-        clean_json = response_text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(clean_json)
+    # Используем новый надежный парсер JSON
+    data = clean_and_parse_json(response_text)
+    
+    if data:
         article_html = data.get("html_content", "")
         seo_data = data
-    except:
+    else:
         article_html = response_text
         seo_data = {"seo_title": topic_text, "featured_img_prompt": f"Photo of {main_keyword}"}
 
@@ -928,6 +949,7 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
+            # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
