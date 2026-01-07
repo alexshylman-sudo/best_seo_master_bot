@@ -580,6 +580,7 @@ def project_settings_menu(call):
     except: pass
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("⚡ Написать тестовую статью", callback_data=f"test_article_{pid}"))
     markup.add(types.InlineKeyboardButton("🧠 База Знаний (Стиль)", callback_data=f"kb_menu_{pid}"))
     markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("📝 Опрос", callback_data=f"srv_{pid}"))
@@ -1359,27 +1360,29 @@ def test_article_start(call):
     cur.close(); conn.close()
     
     if res and res[0] <= 0:
-        bot.send_message(call.message.chat.id, "⚠️ У вас закончились генерации. Пожалуйста, пополните баланс.")
+        bot.send_message(call.message.chat.id, "⚠️ У вас закончились бесплатные генерации (лимит 2). Пожалуйста, пополните баланс для продолжения.")
         return
 
     pid = call.data.split("_")[2]
     propose_test_topics(call.message.chat.id, pid)
 
 def propose_test_topics(chat_id, pid):
-    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
+    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи (на основе ключей и базы знаний)...")
     
     def _gen_topics():
         try:
             conn = get_db_connection(); cur = conn.cursor()
-            cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
+            cur.execute("SELECT info, keywords, style_prompt FROM projects WHERE id=%s", (pid,))
             res = cur.fetchone()
             info = res[0] or {}
             kw = res[1] or ""
+            style = res[2] or ""
             
             prompt = f"""
             Придумай 5 вирусных заголовков для статьи в блог.
-            Ниша сайта: {info.get('survey', 'Общая тема')}. 
+            Ниша сайта (из опроса): {info.get('survey', 'Общая тема')}. 
             SEO Ключевые слова: {kw[:500]}
+            Стиль проекта: {style}
             Язык: Русский.
             
             Строго верни ТОЛЬКО JSON массив строк, например:
@@ -1455,6 +1458,7 @@ def write_article_handler(call):
             Length: 2000-2500 words.
             Style: Magazine Layout (Use HTML <blockquote>, <table>, <ul>).
             Current Year: {current_year}.
+            Style/Tone Prompt: {style_prompt}
             
             IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
             
@@ -1493,7 +1497,7 @@ def write_article_handler(call):
                 article_html = response_text
                 seo_data = {"seo_title": topic_text, "featured_img_prompt": f"Photo of {topic_text}"}
 
-            cur.execute("INSERT INTO articles (project_id, title, content, seo_data, status) VALUES (%s, %s, %s, %s, 'draft') RETURNING id", 
+            cur.execute("INSERT INTO articles (project_id, title, content, seo_data, status, rewrite_count) VALUES (%s, %s, %s, %s, 'draft', 0) RETURNING id", 
                         (pid, topic_text, article_html, json.dumps(seo_data)))
             aid = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
@@ -1505,13 +1509,120 @@ def write_article_handler(call):
                 send_safe_message(call.message.chat.id, clean_view, parse_mode=None)
             
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve_{aid}"),
-                    types.InlineKeyboardButton("✏️ Переписать", callback_data=f"rewrite_{aid}"))
-            bot.send_message(call.message.chat.id, "👇 Статья готова. Публикуем?", reply_markup=markup)
+            markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"pre_approve_{aid}"),
+                    types.InlineKeyboardButton("✏️ Переписать (1/1)", callback_data=f"rewrite_{aid}"))
+            bot.send_message(call.message.chat.id, "👇 Статья готова. Утверждаем или переписываем?", reply_markup=markup)
         except Exception as e:
             bot.send_message(call.message.chat.id, f"❌ Ошибка написания статьи: {e}")
 
     threading.Thread(target=_write_art).start()
+
+# --- REWRITE LOGIC ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rewrite_"))
+def rewrite_article(call):
+    try: bot.answer_callback_query(call.id, "Переписываю...")
+    except: pass
+    aid = call.data.split("_")[1]
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT rewrite_count, project_id, title, seo_data FROM articles WHERE id=%s", (aid,))
+    row = cur.fetchone()
+    
+    if not row:
+        cur.close(); conn.close()
+        return
+
+    count, pid, title, seo_json = row
+    if count >= 1:
+        cur.close(); conn.close()
+        bot.send_message(call.message.chat.id, "⚠️ Вы уже использовали попытку переписать статью.")
+        return
+    
+    cur.execute("UPDATE articles SET rewrite_count = rewrite_count + 1 WHERE id=%s", (aid,))
+    conn.commit()
+    
+    bot.send_message(call.message.chat.id, "⏳ Переписываю статью (это займет около минуты)...")
+    
+    def _do_rewrite():
+        try:
+            # Re-fetch data for context
+            cur.execute("SELECT info, keywords, sitemap_links, style_prompt FROM projects WHERE id=%s", (pid,))
+            proj = cur.fetchone()
+            keywords_raw = proj[1] or ""
+            style_prompt = proj[3] or ""
+            sitemap_list = json.loads(proj[2]) if proj[2] else []
+            links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
+            
+            current_year = datetime.datetime.now().year
+            
+            prompt = f"""
+            TASK: REWRITE this article completely. Make it more engaging, human-like, and professional.
+            Topic: "{title}"
+            Length: 2000-2500 words.
+            Style: Magazine Layout.
+            Current Year: {current_year}.
+            Style Prompt: {style_prompt}
+            
+            KEEP SEO OPTIMIZATION:
+            Keywords: {keywords_raw}
+            Yoast Rules: Focus keyword in title, headers, first paragraph.
+            Internal Links: {links_text}
+            
+            OUTPUT JSON ONLY (Same format):
+            {{
+                "html_content": "Full HTML content...",
+                "seo_title": "...",
+                "meta_desc": "...",
+                "focus_kw": "...",
+                "featured_img_prompt": "..."
+            }}
+            """
+            
+            response_text = get_gemini_response(prompt)
+            data = clean_and_parse_json(response_text)
+            
+            if data:
+                article_html = data.get("html_content", "")
+                seo_data = data
+            else:
+                article_html = response_text
+                seo_data = {"seo_title": title, "featured_img_prompt": f"Photo of {title}"}
+            
+            cur.execute("UPDATE articles SET content=%s, seo_data=%s WHERE id=%s", 
+                        (article_html, json.dumps(seo_data), aid))
+            conn.commit(); cur.close(); conn.close()
+
+            clean_view = format_html_for_chat(article_html)
+            try:
+                send_safe_message(call.message.chat.id, clean_view, parse_mode='HTML')
+            except:
+                send_safe_message(call.message.chat.id, clean_view, parse_mode=None)
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"pre_approve_{aid}"))
+            bot.send_message(call.message.chat.id, "👇 Новая версия готова. Утверждаем?", reply_markup=markup)
+            
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка рерайта: {e}")
+
+    threading.Thread(target=_do_rewrite).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pre_approve_"))
+def pre_approve_check(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    aid = call.data.split("_")[2]
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT project_id FROM articles WHERE id=%s", (aid,))
+    pid = cur.fetchone()[0]
+    cur.close(); conn.close()
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🚀 Публикуем", callback_data=f"approve_{aid}"),
+               types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
+    
+    bot.send_message(call.message.chat.id, "✅ Статья утверждена.\n\nПубликуем её на сайт с картинками или просто сохраняем в проекте?", reply_markup=markup)
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
 def approve_publish(call):
@@ -1609,12 +1720,15 @@ def approve_publish(call):
                     except: pass
                     
                     success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
+                    
+                    markup_final = types.InlineKeyboardMarkup()
+                    markup_final.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
+
                     try:
-                        bot.send_animation(call.message.chat.id, success_gif, caption=f"✅ Успешно! Ключ: {focus_kw}\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+                        bot.send_animation(call.message.chat.id, success_gif, caption=f"✅ Успешно! Ключ: {focus_kw}\n🔗 {link}\n\n⚡ Осталось генераций: {left}", reply_markup=markup_final)
                     except:
-                        bot.send_message(call.message.chat.id, f"✅ Успешно! Ключ: {focus_kw}\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+                        bot.send_message(call.message.chat.id, f"✅ Успешно! Ключ: {focus_kw}\n🔗 {link}\n\n⚡ Осталось генераций: {left}", reply_markup=markup_final)
                         
-                    bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
                 else:
                     conn.close()
                     bot.send_message(call.message.chat.id, f"❌ Ошибка WP Публикации: {r.status_code} - {r.text[:100]}")
@@ -1640,5 +1754,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Gallery & Lock Fixed)...")
+    print("🤖 Бот запущен (Test Article & Lock Fixed)...")
     bot.infinity_polling(skip_pending=True)
