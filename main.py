@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "203473623")) 
 SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -142,6 +142,16 @@ def update_last_active(user_id):
     except: pass
 
 # --- 3. UTILITIES ---
+def slugify(text):
+    """Транслитерация для имен файлов (SEO)"""
+    if not text: return "image"
+    symbols = (u"абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
+               u"abvgdeejzijklmnoprstufhzcss_y_euaABVGDEEJZIJKLMNOPRSTUFHZCSS_Y_EUA")
+    tr = {ord(a): ord(b) for a, b in zip(*symbols)}
+    text = text.translate(tr)
+    text = re.sub(r'[\W\s]+', '-', text).strip('-').lower()
+    return text
+
 def escape_md(text):
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
@@ -292,7 +302,7 @@ def format_html_for_chat(html_content):
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
 # --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) ---
-def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
+def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename=None):
     """
     Returns: (media_id, source_url, debug_message)
     """
@@ -307,7 +317,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     print(f"🎨 Imagen 4 Generating: {final_prompt[:40]}...")
     
     try:
-        # Без safety_settings для избежания ошибок валидации в новой либе
+        # Без safety_settings для избежания ошибок валидации
         response = client.models.generate_images(
             model=target_model, 
             prompt=final_prompt,
@@ -331,9 +341,16 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     try:
         api_url = api_url.rstrip('/')
         creds = base64.b64encode(f"{login}:{pwd}".encode()).decode()
+        
+        # SEO FILE NAMING
+        if seo_filename:
+            file_name = f"{slugify(seo_filename)}-{random.randint(10,99)}.png"
+        else:
+            file_name = f"img-{slugify(alt_text[:20])}-{random.randint(100,999)}.png"
+
         headers = {
             'Authorization': 'Basic ' + creds,
-            'Content-Disposition': f'attachment; filename="img_{random.randint(100,999)}.png"',
+            'Content-Disposition': f'attachment; filename="{file_name}"',
             'Content-Type': 'image/png',
             'User-Agent': 'Mozilla/5.0'
         }
@@ -350,9 +367,9 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             requests.post(
                 f"{api_url}/wp-json/wp/v2/media/{media_id}", 
                 headers={'Authorization': 'Basic ' + creds}, 
-                json={'alt_text': alt_text, 'title': alt_text}
+                json={'alt_text': alt_text, 'title': alt_text, 'caption': alt_text}
             )
-            return media_id, source_url, f"✅ WP Upload OK (ID: {media_id})"
+            return media_id, source_url, f"✅ OK ({file_name})"
         elif r.status_code == 401:
             return None, None, "❌ WP 401: Неверный пароль."
         elif r.status_code == 403:
@@ -382,7 +399,7 @@ def start(message):
         cur = conn.cursor()
         cur.execute("INSERT INTO users (user_id, gens_left) VALUES (%s, 2) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit(); cur.close(); conn.close()
-    bot.send_message(user_id, "👋 Привет! Я AI SEO Master (Tier 1).\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
+    bot.send_message(user_id, "👋 Привет! Я AI SEO Master (Tier 1 + Green SEO).\nПомогу продвинуть твой сайт в топ.", reply_markup=main_menu_markup(user_id))
 
 @bot.message_handler(func=lambda m: m.text in ["➕ Новый проект", "📂 Мои проекты", "👤 Профиль", "💎 Тарифы", "🆘 Техподдержка", "⚙️ Админка", "🔙 В меню"])
 def menu_handler(message):
@@ -485,7 +502,7 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
              markup.add(types.InlineKeyboardButton("🔗 Анализ конкурентов", callback_data=f"comp_start_{pid}"))
         else:
             if not kw_db:
-                markup.add(types.InlineKeyboardButton("🔑 Создать ключи", callback_data=f"kw_ask_count_{pid}"))
+                markup.add(types.InlineKeyboardButton("🔑 Добавить КЛЮЧИ", callback_data=f"kw_ask_count_{pid}"))
             elif not cms_login:
                 markup.add(types.InlineKeyboardButton("⚙️ Настроить сайт (CMS)", callback_data=f"cms_select_{pid}"))
             else:
@@ -656,6 +673,20 @@ def ask_del(call):
     conn.commit(); cur.close(); conn.close()
     bot.send_message(call.message.chat.id, "Удалено.")
     list_projects(call.from_user.id, call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kw_ask_count_"))
+def kw_ask_count(call):
+    pid = call.data.split("_")[3]
+    msg = bot.send_message(call.message.chat.id, "🔑 Вставьте список ключевых слов (столбиком):")
+    bot.register_next_step_handler(msg, kw_save_step, pid)
+
+def kw_save_step(message, pid):
+    kw_text = message.text
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET keywords=%s WHERE id=%s", (kw_text, pid))
+    conn.commit(); cur.close(); conn.close()
+    bot.send_message(message.chat.id, "✅ Ключи сохранены!")
+    open_project_menu(message.chat.id, pid)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_kw_"))
 def view_kw(call):
@@ -934,14 +965,10 @@ def test_article_start(call):
         return
 
     pid = call.data.split("_")[2]
-    # ОБНОВЛЕНО: Вызов функции без задержек для Tier 1
     propose_test_topics(call.message.chat.id, pid)
 
 def propose_test_topics(chat_id, pid):
     bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
-    
-    # Tier 1: Искусственные задержки не нужны
-    # time.sleep(2) 
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
@@ -960,16 +987,13 @@ def propose_test_topics(chat_id, pid):
     """
     
     raw_response = get_gemini_response(prompt)
-    
-    # Простая проверка ошибок, так как на Tier 1 мы ожидаем стабильность
     if "AI Error" in raw_response:
         bot.send_message(chat_id, f"⚠️ Ошибка ИИ:\n{raw_response}")
         cur.close(); conn.close()
         return
 
     topics = clean_and_parse_json(raw_response)
-    
-    if not topics or len(topics) == 0:
+    if not topics:
         bot.send_message(chat_id, "⚠️ ИИ вернул пустой ответ или неверный формат. Попробуйте еще раз.")
         cur.close(); conn.close()
         return
@@ -986,26 +1010,26 @@ def propose_test_topics(chat_id, pid):
         
     bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
-# --- WRITE ARTICLE ---
+# --- WRITE ARTICLE HANDLER (FIXED) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
     parts = call.data.split("_")
     pid, idx = parts[1], int(parts[3])
     
     conn = get_db_connection(); cur = conn.cursor()
-    # ИСПРАВЛЕНИЕ: Теперь запрашиваем keywords из базы
+    # 1. ЗАПРОС КЛЮЧЕЙ ИЗ БД
     cur.execute("SELECT info, keywords, sitemap_links FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     
-    # ИСПРАВЛЕНИЕ: Распаковываем keywords корректно
     info = res[0]
     keywords_raw = res[1] or ""
-    sitemap_list = res[2] if res[2] else []
-    links_text = json.dumps(sitemap_list[:50], ensure_ascii=False) if sitemap_list else "No internal links found."
+    sitemap_list = json.loads(res[2]) if res[2] else [] # Исправлено: парсим JSON
+    
+    # Формируем список ссылок для перелинковки
+    links_text = "\n".join(sitemap_list[:30]) if sitemap_list else "No internal links found."
     
     topics = info.get("temp_topics", [])
     topic_text = topics[idx] if len(topics) > idx else "SEO Article"
-    main_keyword = topic_text.split(':')[0]
     
     current_year = datetime.datetime.now().year
     
@@ -1015,14 +1039,13 @@ def write_article_handler(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью: {topic_text}...", parse_mode='Markdown')
     
-    # ИСПРАВЛЕНИЕ: Передаем весь список ключей (или большую его часть)
+    # 2. ПРОМПТ С КЛЮЧАМИ ИЗ БАЗЫ
     prompt = f"""
     Role: Professional Magazine Editor & Yoast SEO Expert.
     Topic: "{topic_text}"
     Length: 2000-2500 words.
     Style: Magazine Layout (Use HTML <blockquote>, <table>, <ul>).
-    Focus Keyword: "{main_keyword}"
-    Current Year: {current_year} (Use {current_year} or {current_year+1} for future trends).
+    Current Year: {current_year}.
     
     IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
     
@@ -1030,28 +1053,23 @@ def write_article_handler(call):
     {keywords_raw}
     
     MANDATORY YOAST SEO RULES (GREEN BULLET):
-    1. **Keyphrase in Intro**: The focus keyword MUST appear in the very first sentence.
-    2. **Keyphrase Density**: Use the keyword 0.5-2% of the text length (~15-30 times).
+    1. **Focus Keyword**: Pick ONE main keyword from the list above that best fits the topic. Use it in the Title, first paragraph, and subheadings.
+    2. **Keyphrase Density**: Use the focus keyword 0.5-2% of the text length.
     3. **Subheadings**: Include focus keyword in 50% of H2 and H3 tags.
-    4. **Links**:
-       - Internal Links: Pick 3 RELEVANT from this list: {links_text}
-       - Outbound Links: Insert 2 links to authoritative sites (Wikipedia, specialized portals) in new tab.
-    5. **Readability**:
-       - Short paragraphs (max 150 words).
-       - Vary sentence length.
-       - Use transition words in >30% of sentences.
-    6. **Images**: Insert 5 [IMG:...] placeholders distributed evenly.
+    4. **Internal Linking**: You MUST insert 2-3 links to other pages from this list:
+       {links_text}
+       (Insert them naturally in context using <a href="...">anchor</a>).
+    5. **Readability**: Short paragraphs. Use transition words.
+    6. **Images**: Insert 5 [IMG: description containing keyword] placeholders.
     7. **Meta Description**: Max 155 characters. Must contain keyword.
-    8. **Title**: Max 60 chars. Start with Keyword.
     
     OUTPUT JSON ONLY:
     {{
         "html_content": "Full HTML content with [IMG:...] tags.",
         "seo_title": "SEO Title (Max 60 chars)",
         "meta_desc": "Meta Description (Max 155 chars)",
-        "focus_kw": "{main_keyword}",
-        "featured_img_prompt": "Cover image prompt (English)",
-        "featured_img_alt": "Cover alt text (Russian)"
+        "focus_kw": "Selected Focus Keyword",
+        "featured_img_prompt": "Photorealistic image of {topic_text}, interior design style"
     }}
     """
     response_text = get_gemini_response(prompt)
@@ -1063,7 +1081,7 @@ def write_article_handler(call):
         seo_data = data
     else:
         article_html = response_text
-        seo_data = {"seo_title": topic_text, "featured_img_prompt": f"Photo of {main_keyword}"}
+        seo_data = {"seo_title": topic_text, "featured_img_prompt": f"Photo of {topic_text}"}
 
     cur.execute("INSERT INTO articles (project_id, title, content, seo_data, status) VALUES (%s, %s, %s, %s, 'draft') RETURNING id", 
                 (pid, topic_text, article_html, json.dumps(seo_data)))
@@ -1085,7 +1103,6 @@ def write_article_handler(call):
 def approve_publish(call):
     aid = call.data.split("_")[1]
     
-    # Отправляем сообщение о начале процесса
     bot.send_message(call.message.chat.id, "🚀 Начинаю генерацию картинок и публикацию...")
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -1103,8 +1120,10 @@ def approve_publish(call):
 
     url, login, pwd = res
     
-    # Переменная для сбора логов отладки
     debug_report = []
+    
+    # Извлекаем фокусное слово для имен файлов
+    focus_kw = seo_data.get('focus_kw', 'seo-article')
     
     # 1. Обработка картинок внутри текста
     img_matches = re.findall(r'\[IMG: (.*?)\]', content)
@@ -1114,31 +1133,33 @@ def approve_publish(call):
         debug_report.append(f"🔎 Найдено {len(img_matches)} тегов [IMG].")
         
     for i, prompt in enumerate(img_matches):
-        # Генерируем и загружаем
-        media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
+        # Генерируем правильное имя файла
+        seo_filename = f"{focus_kw}-{i+1}"
+        
+        media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", seo_filename)
         
         debug_report.append(f"🖼 Картинка {i+1}: {msg}")
         
         if source_url:
-            # Safe WP block image class
-            img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
+            # Safe WP block image class + SEO Title/Alt
+            img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{focus_kw}" title="{focus_kw}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
             final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
 
-    # 2. Обложка (Featured Image)
+    # 2. Обложка
     feat_media_id = None
     if seo_data.get('featured_img_prompt'):
-        feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], seo_data.get('featured_img_alt', title))
+        seo_filename_cover = f"{focus_kw}-main"
+        feat_media_id, _, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, seo_filename_cover)
         debug_report.append(f"🎨 Обложка: {feat_msg}")
 
-    # Отправляем отчет пользователю, если были ошибки
     error_found = any("❌" in x or "⚠️" in x for x in debug_report)
     if error_found:
         report_text = "\n".join(debug_report)
         bot.send_message(call.message.chat.id, f"📋 **Отчет по медиа:**\n{report_text}", parse_mode='Markdown')
 
-    # 3. Публикация поста
+    # 3. Публикация
     try:
         creds = f"{login}:{pwd}"
         token = base64.b64encode(creds.encode()).decode()
@@ -1149,17 +1170,14 @@ def approve_publish(call):
             'Cookie': 'beget=begetok'
         }
         
-        # Use clean H1 title
-        seo_title = seo_data.get('seo_title', title)
-        final_title = title if len(seo_title) > 70 or ":" in seo_title else seo_title
-
+        # YOAST SEO META FIELDS
         meta_payload = {
-            '_yoast_wpseo_title': seo_title,
+            '_yoast_wpseo_title': seo_data.get('seo_title', title),
             '_yoast_wpseo_metadesc': seo_data.get('meta_desc', ''),
-            '_yoast_wpseo_focuskw': seo_data.get('focus_kw', '')
+            '_yoast_wpseo_focuskw': focus_kw
         }
         post_data = {
-            'title': final_title,
+            'title': seo_data.get('seo_title', title), # Используем SEO заголовок
             'content': final_content.replace("\n", "<br>"),
             'status': 'publish',
             'meta': meta_payload
@@ -1177,18 +1195,18 @@ def approve_publish(call):
             left = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
             
-            bot.delete_message(call.message.chat.id, call.message.message_id) # Удаляем старое меню
+            bot.delete_message(call.message.chat.id, call.message.message_id) 
             
             success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
             try:
-                bot.send_animation(call.message.chat.id, success_gif, caption=f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+                bot.send_animation(call.message.chat.id, success_gif, caption=f"✅ Успешно! Ключ: {focus_kw}\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
             except:
-                bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+                bot.send_message(call.message.chat.id, f"✅ Успешно! Ключ: {focus_kw}\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
                 
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
             conn.close()
-            bot.send_message(call.message.chat.id, f"❌ Ошибка WP Публикации: {r.status_code} - {r.text[:100]}")
+            bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code} - {r.text[:100]}")
             
     except Exception as e:
         if conn: conn.close()
@@ -1206,5 +1224,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Tier 1 Optimized)...")
+    print("🤖 Бот запущен (Tier 1 + Full SEO Fix)...")
     bot.infinity_polling(skip_pending=True)
