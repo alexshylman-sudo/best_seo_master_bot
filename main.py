@@ -34,6 +34,7 @@ bot = TeleBot(TOKEN)
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 UPLOAD_STATE = {} 
+SURVEY_STATE = {} # Temporary storage for survey steps
 
 # --- 2. DATABASE ---
 def get_db_connection():
@@ -308,10 +309,11 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
-# --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) ---
+# --- 4. IMAGE GENERATION (NANO BANANA / GEMINI FLASH IMAGE) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
     image_bytes = None
-    target_model = 'imagen-4.0-fast-generate-001'
+    # ✅ MODEL CHANGED TO NANO BANANA (GEMINI 2.5 FLASH IMAGE)
+    target_model = 'gemini-2.5-flash-image'
     
     base_negative = "exclude text, writing, letters, watermarks, signature, words"
     full_negative = f"{base_negative}, {negative_prompt}" if negative_prompt else base_negative
@@ -321,7 +323,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
     else:
         final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting. Exclude: {full_negative}."
     
-    print(f"🎨 Imagen 4 Generating: {final_prompt[:80]}...")
+    print(f"🎨 Nano Banana Generating: {final_prompt[:80]}...")
     
     try:
         response = client.models.generate_images(
@@ -335,10 +337,10 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
         else:
-            return None, None, "⚠️ Imagen вернул пустоту (Safety)."
+            return None, None, "⚠️ Model returned empty result (Safety)."
             
     except Exception as e:
-        print(f"❌ Google Imagen Error: {e}")
+        print(f"❌ Google GenAI Error: {e}")
         return None, None, f"❌ API Error: {e}"
 
     if not image_bytes: return None, None, "❌ No bytes."
@@ -429,6 +431,7 @@ def menu_handler(message):
         show_admin_panel(uid)
     elif txt == "🔙 В меню":
         if uid in UPLOAD_STATE: del UPLOAD_STATE[uid]
+        if uid in SURVEY_STATE: del SURVEY_STATE[uid]
         bot.send_message(uid, "Главное меню", reply_markup=main_menu_markup(uid))
 
 @bot.callback_query_handler(func=lambda call: call.data == "soon")
@@ -1054,16 +1057,163 @@ def kw_ask_count(call):
     try: bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "🔑 Вставьте список ключевых слов (столбиком):")
-    bot.register_next_step_handler(msg, kw_save_step, pid)
+    # NEW: KEYWORD COUNT MENU
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(types.InlineKeyboardButton("50", callback_data=f"kw_gen_{pid}_50"),
+               types.InlineKeyboardButton("100", callback_data=f"kw_gen_{pid}_100"),
+               types.InlineKeyboardButton("200", callback_data=f"kw_gen_{pid}_200"),
+               types.InlineKeyboardButton("500", callback_data=f"kw_gen_{pid}_500"),
+               types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
+    bot.send_message(call.message.chat.id, "🔑 Выберите количество ключевых слов:", reply_markup=markup)
 
-def kw_save_step(message, pid):
-    kw_text = message.text
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kw_gen_"))
+def kw_gen_handler(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    parts = call.data.split("_")
+    pid = parts[2]
+    count = parts[3]
+    
+    bot.edit_message_text(f"⏳ Генерирую {count} ключевых слов и разбиваю на кластеры... Это может занять время.", 
+                          call.message.chat.id, call.message.message_id)
+    
+    def _gen_keywords():
+        try:
+            conn = get_db_connection(); cur = conn.cursor()
+            cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
+            res = cur.fetchone()
+            info = res[0] or {}
+            
+            # Formulate context from survey
+            context_str = f"Site Description: {info.get('survey_step1','')}\nTarget Audience: {info.get('survey_step2','')}\nRegion: {info.get('survey_step3','')}\nStrengths: {info.get('survey_step4','')}"
+            
+            prompt = f"""
+            Act as a Senior SEO Specialist.
+            Context:
+            {context_str}
+            
+            Task: Generate a comprehensive semantic core of approximately {count} keywords for this website.
+            
+            Strict Requirements:
+            1. Group keywords into logical SEO CLUSTERS (Intent-based).
+            2. Format output strictly as:
+            Cluster Name 1:
+            - keyword 1
+            - keyword 2
+            
+            Cluster Name 2:
+            - keyword 3
+            ...
+            
+            3. Do not add introductory text. Just the clusters and keywords.
+            4. Language: Russian.
+            """
+            
+            ai_resp = get_gemini_response(prompt)
+            
+            cur.execute("UPDATE projects SET keywords=%s WHERE id=%s", (ai_resp, pid))
+            conn.commit(); cur.close(); conn.close()
+            
+            # Send result snippet and menu
+            snippet = ai_resp[:3000] + ("..." if len(ai_resp) > 3000 else "")
+            
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(types.InlineKeyboardButton("✅ Утвердить", callback_data=f"kw_approve_{pid}"),
+                       types.InlineKeyboardButton("📄 Скачать .txt", callback_data=f"kw_download_{pid}"),
+                       types.InlineKeyboardButton("🔄 Пройти опрос заново", callback_data=f"srv_{pid}"),
+                       types.InlineKeyboardButton("🔢 Изменить количество", callback_data=f"kw_ask_count_{pid}"))
+            
+            bot.send_message(call.message.chat.id, f"🔑 **Семантическое ядро (предпросмотр):**\n\n{snippet}", 
+                             reply_markup=markup, parse_mode=None) # No markdown to avoid breakage on lists
+            
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка генерации: {e}")
+
+    threading.Thread(target=_gen_keywords).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kw_approve_"))
+def kw_approve(call):
+    try: bot.answer_callback_query(call.id, "Сохранено!")
+    except: pass
+    pid = call.data.split("_")[2]
+    open_project_menu(call.message.chat.id, pid)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kw_download_"))
+def kw_download(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[2]
+    
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("UPDATE projects SET keywords=%s WHERE id=%s", (kw_text, pid))
+    cur.execute("SELECT keywords FROM projects WHERE id=%s", (pid,))
+    row = cur.fetchone()
+    kw_text = row[0] if row else "No keywords found."
+    cur.close(); conn.close()
+    
+    file_data = io.BytesIO(kw_text.encode('utf-8'))
+    file_data.name = "keywords.txt"
+    bot.send_document(call.message.chat.id, file_data, caption="📂 Ваше семантическое ядро")
+
+# --- UPDATED SURVEY LOGIC (4 STEPS) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
+def start_survey_handler(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[1]
+    SURVEY_STATE[call.from_user.id] = {'pid': pid, 'step': 1}
+    
+    msg = bot.send_message(call.message.chat.id, 
+                           "📝 **Опрос (Шаг 1/4)**\n\n"
+                           "Пожалуйста, кратко опишите суть вашего сайта/бизнеса.\n\n"
+                           "💡 _Чем точнее вы ответите, тем качественнее ИИ подберет ключевые слова._",
+                           parse_mode='Markdown')
+    bot.register_next_step_handler(msg, survey_step_router)
+
+def survey_step_router(message):
+    uid = message.from_user.id
+    if uid not in SURVEY_STATE: return
+    
+    state = SURVEY_STATE[uid]
+    step = state['step']
+    pid = state['pid']
+    text = message.text
+    
+    if text.startswith('/'): return # Abort on command
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
+    info = cur.fetchone()[0] or {}
+    
+    # Save current answer
+    info[f'survey_step{step}'] = text
+    cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
     conn.commit(); cur.close(); conn.close()
-    bot.send_message(message.chat.id, "✅ Ключи сохранены!")
-    open_project_menu(message.chat.id, pid)
+    
+    # Next Step Logic
+    if step == 1:
+        SURVEY_STATE[uid]['step'] = 2
+        msg = bot.send_message(message.chat.id, "📝 **Шаг 2/4: Ваша целевая аудитория?**")
+        bot.register_next_step_handler(msg, survey_step_router)
+    elif step == 2:
+        SURVEY_STATE[uid]['step'] = 3
+        msg = bot.send_message(message.chat.id, "📝 **Шаг 3/4: Страна / Регион продвижения?**")
+        bot.register_next_step_handler(msg, survey_step_router)
+    elif step == 3:
+        SURVEY_STATE[uid]['step'] = 4
+        msg = bot.send_message(message.chat.id, "📝 **Шаг 4/4: Какие ваши сильные стороны (УТП)?**")
+        bot.register_next_step_handler(msg, survey_step_router)
+    elif step == 4:
+        del SURVEY_STATE[uid]
+        update_project_progress(pid, "info_done")
+        
+        # Call Keyword Count Selection immediately
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(types.InlineKeyboardButton("50", callback_data=f"kw_gen_{pid}_50"),
+                   types.InlineKeyboardButton("100", callback_data=f"kw_gen_{pid}_100"),
+                   types.InlineKeyboardButton("200", callback_data=f"kw_gen_{pid}_200"),
+                   types.InlineKeyboardButton("500", callback_data=f"kw_gen_{pid}_500"))
+        
+        bot.send_message(message.chat.id, "✅ Опрос завершен!\n\nСколько ключевых слов сгенерировать?", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_kw_"))
 def view_kw(call):
@@ -1075,59 +1225,21 @@ def view_kw(call):
     row = cur.fetchone()
     kw = row[0] if row else None
     
-    if not kw or len(str(kw).strip()) < 2:
+    if not kw or len(str(kw).strip()) < 5:
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("📝 Пройти опрос", callback_data=f"srv_{pid}"))
         markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
         bot.send_message(call.message.chat.id, "У вас пока нет ключевых слов, но их обязательно нужно создать с помощью опроса.", reply_markup=markup)
     else:
-        send_safe_message(call.message.chat.id, f"Ключи:\n{kw}")
-
-@bot.callback_query_handler(func=lambda call: call.data == "back_main")
-def back_main(call):
-    try: bot.answer_callback_query(call.id)
-    except: pass
-    bot.delete_message(call.message.chat.id, call.message.message_id)
-    bot.send_message(call.message.chat.id, "Главное меню", reply_markup=main_menu_markup(call.from_user.id))
-
-# --- LOGIC ---
-@bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
-def start_survey_handler(call):
-    try: bot.answer_callback_query(call.id)
-    except: pass
-    pid = call.data.split("_")[1]
-    
-    msg = bot.send_message(call.message.chat.id, 
-                           "📝 **Опрос о проекте**\n\n"
-                           "Пожалуйста, кратко опишите суть вашего сайта/бизнеса.\n"
-                           "Эта информация поможет ИИ подбирать темы и ключевые слова.\n\n"
-                           "*Пример:* Интернет-магазин корейской косметики, доставка по РФ, средний ценовой сегмент.",
-                           parse_mode='Markdown')
-    bot.register_next_step_handler(msg, save_survey_step, pid)
-
-def save_survey_step(message, pid):
-    if message.text.startswith('/'): return
-    
-    user_input = message.text
-    conn = get_db_connection(); cur = conn.cursor()
-    
-    # Update info
-    cur.execute("SELECT info, progress FROM projects WHERE id=%s", (pid,))
-    res = cur.fetchone()
-    if not res: cur.close(); conn.close(); return
-    
-    info = res[0] or {}
-    progress = res[1] or {}
-    
-    info['survey'] = user_input
-    progress['info_done'] = True
-    
-    cur.execute("UPDATE projects SET info=%s, progress=%s WHERE id=%s", 
-                (json.dumps(info), json.dumps(progress), pid))
-    conn.commit(); cur.close(); conn.close()
-    
-    bot.send_message(message.chat.id, "✅ Данные сохранены! Теперь можно генерировать темы и ключи.")
-    open_project_menu(message.chat.id, pid, mode="management")
+        # If huge text, send file or snippet
+        if len(kw) > 3000:
+            snippet = kw[:1000] + "\n... (Полный список скачайте файлом)"
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📄 Скачать файл", callback_data=f"kw_download_{pid}"),
+                       types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
+            bot.send_message(call.message.chat.id, f"Ключи:\n{snippet}", reply_markup=markup)
+        else:
+            send_safe_message(call.message.chat.id, f"Ключи:\n{kw}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("comp_start_"))
 def comp_start(call):
@@ -1460,7 +1572,7 @@ def propose_test_topics(chat_id, pid):
             
             prompt = f"""
             Придумай 5 вирусных заголовков для статьи в блог.
-            Ниша сайта (из опроса): {info.get('survey', 'Общая тема')}. 
+            Ниша сайта (из опроса): {info.get('survey_step1', 'Общая тема')}. 
             SEO Ключевые слова: {kw[:500]}
             Стиль проекта: {style}
             Язык: Русский.
@@ -1871,5 +1983,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Survey Fixed)...")
+    print("🤖 Бот запущен (Nano Banana & Survey Fixed)...")
     bot.infinity_polling(skip_pending=True)
