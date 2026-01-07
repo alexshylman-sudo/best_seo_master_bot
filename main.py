@@ -218,7 +218,6 @@ def clean_and_parse_json(text):
         try: return json.loads(match.group(1))
         except: pass
     
-    # Try list format [ ... ]
     match_list = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
     if match_list:
         try: return json.loads(match_list.group(1))
@@ -229,8 +228,7 @@ def clean_and_parse_json(text):
     if start != -1 and end != -1:
         try: return json.loads(text[start:end+1])
         except: pass
-        
-    # Fallback for simple list
+    
     start_list = text.find('[')
     end_list = text.rfind(']')
     if start_list != -1 and end_list != -1:
@@ -260,10 +258,10 @@ def format_html_for_chat(html_content):
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
-    """ONLY GOOGLE IMAGEN. NO POLLINATIONS FALLBACK."""
+    """ONLY GOOGLE IMAGEN."""
     image_bytes = None
     
-    print(f"🎨 Generating image via Google Imagen: {image_prompt[:30]}...")
+    print(f"🎨 Google Imagen: {image_prompt[:30]}...")
     try:
         response = client.models.generate_images(
             model='imagen-3.0-generate-001', 
@@ -272,7 +270,6 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
-            print("✅ Google Image Generated")
     except Exception as e:
         print(f"❌ Google Imagen Error: {e}")
         return None, None
@@ -730,7 +727,10 @@ def reset_plan(call):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
     conn.commit(); cur.close(); conn.close()
-    # Manual call to strategy start
+    # Manual call to strategy start (need helper)
+    strategy_start_helper(call, pid)
+
+def strategy_start_helper(call, pid):
     markup = types.InlineKeyboardMarkup(row_width=4)
     btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
     markup.add(*btns)
@@ -748,7 +748,7 @@ def save_freq_and_plan(call):
     actual_count = min(freq, len(remaining_days)) if remaining_days else 0
     
     if actual_count == 0:
-        bot.send_message(call.message.chat.id, f"📅 Эта неделя заканчивается. План на {freq} статей будет создан в следующий понедельник.")
+        bot.send_message(call.message.chat.id, f"📅 Эта неделя заканчивается. План на {freq} статей будет создан в следующий понедельник.\nСейчас вы можете написать **Тестовую статью**.")
         return
 
     bot.edit_message_text(f"📅 Генерирую план на остаток недели ({actual_count} статей)...", call.message.chat.id, call.message.message_id)
@@ -887,7 +887,7 @@ def propose_test_topics(chat_id, pid):
     Ниша: {info.get('survey', '')}. Ключи: {kw[:500]}
     Верни JSON список: ["Тема 1", "Тема 2"...]
     """
-    topics = clean_and_parse_json(get_gemini_response(prompt)) or ["Тестовая тема 1", "Тестовая тема 2"]
+    topics = clean_and_parse_json(get_gemini_response(prompt)) or ["Тема 1", "Тема 2"]
     
     info["temp_topics"] = topics
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
@@ -901,6 +901,7 @@ def propose_test_topics(chat_id, pid):
         
     bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
+# --- НАПИСАНИЕ СТАТЬИ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
     parts = call.data.split("_")
@@ -922,21 +923,21 @@ def write_article_handler(call):
     bot.send_message(call.message.chat.id, f"⏳ Пишу статью: {topic_text}...", parse_mode='Markdown')
     
     prompt = f"""
-    Role: Professional Magazine Editor & SEO Expert.
-    Topic: "{topic_text}"
-    Language: STRICTLY RUSSIAN (NO ENGLISH IN TEXT).
+    Role: Senior SEO Copywriter & Yoast SEO Expert.
+    Task: Write a blog post for the topic: "{topic_text}".
+    Language: STRICTLY RUSSIAN.
     Focus Keyword: "{main_keyword}"
     
-    REQUIREMENTS:
-    1. **Magazine Layout**: 
-       - Use `<blockquote>` for key insights.
-       - Use `<table>` where appropriate.
-       - **IMAGES**: You MUST insert 5-7 image placeholders evenly distributed.
-       - Format: `[IMG: specific detailed prompt for image generation in English]`
-       - Use HTML tags like `<ul>`, `<ol>`, `<h2>`.
-       - DO NOT use CSS styles like 'float: left'. Use simple paragraph structure.
-    2. **SEO**: 
-       - Short paragraphs.
+    MANDATORY YOAST SEO CHECKLIST (STRICT COMPLIANCE):
+    1. **Title**: Start with the Focus Keyword.
+    2. **Introduction**: The Focus Keyword MUST appear in the very first sentence.
+    3. **Subheadings**: Use the Focus Keyword in at least one H2 and one H3.
+    4. **Density**: Repeat the Focus Keyword 5-7 times naturally throughout the text.
+    5. **Links**:
+       - Insert 2-3 Internal Links contextually.
+       - Insert 1-2 Outbound Links to authoritative sites (Wikipedia, etc.) in new tab.
+    6. **Readability**: Short paragraphs (max 4 lines). Sentences max 20 words.
+    7. **Images**: Insert 5 [IMG:...] placeholders.
     
     OUTPUT JSON ONLY:
     {{
@@ -998,6 +999,7 @@ def approve_publish(call):
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
+            # Safe WP block image class
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
@@ -1016,6 +1018,7 @@ def approve_publish(call):
             'User-Agent': 'Mozilla/5.0',
             'Cookie': 'beget=begetok'
         }
+        # Use clean H1 title
         seo_title = seo_data.get('seo_title', title)
         final_title = title if len(seo_title) > 70 or ":" in seo_title else seo_title
 
@@ -1039,12 +1042,20 @@ def approve_publish(call):
             link = r.json().get('link')
             cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
             
+            # Check limits
             cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
             left = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
-            bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}\n\nВозврат в главное меню...")
+            
+            # Success GIF + Message
+            gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601071222.gif"
+            try:
+                bot.send_animation(call.message.chat.id, gif_url, caption=f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+            except:
+                bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}")
+                
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
             conn.close()
