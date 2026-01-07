@@ -30,6 +30,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 APP_URL = os.getenv("APP_URL")
 
 bot = TeleBot(TOKEN)
+# Инициализация клиента Google GenAI
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 
@@ -189,7 +190,6 @@ def check_site_availability(url):
     except: return False
 
 def parse_sitemap(url):
-    """Пытается найти sitemap.xml и извлечь ссылки"""
     links = []
     try:
         sitemap_url = url.rstrip('/') + '/sitemap.xml'
@@ -201,7 +201,7 @@ def parse_sitemap(url):
                 ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
                 for url_tag in root.findall('.//s:loc', ns):
                     links.append(url_tag.text)
-                if not links: 
+                if not links:
                     for url_tag in root.findall('.//loc'):
                         links.append(url_tag.text)
             except: pass
@@ -290,16 +290,17 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
+# --- ОБНОВЛЕННАЯ ФУНКЦИЯ ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ (IMAGEN 4 FAST) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
     
-    # --- 1. МОДЕЛЬ: Актуальная Imagen 4 Fast ---
+    # 1. Используем модель Imagen 4 Fast (актуальная на 2026 год)
     target_model = 'imagen-4.0-fast-generate-001'
     
-    # --- 2. КАЧЕСТВО: Улучшаем промпт ---
+    # 2. Добавляем "магические" слова для фотореализма
     final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, cinematic lighting, 8k"
     
-    print(f"🎨 Google Imagen 4 Fast: {final_prompt[:30]}...")
+    print(f"🎨 Google Imagen 4 Fast: {final_prompt[:40]}...")
     
     try:
         response = client.models.generate_images(
@@ -307,9 +308,9 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             prompt=final_prompt,
             config=genai_types.GenerateImagesConfig(
                 number_of_images=1,
-                # --- 3. ФОРМАТ: 16:9 для блога ---
+                # 3. Формат 16:9 для блога
                 aspect_ratio='16:9',
-                # --- 4. БЕЗОПАСНОСТЬ: Минимизируем блокировки ---
+                # 4. Настройки безопасности (чтобы не блокировало зря)
                 safety_settings=[
                     genai_types.SafetySetting(
                         category="HARM_CATEGORY_HATE_SPEECH",
@@ -352,7 +353,8 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             'Authorization': 'Basic ' + token,
             'Content-Disposition': f'attachment; filename={file_name}',
             'Content-Type': 'image/png',
-            'User-Agent': 'Mozilla/5.0'
+            'User-Agent': 'Mozilla/5.0',
+            'Cookie': 'beget=begetok'
         }
         upload_api = f"{api_url}/wp-json/wp/v2/media"
         r = requests.post(upload_api, headers=headers, data=image_bytes, timeout=60)
@@ -360,7 +362,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if r.status_code == 201:
             media_id = r.json().get('id')
             source_url = r.json().get('source_url')
-            # Critical for Yoast SEO Green Light on Images
+            # Заполняем ALT и Title для SEO
             requests.post(
                 f"{upload_api}/{media_id}", 
                 headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
@@ -453,7 +455,6 @@ def check_url_step(message):
         bot.register_next_step_handler(msg, check_url_step)
         return
     
-    # Сразу парсим sitemap при добавлении
     sitemap_links = parse_sitemap(url)
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -943,12 +944,13 @@ def test_article_start(call):
         return
 
     pid = call.data.split("_")[2]
+    # ОБНОВЛЕНО: Вызов функции с обработкой ошибок лимитов
     propose_test_topics(call.message.chat.id, pid)
 
 def propose_test_topics(chat_id, pid):
-    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
+    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи (это может занять пару секунд)...")
     
-    # --- ДОБАВЛЕНО: Пауза, чтобы избежать ошибки 429 ---
+    # 1. Пауза, чтобы снизить риск ошибки 429 на Free тарифе
     time.sleep(2)
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -958,12 +960,38 @@ def propose_test_topics(chat_id, pid):
     kw = res[1] or ""
     
     prompt = f"""
-    Придумай 5 вирусных тем для статьи в блог.
-    Ниша: {info.get('survey', '')}. Ключи: {kw[:500]}
-    Верни JSON список: ["Тема 1", "Тема 2"...]
-    """
-    topics = clean_and_parse_json(get_gemini_response(prompt)) or ["Тема 1", "Тема 2"]
+    Придумай 5 вирусных заголовков для статьи в блог.
+    Ниша сайта: {info.get('survey', 'Общая тема')}. 
+    SEO Ключевые слова: {kw[:500]}
     
+    Строго верни ТОЛЬКО JSON массив строк, например:
+    ["Как выбрать...", "ТОП 10 ошибок...", "Секреты..."]
+    """
+    
+    # 2. Получаем "сырой" ответ
+    raw_response = get_gemini_response(prompt)
+    
+    # 3. ПРОВЕРКА НА ОШИБКИ ЛИМИТОВ (429)
+    if "429" in raw_response or "RESOURCE_EXHAUSTED" in raw_response:
+        bot.send_message(chat_id, "🔴 **Google API Лимит исчерпан!**\nСлишком много запросов. Подождите 2-3 минуты и попробуйте снова.\n\n(Это ограничение бесплатного ключа)")
+        cur.close(); conn.close()
+        return
+
+    # 4. ПРОВЕРКА НА ДРУГИЕ ОШИБКИ
+    if "AI Error" in raw_response:
+        bot.send_message(chat_id, f"⚠️ Ошибка ИИ:\n{raw_response}")
+        cur.close(); conn.close()
+        return
+
+    # 5. ПОПЫТКА РАСПОЗНАТЬ JSON
+    topics = clean_and_parse_json(raw_response)
+    
+    if not topics or len(topics) == 0:
+        bot.send_message(chat_id, "⚠️ ИИ вернул пустой ответ или неверный формат. Попробуйте еще раз.")
+        cur.close(); conn.close()
+        return
+    
+    # 6. Сохраняем ТОЛЬКО если темы реальные
     info["temp_topics"] = topics
     cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
     conn.commit(); cur.close(); conn.close()
