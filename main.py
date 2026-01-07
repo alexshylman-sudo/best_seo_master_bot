@@ -479,7 +479,7 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("📝 Опрос", callback_data=f"srv_{pid}"))
     markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"comp_start_{pid}"))
     markup.add(types.InlineKeyboardButton("⚙️ CMS", callback_data=f"cms_select_{pid}"))
-    markup.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"ask_del_{pid}"))
+    markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -699,28 +699,7 @@ def perform_analysis(call):
 def strategy_start(call):
     pid = call.data.split("_")[1]
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT cms_login, content_plan FROM projects WHERE id=%s", (pid,))
-    if not cur.fetchone()[0]:
-        cur.close(); conn.close()
-        bot.send_message(call.message.chat.id, "⚠️ Настройте CMS в настройках проекта!")
-        return
     
-    plan = cur.fetchone()[1] if cur.description else None # Fix fetch logic if fetchone called twice
-    # Re-fetch correctly
-    # cur.execute already done.
-    # plan = res[1] from previous logic. Let's fix readability:
-    
-    # Correct logic:
-    # res = cur.fetchone() is already done above.
-    
-    # Let's re-do for clarity in this block:
-    # ... (code continues below)
-    pass # Placeholder for visual break
-
-# Fixed strategy_start function for context:
-def strategy_start_fixed(call):
-    pid = call.data.split("_")[1]
-    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT cms_login, content_plan FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
@@ -741,11 +720,6 @@ def strategy_start_fixed(call):
     btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
     markup.add(*btns)
     bot.send_message(call.message.chat.id, "📅 Сколько статей в неделю?", reply_markup=markup)
-
-# Replace the handler with fixed one
-@bot.callback_query_handler(func=lambda call: call.data.startswith("strat_"))
-def strategy_start_handler(call):
-    strategy_start_fixed(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("show_plan_"))
 def show_current_plan(call):
@@ -768,6 +742,14 @@ def reset_plan(call):
     cur.execute("UPDATE projects SET content_plan='[]' WHERE id=%s", (pid,))
     conn.commit(); cur.close(); conn.close()
     strategy_start_fixed(call)
+
+def strategy_start_fixed(call):
+    # Вспомогательная функция для рестарта стратегии
+    pid = call.data.split("_")[2]
+    markup = types.InlineKeyboardMarkup(row_width=4)
+    btns = [types.InlineKeyboardButton(str(i), callback_data=f"freq_{pid}_{i}") for i in range(1, 8)]
+    markup.add(*btns)
+    bot.send_message(call.message.chat.id, "📅 Сколько статей в неделю?", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("freq_"))
 def save_freq_and_plan(call):
@@ -848,7 +830,6 @@ def replace_topic(call):
     
     if idx < len(plan):
         old_topic = plan[idx]['topic']
-        # Исправлено: Добавлен контекст для избежания галлюцинаций
         prompt = f"""
         Задача: Придумай 1 новую тему статьи для блога, отличную от '{old_topic}'. 
         Контекст ниши: {keywords[:500]}
@@ -896,43 +877,68 @@ def approve_plan(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
 def test_article_start(call):
-    write_article_handler(call) 
+    # Проверка лимитов перед запуском теста
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
+    res = cur.fetchone()
+    cur.close(); conn.close()
+    
+    if res and res[0] <= 0:
+        bot.send_message(call.message.chat.id, "⚠️ У вас закончились генерации. Пожалуйста, пополните баланс.")
+        return
+
+    # Запускаем предложение 5 тем
+    pid = call.data.split("_")[2]
+    propose_test_topics(call.message.chat.id, pid)
+
+def propose_test_topics(chat_id, pid):
+    bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    info = res[0] or {}
+    kw = res[1] or ""
+    
+    prompt = f"""
+    Придумай 5 вирусных тем для статьи в блог.
+    Ниша: {info.get('survey', '')}. Ключи: {kw[:500]}
+    Верни JSON список: ["Тема 1", "Тема 2"...]
+    """
+    topics = clean_and_parse_json(get_gemini_response(prompt)) or ["Тестовая тема 1", "Тестовая тема 2"]
+    
+    info["temp_topics"] = topics
+    cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
+    conn.commit(); cur.close(); conn.close()
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    msg_text = "📝 **Выберите тему для теста:**\n\n"
+    for i, t in enumerate(topics[:5]):
+        msg_text += f"{i+1}. {t}\n"
+        markup.add(types.InlineKeyboardButton(f"Вариант {i+1}", callback_data=f"write_{pid}_topic_{i}"))
+        
+    bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
 
 # --- НАПИСАНИЕ СТАТЬИ ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
-    is_test = "test_article" in call.data
-    pid = call.data.split("_")[2]
-    idx = 0 
-    if not is_test:
-        idx = int(call.data.split("_")[3])
+    parts = call.data.split("_")
+    pid, idx = parts[1], int(parts[3])
     
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     info, keywords = res[0], res[1] or ""
-    internal_links = info.get('internal_links', [])
-    links_text = json.dumps(internal_links[:50], ensure_ascii=False)
     
-    topic_text = "Тестовая SEO статья"
-    if is_test:
-        plan = info.get("content_plan", [])
-        if plan: topic_text = plan[0]['topic']
-        else: topic_text = f"Тренды: {keywords.split(',')[0] if keywords else 'Ремонт'}"
-    else:
-        topics = info.get("temp_topics", [])
-        if topics: topic_text = topics[idx]
-
+    topics = info.get("temp_topics", [])
+    topic_text = topics[idx] if len(topics) > idx else "SEO Article"
     main_keyword = topic_text.split(':')[0]
     
-    if is_test:
-        try:
-            bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью: <b>{topic_text}</b>...", parse_mode='HTML')
-        except:
-            bot.send_message(call.message.chat.id, f"⚡ Пишу тестовую статью...", parse_mode=None)
-    else:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.send_message(call.message.chat.id, f"⏳ Пишу статью...", parse_mode='Markdown')
+    # Списание лимитов
+    cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
+    conn.commit()
+    
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    bot.send_message(call.message.chat.id, f"⏳ Пишу статью: {topic_text}...", parse_mode='Markdown')
     
     prompt = f"""
     Role: Professional Magazine Editor & SEO Expert.
@@ -949,7 +955,6 @@ def write_article_handler(call):
        - Use HTML tags like `<ul>`, `<ol>`, `<h2>`.
        - DO NOT use CSS styles like 'float: left'. Use simple paragraph structure.
     2. **SEO**: 
-       - Insert 3 internal links from: {links_text}
        - Short paragraphs.
     
     OUTPUT JSON ONLY:
@@ -973,7 +978,6 @@ def write_article_handler(call):
         article_html = response_text
         seo_data = {"seo_title": topic_text, "featured_img_prompt": f"Photo of {main_keyword}"}
 
-    cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
     cur.execute("INSERT INTO articles (project_id, title, content, seo_data, status) VALUES (%s, %s, %s, %s, 'draft') RETURNING id", 
                 (pid, topic_text, article_html, json.dumps(seo_data)))
     aid = cur.fetchone()[0]
@@ -1000,11 +1004,10 @@ def approve_publish(call):
     seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
     cur.execute("SELECT cms_url, cms_login, cms_password FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
-    cur.close(); conn.close()
     
     if not res:
         bot.send_message(call.message.chat.id, "❌ Проект не найден.")
-        return
+        cur.close(); conn.close(); return
 
     url, login, pwd = res
     msg = bot.send_message(call.message.chat.id, "🚀 Генерирую 5-7 картинок и публикую...")
@@ -1035,7 +1038,6 @@ def approve_publish(call):
         }
         # Использование нормального заголовка H1
         seo_title = seo_data.get('seo_title', title)
-        # Если SEO заголовок слишком длинный или мусорный, используем просто тему
         if len(seo_title) > 70 or ":" in seo_title:
              final_title = title
         else:
@@ -1059,18 +1061,22 @@ def approve_publish(call):
         
         if r.status_code == 201:
             link = r.json().get('link')
-            conn = get_db_connection(); cur = conn.cursor()
             cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
+            
+            # Получаем остаток лимитов для сообщения
+            cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
+            left = cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
             
             bot.delete_message(call.message.chat.id, msg.message_id)
-            # Используем безопасное форматирование без Markdown
-            bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n{link}\n\nВозврат в главное меню...")
+            bot.send_message(call.message.chat.id, f"✅ Успешно опубликовано!\n🔗 {link}\n\n⚡ Осталось генераций: {left}\n\nВозврат в главное меню...")
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
+            conn.close()
             bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code}")
             
     except Exception as e:
+        if conn: conn.close()
         bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 # ЗАПУСК
