@@ -464,7 +464,6 @@ def check_url_step(message):
                 bot.register_next_step_handler(msg, check_url_step)
                 return
             
-            # --- ПРОВЕРКА ДУБЛЕЙ СТРОГО ---
             clean_check_url = url.rstrip('/')
             
             conn = get_db_connection()
@@ -479,7 +478,6 @@ def check_url_step(message):
                 bot.send_message(message.chat.id, f"🚫 **Этот сайт уже добавлен в базу!**\n\nПовторное добавление невозможно. Найдите его в разделе '📂 Мои проекты'.", 
                                  parse_mode='Markdown', reply_markup=markup)
                 return
-            # -------------------------------
 
             tmp_msg = bot.send_message(message.chat.id, "🔎 Проверяю доступность сайта...")
             
@@ -591,14 +589,13 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-# --- CMS HANDLERS (FIXED) ---
+# --- CMS HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cms_select_"))
 def cms_start_setup(call):
     try: bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[2]
     
-    # Сразу просим логин, так как URL уже есть
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 Отмена", callback_data=f"proj_settings_{pid}"))
     
@@ -622,14 +619,13 @@ def cms_save_password_step(message, pid):
     pwd = message.text.strip()
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET cms_password=%s WHERE id=%s", (pwd, pid))
-    # Также обновляем cms_url равным url проекта для удобства
     cur.execute("UPDATE projects SET cms_url=url WHERE id=%s AND cms_url IS NULL", (pid,))
     conn.commit(); cur.close(); conn.close()
     
     bot.send_message(message.chat.id, "✅ CMS данные сохранены! Теперь можно публиковать статьи.")
     open_project_menu(message.chat.id, pid)
 
-# --- KNOWLEDGE BASE HANDLERS ---
+# --- KNOWLEDGE BASE HANDLERS (UPDATED) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_menu_"))
 def kb_menu(call):
     try: bot.answer_callback_query(call.id)
@@ -649,6 +645,7 @@ def kb_menu(call):
     markup.add(types.InlineKeyboardButton("📝 Изменить Стиль (Текст)", callback_data=f"kb_set_text_{pid}"))
     markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото ({len(images)}/30)", callback_data=f"kb_add_photo_{pid}"))
     if images:
+        markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
         markup.add(types.InlineKeyboardButton("🗑 Очистить все фото", callback_data=f"kb_clear_photos_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
     
@@ -675,36 +672,44 @@ def kb_add_photo(call):
     except: pass
     pid = call.data.split("_")[3]
     UPLOAD_STATE[call.from_user.id] = pid
-    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (JPG/PNG) до 1МБ.\nМожно отправить несколько по очереди.")
+    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (JPG/PNG) до 1МБ.\nМожно отправить несколько сразу (как альбом).")
 
 @bot.message_handler(content_types=['photo', 'document'])
 def handle_photo_upload(message):
     uid = message.from_user.id
     if uid not in UPLOAD_STATE: return 
     
+    # ФУНКЦИЯ ЗАГРУЗКИ С БЛОКИРОВКОЙ (FOR UPDATE) ДЛЯ ИЗБЕЖАНИЯ ГОНОК
     def _save_photo():
         try:
             pid = UPLOAD_STATE[uid]
-            
-            conn = get_db_connection(); cur = conn.cursor()
-            cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
-            images = cur.fetchone()[0] or []
+            conn = get_db_connection()
+            if not conn: return
+            cur = conn.cursor()
+
+            # БЛОКИРУЕМ СТРОКУ (FOR UPDATE) ЧТОБЫ ПОТОКИ ЖДАЛИ ДРУГ ДРУГА
+            cur.execute("SELECT style_images FROM projects WHERE id=%s FOR UPDATE", (pid,))
+            res = cur.fetchone()
+            images = res[0] or []
+
             if len(images) >= 30:
-                bot.send_message(message.chat.id, "❌ Достигнут лимит 30 фото.")
-                cur.close(); conn.close(); return
+                cur.close(); conn.close()
+                return # Молча игнорируем превышение, чтобы не спамить
 
             file_info = None
+            file_name_display = "Image"
+            
             if message.photo:
                 file_info = bot.get_file(message.photo[-1].file_id)
+                if message.caption: file_name_display = message.caption[:20]
             elif message.document:
                 if message.document.mime_type in ['image/jpeg', 'image/png']:
                     file_info = bot.get_file(message.document.file_id)
+                    file_name_display = message.document.file_name[:20]
                 else:
-                    bot.send_message(message.chat.id, "❌ Только JPG или PNG.")
                     cur.close(); conn.close(); return
 
             if file_info.file_size > 1048576:
-                bot.send_message(message.chat.id, "❌ Файл слишком большой (>1МБ).")
                 cur.close(); conn.close(); return
 
             downloaded_file = bot.download_file(file_info.file_path)
@@ -712,13 +717,99 @@ def handle_photo_upload(message):
             
             images.append(b64_img)
             cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
-            conn.commit(); cur.close(); conn.close()
+            conn.commit()
             
-            bot.send_message(message.chat.id, f"✅ Фото добавлено! ({len(images)}/30)")
+            current_count = len(images)
+            cur.close(); conn.close()
+            
+            bot.reply_to(message, f"✅ Фото #{current_count} сохранено ({file_name_display})")
+            
         except Exception as e:
-            bot.send_message(message.chat.id, f"Ошибка загрузки фото: {e}")
+            print(f"Upload Error: {e}")
 
     threading.Thread(target=_save_photo).start()
+
+# --- NEW: GALLERY & DELETE ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gallery_"))
+def kb_gallery(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[2]
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
+    images = cur.fetchone()[0] or []
+    cur.close(); conn.close()
+    
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    btns = []
+    for i in range(len(images)):
+        btns.append(types.InlineKeyboardButton(f"Фото {i+1}", callback_data=f"kb_view_{pid}_{i}"))
+    
+    markup.add(*btns)
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
+    
+    bot.edit_message_text(f"📂 **Галерея ({len(images)} фото)**\nНажмите на кнопку, чтобы увидеть фото и удалить его.", 
+                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_view_"))
+def kb_view_photo(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    parts = call.data.split("_")
+    pid, idx = parts[2], int(parts[3])
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
+    images = cur.fetchone()[0] or []
+    cur.close(); conn.close()
+    
+    if idx >= len(images):
+        bot.send_message(call.message.chat.id, "❌ Фото уже удалено.")
+        kb_gallery(call) # Refresh
+        return
+
+    b64_data = images[idx]
+    img_bytes = base64.b64decode(b64_data)
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🗑 Удалить это фото", callback_data=f"kb_del_{pid}_{idx}"))
+    markup.add(types.InlineKeyboardButton("🔙 В галерею", callback_data=f"kb_gallery_{pid}"))
+    
+    try:
+        bot.send_photo(call.message.chat.id, img_bytes, caption=f"🖼 Фото #{idx+1}", reply_markup=markup)
+    except Exception as e:
+        bot.send_message(call.message.chat.id, "❌ Ошибка отображения фото.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_del_"))
+def kb_delete_single(call):
+    try: bot.answer_callback_query(call.id, "Удалено")
+    except: pass
+    parts = call.data.split("_")
+    pid, idx = parts[2], int(parts[3])
+    
+    conn = get_db_connection()
+    if not conn: return
+    cur = conn.cursor()
+    
+    # Блокировка для безопасного удаления
+    cur.execute("SELECT style_images FROM projects WHERE id=%s FOR UPDATE", (pid,))
+    images = cur.fetchone()[0] or []
+    
+    if idx < len(images):
+        del images[idx]
+        cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
+        conn.commit()
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.send_message(call.message.chat.id, f"✅ Фото удалено. Осталось: {len(images)}")
+    else:
+        conn.rollback()
+        bot.send_message(call.message.chat.id, "❌ Фото уже не существует.")
+        
+    cur.close(); conn.close()
+    
+    # Возвращаем в галерею (текстовое меню)
+    kb_gallery(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_clear_photos_"))
 def kb_clear_photos(call):
@@ -741,6 +832,8 @@ def kb_menu_wrapper(chat_id, pid):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📝 Изменить Стиль", callback_data=f"kb_set_text_{pid}"),
                types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
+    if images:
+        markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
     bot.send_message(chat_id, msg, reply_markup=markup, parse_mode='Markdown')
 
@@ -1504,5 +1597,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (All Fixed)...")
+    print("🤖 Бот запущен (Gallery & Lock Fix)...")
     bot.infinity_polling(skip_pending=True)
