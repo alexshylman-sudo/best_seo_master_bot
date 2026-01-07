@@ -135,6 +135,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Гарантируем админские права
     cur.execute("""
         INSERT INTO users (user_id, is_admin, tariff, gens_left) 
         VALUES (%s, TRUE, 'GOD_MODE', 9999) 
@@ -979,7 +980,7 @@ def show_tariff_periods(user_id):
     bot.send_message(user_id, txt, reply_markup=markup, parse_mode='Markdown')
 
 def show_admin_panel(uid):
-    if uid != 203473623: return
+    if uid != ADMIN_ID: return
 
     conn = get_db_connection()
     if not conn: return
@@ -1727,13 +1728,27 @@ def write_article_handler(call):
             Length: 2000-2500 words.
             Style: Magazine Layout (Use HTML <blockquote>, <table>, <ul>).
             Current Year: {current_year}.
-            Style/Tone Prompt: {style_prompt}
+            
+            WEBSITE CONTEXT (From Survey):
+            Niche: {info.get('survey_step1', 'General')}
+            Audience: {info.get('survey_step2', 'General')}
+            Region: {info.get('survey_step3', 'General')}
+            USP: {info.get('survey_step4', 'General')}
+
+            VISUAL STYLE GUIDE (User Input):
+            {style_prompt}
             
             IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
             
             SEO SEMANTIC CORE (Integrate these keywords naturally):
             {keywords_raw}
             
+            IMAGE PROMPTING INSTRUCTIONS:
+            - When writing [IMG: ...] prompts, do NOT simply copy the Style Guide.
+            - INTELLIGENTLY ADAPT the style: Extract visual adjectives (lighting, mood, texture) from the Style Guide that fit the specific paragraph topic.
+            - Ensure images reflect the "Website Context" (e.g. if selling luxury cars, show luxury cars).
+            - Images must be high-quality photography descriptions.
+
             MANDATORY YOAST SEO RULES (STRICT):
             1. **Focus Keyword**: Pick ONE main keyword. It MUST appear in the **First Sentence of the First Paragraph**.
             2. **Keyphrase Density**: Use the focus keyword frequently (0.5-2%).
@@ -1819,6 +1834,8 @@ def rewrite_article(call):
             # Re-fetch data for context
             cur.execute("SELECT info, keywords, sitemap_links, style_prompt FROM projects WHERE id=%s", (pid,))
             proj = cur.fetchone()
+            
+            info = proj[0]
             keywords_raw = proj[1] or ""
             style_prompt = proj[3] or ""
             
@@ -1844,7 +1861,15 @@ def rewrite_article(call):
             Length: 2000-2500 words.
             Style: Magazine Layout.
             Current Year: {current_year}.
-            Style Prompt: {style_prompt}
+            
+            WEBSITE CONTEXT (From Survey):
+            Niche: {info.get('survey_step1', 'General')}
+            Audience: {info.get('survey_step2', 'General')}
+            Region: {info.get('survey_step3', 'General')}
+            USP: {info.get('survey_step4', 'General')}
+
+            VISUAL STYLE GUIDE (User Input):
+            {style_prompt}
             
             KEEP SEO OPTIMIZATION (STRICT YOAST RULES):
             1. **Focus Keyword**: MUST appear in the **First Sentence**.
@@ -1854,6 +1879,12 @@ def rewrite_article(call):
             3. **Outbound Linking**: Include 1 relevant external link (e.g., Wikipedia).
             4. **Subheadings**: Include focus keyword in 50% of subheaders.
             5. **Meta Description**: Must include the focus keyword.
+
+            IMAGE PROMPTING INSTRUCTIONS:
+            - When writing [IMG: ...] prompts, do NOT simply copy the Style Guide.
+            - INTELLIGENTLY ADAPT the style: Extract visual adjectives (lighting, mood, texture) from the Style Guide that fit the specific paragraph topic.
+            - Ensure images reflect the "Website Context" (e.g. if selling luxury cars, show luxury cars).
+            - Images must be high-quality photography descriptions.
             
             OUTPUT JSON ONLY (Same format):
             {{
@@ -2047,5 +2078,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Stable Image Gen & Safe MSG)...")
+    print("🤖 Бот запущен (Nano Banana & Survey Fixed)...")
     bot.infinity_polling(skip_pending=True)
