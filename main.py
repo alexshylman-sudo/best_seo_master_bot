@@ -84,7 +84,6 @@ def init_db():
             total_paid_stars INT DEFAULT 0
         )
     """)
-    # Убедимся, что URL уникален или проверяем его вручную (лучше вручную для нормализации)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
@@ -307,11 +306,8 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
-# --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) WITH KNOWLEDGE BASE ---
+# --- 4. IMAGE GENERATION (TIER 1 - IMAGEN 4 FAST) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style=""):
-    """
-    Returns: (media_id, source_url, debug_message)
-    """
     image_bytes = None
     target_model = 'imagen-4.0-fast-generate-001'
     
@@ -442,12 +438,14 @@ def list_projects(user_id, chat_id):
     projs = cur.fetchall()
     cur.close(); conn.close()
     if not projs:
-        bot.send_message(chat_id, "У вас нет проектов.")
+        markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
+        bot.send_message(chat_id, "📂 У вас пока нет проектов.", reply_markup=markup)
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
     for p in projs:
         btn_text = p[1].replace("https://", "").replace("http://", "").replace("www.", "")[:30]
         markup.add(types.InlineKeyboardButton(f"🌐 {btn_text}", callback_data=f"open_proj_mgmt_{p[0]}"))
+    markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
     bot.send_message(chat_id, "Ваши проекты:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "new_site")
@@ -458,7 +456,6 @@ def new_site_start(call):
     bot.register_next_step_handler(msg, check_url_step)
 
 def check_url_step(message):
-    # Оборачиваем в тред, т.к. проверка дублей и доступности может быть долгой
     def _process_url():
         try:
             url = message.text.strip()
@@ -468,22 +465,22 @@ def check_url_step(message):
                 return
             
             # --- ПРОВЕРКА ДУБЛЕЙ СТРОГО ---
-            # Убираем слеш на конце для чистоты сравнения
             clean_check_url = url.rstrip('/')
             
             conn = get_db_connection()
             cur = conn.cursor()
-            # Проверяем, есть ли такой URL (с или без слеша на конце) в базе
             cur.execute("SELECT id FROM projects WHERE url LIKE %s OR url LIKE %s", (clean_check_url, clean_check_url + '/'))
             exists = cur.fetchone()
             cur.close(); conn.close()
 
             if exists:
-                bot.send_message(message.chat.id, f"🚫 **Этот сайт уже добавлен в базу!**\n\nПовторное добавление невозможно. Найдите его в разделе '📂 Мои проекты'.", parse_mode='Markdown')
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
+                bot.send_message(message.chat.id, f"🚫 **Этот сайт уже добавлен в базу!**\n\nПовторное добавление невозможно. Найдите его в разделе '📂 Мои проекты'.", 
+                                 parse_mode='Markdown', reply_markup=markup)
                 return
             # -------------------------------
 
-            # Предварительное сообщение
             tmp_msg = bot.send_message(message.chat.id, "🔎 Проверяю доступность сайта...")
             
             if not check_site_availability(url):
@@ -589,10 +586,48 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("📝 Опрос", callback_data=f"srv_{pid}"))
     markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"comp_start_{pid}"))
-    markup.add(types.InlineKeyboardButton("⚙️ CMS", callback_data=f"cms_select_{pid}"))
+    markup.add(types.InlineKeyboardButton("⚙️ CMS (Сайт)", callback_data=f"cms_select_{pid}"))
     markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+# --- CMS HANDLERS (FIXED) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cms_select_"))
+def cms_start_setup(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[2]
+    
+    # Сразу просим логин, так как URL уже есть
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔙 Отмена", callback_data=f"proj_settings_{pid}"))
+    
+    msg = bot.send_message(call.message.chat.id, 
+                           "🔐 **Настройка WordPress**\n\n1. Убедитесь, что у вас включены 'Application Passwords'.\n2. Введите **Логин** администратора:", 
+                           reply_markup=markup, parse_mode='Markdown')
+    bot.register_next_step_handler(msg, cms_save_login_step, pid)
+
+def cms_save_login_step(message, pid):
+    if message.text.startswith("/"): return
+    login = message.text.strip()
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET cms_login=%s WHERE id=%s", (login, pid))
+    conn.commit(); cur.close(); conn.close()
+    
+    msg = bot.send_message(message.chat.id, "🔑 Теперь введите **Пароль приложения** (Application Password):")
+    bot.register_next_step_handler(msg, cms_save_password_step, pid)
+
+def cms_save_password_step(message, pid):
+    pwd = message.text.strip()
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE projects SET cms_password=%s WHERE id=%s", (pwd, pid))
+    # Также обновляем cms_url равным url проекта для удобства
+    cur.execute("UPDATE projects SET cms_url=url WHERE id=%s AND cms_url IS NULL", (pid,))
+    conn.commit(); cur.close(); conn.close()
+    
+    bot.send_message(message.chat.id, "✅ CMS данные сохранены! Теперь можно публиковать статьи.")
+    open_project_menu(message.chat.id, pid)
 
 # --- KNOWLEDGE BASE HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_menu_"))
@@ -887,7 +922,6 @@ def comp_start(call):
     bot.register_next_step_handler(msg, analyze_competitor_step, pid)
 
 def analyze_competitor_step(message, pid):
-    # ТЯЖЕЛАЯ ОПЕРАЦИЯ - В ТРЕД
     def _process_comp():
         try:
             if message.text.startswith("/"): return
@@ -959,7 +993,6 @@ def perform_analysis(call):
     _, _, pid, type_ = call.data.split("_")
     bot.edit_message_text(f"⏳ Выполняю {type_} анализ...", call.message.chat.id, call.message.message_id)
     
-    # ТЯЖЕЛАЯ ОПЕРАЦИЯ - В ТРЕД
     def _run_analysis():
         try:
             conn = get_db_connection(); cur = conn.cursor()
@@ -1057,7 +1090,6 @@ def save_freq_and_plan(call):
 
     bot.edit_message_text(f"📅 Генерирую план на остаток недели ({actual_count} статей)...", call.message.chat.id, call.message.message_id)
     
-    # ТЯЖЕЛАЯ ОПЕРАЦИЯ - В ТРЕД
     def _gen_plan():
         try:
             conn = get_db_connection(); cur = conn.cursor()
@@ -1119,7 +1151,6 @@ def replace_topic(call):
     _, _, pid, idx = call.data.split("_")
     idx = int(idx)
     
-    # ТЯЖЕЛАЯ ОПЕРАЦИЯ - В ТРЕД
     def _repl_topic():
         try:
             conn = get_db_connection(); cur = conn.cursor()
@@ -1201,7 +1232,6 @@ def test_article_start(call):
 def propose_test_topics(chat_id, pid):
     bot.send_message(chat_id, "⏳ Генерирую 5 тем для тестовой статьи...")
     
-    # ТЯЖЕЛАЯ ОПЕРАЦИЯ - В ТРЕД
     def _gen_topics():
         try:
             conn = get_db_connection(); cur = conn.cursor()
@@ -1260,7 +1290,6 @@ def write_article_handler(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, f"⏳ Начинаю писать статью... Это займет около минуты.", parse_mode='Markdown')
     
-    # ТЯЖЕЛАЯ ОПЕРАЦИЯ - В ТРЕД
     def _write_art():
         try:
             conn = get_db_connection(); cur = conn.cursor()
@@ -1356,7 +1385,6 @@ def approve_publish(call):
     aid = call.data.split("_")[1]
     bot.send_message(call.message.chat.id, "🚀 Начинаю генерацию картинок и публикацию... (Это может занять 2-3 минуты)")
     
-    # ОЧЕНЬ ТЯЖЕЛАЯ ОПЕРАЦИЯ - ОБЯЗАТЕЛЬНО В ТРЕД
     def _pub_process():
         conn = get_db_connection(); cur = conn.cursor()
         try:
@@ -1476,5 +1504,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Async + DupCheck)...")
+    print("🤖 Бот запущен (All Fixed)...")
     bot.infinity_polling(skip_pending=True)
