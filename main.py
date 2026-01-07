@@ -30,7 +30,6 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 APP_URL = os.getenv("APP_URL")
 
 bot = TeleBot(TOKEN)
-# Инициализация клиента Google AI (New SDK)
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 
@@ -169,7 +168,6 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
 
 def get_gemini_response(prompt):
     try:
-        # Используем Flash для текста (быстро и дешево)
         response = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
         return response.text
     except Exception as e:
@@ -291,17 +289,16 @@ def format_html_for_chat(html_content):
     clean_text = soup.get_text(separator="\n\n")
     return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
 
-# --- 4. IMAGE GENERATION (UPDATED FOR RENDER + IMAGEN 3) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
     image_bytes = None
     
-    # 1. Используем стабильную модель FAST
-    target_model = 'imagen-3.0-fast-generate-001'
+    # --- 1. МОДЕЛЬ: Актуальная Imagen 4 Fast ---
+    target_model = 'imagen-4.0-fast-generate-001'
     
-    # 2. Улучшаем промпт для фотореализма
-    final_prompt = f"Professional photography, high quality, realistic, {image_prompt}, cinematic lighting, 8k"
+    # --- 2. КАЧЕСТВО: Улучшаем промпт ---
+    final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, cinematic lighting, 8k"
     
-    print(f"🎨 Generating Image ({target_model}): {final_prompt[:40]}...")
+    print(f"🎨 Google Imagen 4 Fast: {final_prompt[:40]}...")
     
     try:
         response = client.models.generate_images(
@@ -309,18 +306,37 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
             prompt=final_prompt,
             config=genai_types.GenerateImagesConfig(
                 number_of_images=1,
-                aspect_ratio='16:9' # Горизонтальный формат 16:9
+                # --- 3. ФОРМАТ: 16:9 для блога ---
+                aspect_ratio='16:9',
+                # --- 4. БЕЗОПАСНОСТЬ: Минимизируем блокировки ---
+                safety_settings=[
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_HATE_SPEECH",
+                        threshold="BLOCK_ONLY_HIGH"
+                    ),
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_ONLY_HIGH"
+                    ),
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_HARASSMENT",
+                        threshold="BLOCK_ONLY_HIGH"
+                    ),
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        threshold="BLOCK_ONLY_HIGH"
+                    ),
+                ]
             )
         )
         if response.generated_images:
             image_bytes = response.generated_images[0].image.image_bytes
         else:
-            print("⚠️ Image generation returned empty (Safety Block or API Error)")
+            print("⚠️ Изображение не создано (фильтры безопасности или ошибка)")
             return None, None
             
     except Exception as e:
         print(f"❌ Google Imagen Error: {e}")
-        # Если вылетит 404 или 403, бот продолжит работать, просто без картинки
         return None, None
 
     if not image_bytes: return None, None
@@ -329,40 +345,34 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text):
         if api_url.endswith('/'): api_url = api_url[:-1]
         seed = random.randint(1, 99999)
         file_name = f"img-{seed}.png"
-        
-        creds = base64.b64encode(f"{login}:{pwd}".encode()).decode()
+        creds = f"{login}:{pwd}"
+        token = base64.b64encode(creds.encode()).decode()
         headers = {
-            'Authorization': 'Basic ' + creds,
+            'Authorization': 'Basic ' + token,
             'Content-Disposition': f'attachment; filename={file_name}',
             'Content-Type': 'image/png',
-            'User-Agent': 'AI-SEO-Bot/1.0'
+            'User-Agent': 'Mozilla/5.0',
+            'Cookie': 'beget=begetok'
         }
-        
         upload_api = f"{api_url}/wp-json/wp/v2/media"
         r = requests.post(upload_api, headers=headers, data=image_bytes, timeout=60)
         
         if r.status_code == 201:
-            data = r.json()
-            media_id = data.get('id')
-            source_url = data.get('source_url')
-            
-            # Обновляем ALT и Title (Важно для SEO)
+            media_id = r.json().get('id')
+            source_url = r.json().get('source_url')
+            # Critical for Yoast SEO Green Light on Images
             requests.post(
                 f"{upload_api}/{media_id}", 
-                headers={'Authorization': 'Basic ' + creds, 'Content-Type': 'application/json'}, 
+                headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'}, 
                 json={'alt_text': alt_text, 'title': alt_text, 'caption': alt_text}, 
                 timeout=10
             )
-            print(f"✅ Uploaded to WP: {source_url}")
             return media_id, source_url
-        else:
-            print(f"❌ WP Upload Failed: {r.status_code} {r.text}")
     except Exception as e:
-        print(f"❌ WP Connection Error: {e}")
-        
+        print(f"WP Upload Error: {e}")
     return None, None
 
-# --- 5. MENUS & HANDLERS ---
+# --- 4. MENUS ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("➕ Новый проект", "📂 Мои проекты")
@@ -412,7 +422,7 @@ def menu_handler(message):
 @bot.callback_query_handler(func=lambda call: call.data == "soon")
 def soon_alert(call): bot.answer_callback_query(call.id, "🚧 В разработке...")
 
-# --- PROJECTS ---
+# --- 5. PROJECTS ---
 def list_projects(user_id, chat_id):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT id, url FROM projects WHERE user_id = %s ORDER BY id ASC", (user_id,))
@@ -443,6 +453,7 @@ def check_url_step(message):
         bot.register_next_step_handler(msg, check_url_step)
         return
     
+    # Сразу парсим sitemap при добавлении
     sitemap_links = parse_sitemap(url)
     
     conn = get_db_connection(); cur = conn.cursor()
@@ -454,6 +465,7 @@ def check_url_step(message):
     USER_CONTEXT[message.from_user.id] = pid
     open_project_menu(message.chat.id, pid, mode="onboarding", new_site_url=url)
 
+# --- MENU ---
 def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url=None):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT url, keywords, progress, cms_login, cms_password FROM projects WHERE id = %s", (pid,))
@@ -530,7 +542,7 @@ def project_settings_menu(call):
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"open_proj_mgmt_{pid}"))
     bot.edit_message_text("⚙️ **Настройки проекта**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-# --- PROFILE & PAYMENTS ---
+# --- UTILS (PROFILE) ---
 def show_profile(uid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT tariff, gens_left, balance, joined_at, total_paid_rub FROM users WHERE user_id=%s", (uid,))
@@ -970,6 +982,7 @@ def write_article_handler(call):
     cur.execute("SELECT info, keywords, sitemap_links FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     info, keywords = res[0], res[1] or ""
+    # Get Real Sitemap Links for Internal Linking
     sitemap_list = res[2] if res[2] else []
     links_text = json.dumps(sitemap_list[:50], ensure_ascii=False) if sitemap_list else "No internal links found."
     
@@ -1065,8 +1078,6 @@ def approve_publish(call):
     
     img_matches = re.findall(r'\[IMG: (.*?)\]', content)
     final_content = content
-    
-    # Генерация картинок внутри текста
     for i, prompt in enumerate(img_matches):
         media_id, source_url = generate_and_upload_image(url, login, pwd, prompt, f"{title} photo {i}")
         if source_url:
@@ -1074,22 +1085,23 @@ def approve_publish(call):
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{title}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
         else:
-            # Если картинка не сгенерилась, просто удаляем тег
             final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
 
-    # Генерация обложки (Featured Image)
     feat_media_id = None
     if seo_data.get('featured_img_prompt'):
         feat_media_id, _ = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], seo_data.get('featured_img_alt', title))
 
     try:
-        creds = base64.b64encode(f"{login}:{pwd}".encode()).decode()
+        creds = f"{login}:{pwd}"
+        token = base64.b64encode(creds.encode()).decode()
         headers = {
-            'Authorization': 'Basic ' + creds,
+            'Authorization': 'Basic ' + token,
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0'
+            'User-Agent': 'Mozilla/5.0',
+            'Cookie': 'beget=begetok'
         }
         
+        # Use clean H1 title
         seo_title = seo_data.get('seo_title', title)
         final_title = title if len(seo_title) > 70 or ":" in seo_title else seo_title
 
@@ -1106,7 +1118,7 @@ def approve_publish(call):
         }
         if feat_media_id: post_data['featured_media'] = feat_media_id
 
-        api_url = f"{url.rstrip('/')}/wp-json/wp/v2/posts"
+        api_url = f"{url}/wp-json/wp/v2/posts"
         r = requests.post(api_url, headers=headers, json=post_data, timeout=60)
         
         if r.status_code == 201:
@@ -1128,11 +1140,11 @@ def approve_publish(call):
             bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup(call.from_user.id))
         else:
             conn.close()
-            bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code} {r.text[:100]}")
+            bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code}")
             
     except Exception as e:
         if conn: conn.close()
-        bot.send_message(call.message.chat.id, f"❌ Ошибка публикации: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
 
 # ЗАПУСК
 def run_scheduler():
@@ -1146,5 +1158,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Render Mode)...")
+    print("🤖 Бот запущен...")
     bot.infinity_polling(skip_pending=True)
