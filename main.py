@@ -679,7 +679,6 @@ def handle_photo_upload(message):
     uid = message.from_user.id
     if uid not in UPLOAD_STATE: return 
     
-    # ФУНКЦИЯ ЗАГРУЗКИ С БЛОКИРОВКОЙ (FOR UPDATE) ДЛЯ ИЗБЕЖАНИЯ ГОНОК
     def _save_photo():
         try:
             pid = UPLOAD_STATE[uid]
@@ -692,22 +691,34 @@ def handle_photo_upload(message):
             res = cur.fetchone()
             images = res[0] or []
 
+            # --- ПРОВЕРКА ЛИМИТА ---
             if len(images) >= 30:
                 cur.close(); conn.close()
-                return # Молча игнорируем превышение, чтобы не спамить
+                markup_limit = types.InlineKeyboardMarkup()
+                markup_limit.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"kb_menu_{pid}"))
+                bot.send_message(message.chat.id, "⚠️ Лимит превышен! Максимум 30 фото.", reply_markup=markup_limit)
+                return 
+            # -----------------------
 
             file_info = None
-            file_name_display = "Image"
+            file_name_display = f"photo_{random.randint(1000,9999)}.jpg" # Default fallback
             
-            if message.photo:
-                file_info = bot.get_file(message.photo[-1].file_id)
-                if message.caption: file_name_display = message.caption[:20]
-            elif message.document:
+            # --- ОПРЕДЕЛЕНИЕ ИМЕНИ ФАЙЛА ---
+            if message.document:
+                # Если это документ - берем реальное имя файла
                 if message.document.mime_type in ['image/jpeg', 'image/png']:
                     file_info = bot.get_file(message.document.file_id)
-                    file_name_display = message.document.file_name[:20]
+                    file_name_display = message.document.file_name
                 else:
                     cur.close(); conn.close(); return
+            elif message.photo:
+                # Если это сжатое фото - генерируем имя
+                file_info = bot.get_file(message.photo[-1].file_id)
+                # Телеграм не хранит оригинальное имя для Compressed photos
+                file_name_display = f"photo_{int(time.time())}_{random.randint(10,99)}.jpg"
+            else:
+                 cur.close(); conn.close(); return
+            # -------------------------------
 
             if file_info.file_size > 1048576:
                 cur.close(); conn.close(); return
@@ -722,7 +733,13 @@ def handle_photo_upload(message):
             current_count = len(images)
             cur.close(); conn.close()
             
-            bot.reply_to(message, f"✅ Фото #{current_count} сохранено ({file_name_display})")
+            # --- КЛАВИАТУРА ПОСЛЕ ЗАГРУЗКИ ---
+            markup = types.InlineKeyboardMarkup()
+            if current_count < 30:
+                markup.add(types.InlineKeyboardButton("➕ Добавить еще", callback_data=f"kb_add_photo_{pid}"))
+            markup.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"kb_menu_{pid}"))
+            
+            bot.reply_to(message, f"✅ Фото №{current_count} сохранено ({file_name_display})", reply_markup=markup)
             
         except Exception as e:
             print(f"Upload Error: {e}")
@@ -1597,5 +1614,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🤖 Бот запущен (Gallery & Lock Fix)...")
+    print("🤖 Бот запущен (Gallery & Lock Fixed)...")
     bot.infinity_polling(skip_pending=True)
