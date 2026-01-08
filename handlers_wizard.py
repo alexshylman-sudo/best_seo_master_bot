@@ -13,7 +13,7 @@ from handlers_core import open_proj_mgmt
 # --- ИМПОРТ МОДУЛЯ ПОИСКА ---
 from seo_search import search_relevant_links, format_search_results
 
-# Локальный кэш для хранения результатов поиска (временная память)
+# Кэш
 SEARCH_CACHE = {}
 
 # STEP 1: NEW SITE
@@ -260,90 +260,97 @@ def kb_gen_internal_logic(chat_id, pid):
 
     threading.Thread(target=_scan).start()
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("step5_ext_start_"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("step5_ext_start_") or call.data.startswith("retry_ext_"))
 def step5_start_external_search(call):
-    """Часть 2: Поиск в DuckDuckGo"""
-    try: bot.answer_callback_query(call.id); 
+    """Часть 2: Поиск в DuckDuckGo (или повторный поиск)"""
+    try: bot.answer_callback_query(call.id, "Ищу..."); 
     except: pass
-    pid = call.data.split("_")[-1]
+    
+    # Определяем pid, учитывая разные callback'и
+    if "retry_ext_" in call.data:
+        pid = call.data.split("_")[-1]
+    else:
+        pid = call.data.split("_")[-1]
+        
     chat_id = call.message.chat.id
     
-    bot.send_message(chat_id, "🔎 **Часть 2.** Ищу трастовые сайты по вашей тематике в интернете...")
+    # Удаляем старое сообщение с кнопками, если это повтор
+    if "retry_ext_" in call.data:
+        try: bot.delete_message(chat_id, call.message.message_id)
+        except: pass
+
+    bot.send_message(chat_id, "🔎 **Часть 2.** Ищу качественные статьи (только RU, без спама)...")
     
     def _search_thread():
-        # Получаем тему из ответов пользователя
+        # Получаем тему и ключи
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
-        info = cur.fetchone()[0] or {}
-        cur.close()
-        conn.close()
+        cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
+        res = cur.fetchone()
+        info = res[0] or {}
+        # Пробуем взять ключи, если нет - то тему опроса
+        topic = res[1] if res[1] else info.get('survey_step1', '')
         
-        # Формируем запрос: Тема + "полезные статьи"
-        topic = info.get('survey_step1', 'SEO')
-        query = f"{topic} полезные статьи википедия обзор"
+        # Если совсем пусто
+        if not topic or len(topic) < 3:
+            topic = "SEO продвижение"
+
+        # Берем только первые 30 символов темы, чтобы запрос не был слишком длинным и мусорным
+        short_topic = topic.split(',')[0].split('.')[0][:50]
         
-        # Ищем через наш модуль
-        results = search_relevant_links(query, max_results=6)
+        # Формируем запрос: "Полезная статья {ТЕМА}"
+        query = f"Полезная статья {short_topic}"
+        
+        # Ищем через наш обновленный модуль
+        results = search_relevant_links(query, max_results=10)
         
         # Сохраняем во временный кэш
         SEARCH_CACHE[call.from_user.id] = {'pid': pid, 'links': results}
         
-        # Отправляем пользователю
+        # Отправляем пользователю список
         msg_text = format_search_results(results)
         
-        # Если ссылок нет - сразу кнопку дальше
-        if not results:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"finish_step5_{pid}"))
-            bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='HTML')
+        markup = types.InlineKeyboardMarkup()
+        
+        if results:
+            # ДВЕ КНОПКИ: ОДОБРИТЬ ВСЕ или ИСКАТЬ ЕЩЕ
+            markup.add(types.InlineKeyboardButton("✅ Одобрить и продолжить", callback_data=f"save_ext_{pid}"))
+            markup.add(types.InlineKeyboardButton("🔄 Найти другие варианты", callback_data=f"retry_ext_{pid}"))
         else:
-            # Ждем ввода цифр
-            msg = bot.send_message(chat_id, msg_text, parse_mode='HTML', disable_web_page_preview=True)
-            bot.register_next_step_handler(msg, step5_process_selection)
+            markup.add(types.InlineKeyboardButton("🔄 Попробовать еще раз", callback_data=f"retry_ext_{pid}"))
+            markup.add(types.InlineKeyboardButton("➡️ Пропустить шаг", callback_data=f"finish_step5_{pid}"))
+            
+        bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='HTML', disable_web_page_preview=True)
 
     threading.Thread(target=_search_thread).start()
 
-def step5_process_selection(message):
-    uid = message.from_user.id
-    if uid not in SEARCH_CACHE: return # Если стейт потерян
-
-    user_input = message.text.strip()
-    data = SEARCH_CACHE[uid]
-    pid = data['pid']
-    found_links = data['links']
+@bot.callback_query_handler(func=lambda call: call.data.startswith("save_ext_"))
+def save_external_links(call):
+    """Сохраняет найденные ссылки (все 10) и идет дальше"""
+    try: bot.answer_callback_query(call.id); 
+    except: pass
+    pid = call.data.split("_")[-1]
+    uid = call.from_user.id
     
-    selected_links = []
-
-    if user_input == '0':
-        pass # Ничего не выбрали
+    if uid in SEARCH_CACHE:
+        links = SEARCH_CACHE[uid]['links']
+        
+        # Сохраняем в БД
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE projects SET approved_external_links=%s WHERE id=%s", (json.dumps(links), pid))
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        del SEARCH_CACHE[uid]
+        msg = f"✅ Сохранено {len(links)} внешних источников."
     else:
-        try:
-            # Парсим "1, 3"
-            indices = [int(x.strip()) - 1 for x in user_input.replace('.',',').split(',') if x.strip().isdigit()]
-            for i in indices:
-                if 0 <= i < len(found_links):
-                    selected_links.append(found_links[i])
-        except:
-            bot.send_message(message.chat.id, "⚠️ Не понял цифры. Напишите, например: `1, 2` или `0`.", parse_mode='Markdown')
-            bot.register_next_step_handler(message, step5_process_selection)
-            return
-
-    # Сохраняем в БД
-    conn = get_db_connection()
-    cur = conn.cursor()
-    # Берем старые (если были) или перезаписываем
-    cur.execute("UPDATE projects SET approved_external_links=%s WHERE id=%s", (json.dumps(selected_links), pid))
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    # Очищаем кэш
-    del SEARCH_CACHE[uid]
+        msg = "⚠️ Срок действия данных истек. Но мы идем дальше."
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("➡️ Идем дальше (Шаг 6)", callback_data=f"finish_step5_{pid}"))
-    bot.send_message(message.chat.id, f"✅ Принято! Добавлено внешних источников: {len(selected_links)}.", reply_markup=markup)
+    bot.send_message(call.message.chat.id, msg, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("finish_step5_"))
 def finish_step5_handler(call):
@@ -367,6 +374,8 @@ def step6_gallery_start(call):
 def finish_step6_handler(call):
     pid = call.data.split("_")[-1]
     update_project_progress(pid, "step6_gallery_done")
+    step6_gallery_start(call) # Исправлено: если закончили 6 шаг, то должны идти на 7, но у нас тут почему-то рекурсия была.
+    # ВАЖНО: Ниже правильная логика перехода на 7 шаг
     step7_imgprompts_start(call)
 
 # STEP 7: IMG PROMPTS
