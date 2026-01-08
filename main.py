@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-ADMIN_ID = 203473623 # Замените на свой ID, если нужно
+ADMIN_ID = 203473623 # Замените на свой ID
 SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -68,7 +68,6 @@ def patch_db_schema():
     if not conn: return
     cur = conn.cursor()
     try:
-        # Patching necessary columns
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_paid_rub INT DEFAULT 0")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_paid_stars INT DEFAULT 0")
@@ -98,7 +97,6 @@ def init_db():
     conn = get_db_connection()
     if not conn: return
     cur = conn.cursor()
-    # Users Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -113,7 +111,6 @@ def init_db():
             total_paid_stars INT DEFAULT 0
         )
     """)
-    # Projects Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
@@ -142,7 +139,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Articles Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS articles (
             id SERIAL PRIMARY KEY,
@@ -157,7 +153,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Payments Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
@@ -168,7 +163,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Admin Init
     cur.execute("""
         INSERT INTO users (user_id, is_admin, tariff, gens_left) 
         VALUES (%s, TRUE, 'GOD_MODE', 9999) 
@@ -207,7 +201,6 @@ def escape_md(text):
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
 
 def send_step_animation(chat_id, step_key, caption=None):
-    """Sends a GIF for the step."""
     gif_url = STEP_GIFS.get(step_key)
     if gif_url:
         try:
@@ -257,7 +250,6 @@ def check_site_availability(url):
     except: return False
 
 def update_project_progress(pid, step_key):
-    """Обновляет JSON progress, добавляя новый ключ как выполненный."""
     conn = get_db_connection()
     if not conn: return
     cur = conn.cursor()
@@ -316,7 +308,7 @@ def parse_sitemap(url):
         if not links:
             links = parse_html_links(url)
         clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', '.pdf', 'wp-admin', 'feed', '.xml', 'sitemap'])]
-        return clean_links[:100]
+        return clean_links
     except: return []
 
 def parse_html_links(url):
@@ -469,35 +461,6 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
     except Exception as e:
         print(f"WP Upload Error: {e}")
         return None, None, f"❌ WP Connection Error: {e}"
-
-# --- HELPER: ARTICLE QUALITY VALIDATION ---
-def validate_article_quality(content_html, project_sitemap_links):
-    errors = []
-    garbage_phrases = ["Here is the article", "Sure, here is", "json", "```", "[Insert link]", "lorem ipsum"]
-    for phrase in garbage_phrases:
-        if phrase.lower() in str(content_html).lower()[:100]: 
-            errors.append(f"Мусорный текст в начале: '{phrase}'")
-        if "```" in str(content_html):
-             errors.append("Остались Markdown символы (```)")
-    soup = BeautifulSoup(content_html, 'html.parser')
-    if not soup.find(['h2', 'h3']):
-        errors.append("Нет подзаголовков (H2/H3).")
-    if len(soup.get_text()) < 500:
-        errors.append("Статья слишком короткая (<500 символов).")
-    links_found = soup.find_all('a', href=True)
-    if links_found:
-        valid_urls = set()
-        for link in project_sitemap_links:
-            clean = link.replace("http://", "").replace("https://", "").rstrip('/')
-            valid_urls.add(clean)
-        for link in links_found:
-            href = link['href']
-            clean_href = href.replace("http://", "").replace("https://", "").rstrip('/')
-            is_external = "wikipedia" in href or "google" in href
-            if not is_external and clean_href not in valid_urls and len(valid_urls) > 0:
-                 if clean_href.count('/') > 1:
-                     errors.append(f"Подозрительная ссылка: {href}")
-    return errors
 
 # --- 5. MENUS & BOT HANDLERS ---
 def main_menu_markup(user_id):
@@ -710,7 +673,7 @@ def check_url_step(message):
             send_step_animation(message.chat.id, "scan", "⏳ **Шаг 2. Сканирую сайт...**")
             sitemap_links = parse_sitemap(url)
 
-            # SAVE PROJECT & MARK STEP 2 DONE
+            # SAVE PROJECT
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("INSERT INTO projects (user_id, type, url, info, sitemap_links, progress) VALUES (%s, 'site', %s, '{}', %s, '{}') RETURNING id", (message.from_user.id, url, json.dumps(sitemap_links)))
@@ -723,9 +686,15 @@ def check_url_step(message):
             USER_CONTEXT[message.from_user.id] = pid
 
             if not sitemap_links:
-                bot.send_message(message.chat.id, "⚠️ Данные не считаны автоматически (блокировка), но мы продолжим.")
+                bot.send_message(message.chat.id, "⚠️ Карта сайта не найдена. Анализирую главную страницу...")
             else:
                 bot.send_message(message.chat.id, f"✅ Успешно! Найдено {len(sitemap_links)} страниц.")
+            
+            # --- NEW: STEP 2 SITE ANALYSIS ---
+            scraped_data, _ = deep_analyze_site(url)
+            prompt = f"Analyze this site: {url}. Content: {scraped_data[:3000]}. Give a short SEO summary in Russian."
+            analysis = get_gemini_response(prompt)
+            bot.send_message(message.chat.id, f"📊 **Экспресс-анализ сайта:**\n\n{analysis}")
 
             # START STEP 3
             send_step_animation(message.chat.id, "survey", "📝 **Шаг 3. Опрос (Брифинг)**")
@@ -826,7 +795,8 @@ def step4_analyze_comp_logic(message):
     def _analyze():
         try:
             scraped_data, _ = deep_analyze_site(url)
-            prompt = f"Role: SEO Expert. Analyze: {url}.\nSnippet: {scraped_data[:2000]}\nOpinion (2 sentences):"
+            # --- NEW: Force Russian ---
+            prompt = f"Role: SEO Expert. Analyze: {url}.\nSnippet: {scraped_data[:2000]}\nTask: Write a VERY BRIEF (2 sentences) opinion on their SEO quality. OUTPUT LANGUAGE: RUSSIAN."
             opinion = get_gemini_response(prompt)
             
             conn = get_db_connection()
@@ -891,19 +861,34 @@ def kb_gen_internal_logic(chat_id, pid):
         
         links = parse_sitemap(url)
         clean_links = [l for l in links if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed', '.xml'])]
-        clean_links = clean_links[:50] 
+        # --- NEW: Show links properly ---
         
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("UPDATE projects SET approved_internal_links=%s WHERE id=%s", (json.dumps(clean_links), pid))
+        cur.execute("UPDATE projects SET approved_internal_links=%s WHERE id=%s", (json.dumps(clean_links[:100]), pid))
         conn.commit()
         cur.close()
         conn.close()
         
-        msg = f"✅ Найдено и сохранено {len(clean_links)} ссылок."
+        # Display Logic
+        msg = f"✅ Найдено {len(clean_links)} ссылок."
+        if len(clean_links) > 0:
+            if len(clean_links) <= 20:
+                msg += "\n\n" + "\n".join(clean_links)
+                bot.send_message(chat_id, msg)
+            else:
+                msg += "\n\n(Первые 20):\n" + "\n".join(clean_links[:20])
+                bot.send_message(chat_id, msg)
+                # Create and send text file
+                file_str = "\n".join(clean_links)
+                file_io = io.BytesIO(file_str.encode('utf-8'))
+                file_io.name = "all_links.txt"
+                bot.send_document(chat_id, file_io, caption="📂 Полный список ссылок")
+        
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("➡️ Идем дальше (Шаг 6)", callback_data=f"finish_step5_{pid}"))
-        bot.send_message(chat_id, msg, reply_markup=markup)
+        bot.send_message(chat_id, "Ссылки собраны. Продолжим?", reply_markup=markup)
+
     threading.Thread(target=_scan).start()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("finish_step5_"))
@@ -1242,7 +1227,10 @@ def handle_photo_upload(message):
         conn.commit()
         cur.close()
         conn.close()
-        bot.reply_to(message, "✅ Фото сохранено.")
+        # --- NEW: Show reaction with Next Button ---
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("➡️ Идем дальше (Шаг 7)", callback_data=f"finish_step6_{pid}"))
+        bot.reply_to(message, f"✅ Фото загружено ({len(imgs)}/30).", reply_markup=markup)
     except: pass
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("test_article_"))
