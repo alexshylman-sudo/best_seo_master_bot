@@ -1585,7 +1585,10 @@ def propose_test_topics(chat_id, pid):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("write_"))
 def write_article_handler(call):
-    try: bot.answer_callback_query(call.id, "Пишу статью..."); except: pass
+    try:
+        bot.answer_callback_query(call.id, "Пишу статью...")
+    except:
+        pass
     parts = call.data.split("_")
     pid = parts[1]
     idx = int(parts[3])
@@ -1645,7 +1648,10 @@ def write_article_handler(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rewrite_"))
 def rewrite_article(call):
-    try: bot.answer_callback_query(call.id, "Переписываю..."); except: pass
+    try:
+        bot.answer_callback_query(call.id, "Переписываю...")
+    except:
+        pass
     aid = call.data.split("_")[1]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1700,7 +1706,10 @@ def rewrite_article(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pre_approve_"))
 def pre_approve_check(call):
-    try: bot.answer_callback_query(call.id); except: pass
+    try:
+        bot.answer_callback_query(call.id)
+    except:
+        pass
     aid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1714,7 +1723,10 @@ def pre_approve_check(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
 def approve_publish(call):
-    try: bot.answer_callback_query(call.id, "Публикую..."); except: pass
+    try:
+        bot.answer_callback_query(call.id, "Публикую...")
+    except:
+        pass
     aid = call.data.split("_")[1]
     bot.send_message(call.message.chat.id, "🚀 Публикация... (2-3 мин)")
     def _pub_process():
