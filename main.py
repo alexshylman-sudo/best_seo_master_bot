@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION_1 ---
 load_dotenv()
 
 ADMIN_ID = 203473623  # Вставьте ваш ID
