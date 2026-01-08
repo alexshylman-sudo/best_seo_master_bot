@@ -10,6 +10,12 @@ from database import get_db_connection, update_project_progress
 from utils import send_step_animation, parse_sitemap, deep_analyze_site, get_gemini_response, send_safe_message, clean_and_parse_json
 from handlers_core import open_proj_mgmt
 
+# --- ИМПОРТ МОДУЛЯ ПОИСКА ---
+from seo_search import search_relevant_links, format_search_results
+
+# Локальный кэш для хранения результатов поиска (временная память)
+SEARCH_CACHE = {}
+
 # STEP 1: NEW SITE
 @bot.callback_query_handler(func=lambda call: call.data == "new_site")
 def new_site_start(call):
@@ -205,9 +211,11 @@ def finish_step4_handler(call):
     update_project_progress(pid, "step4_competitors_done") 
     step5_links_start(call)
 
-# STEP 5: LINKS
+# --- STEP 5: LINKS (ВНУТРЕННИЕ + ВНЕШНИЕ) ---
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("step5_links_"))
 def step5_links_start(call):
+    """Начало шага 5: Сначала Внутренние ссылки"""
     try: bot.answer_callback_query(call.id); 
     except: pass
     pid = call.data.split("_")[-1]
@@ -217,7 +225,7 @@ def step5_links_start(call):
     kb_gen_internal_logic(call.message.chat.id, pid)
 
 def kb_gen_internal_logic(chat_id, pid):
-    bot.send_message(chat_id, "⏳ Генерирую ссылки для перелинковки...")
+    bot.send_message(chat_id, "⚙️ **Часть 1.** Анализирую структуру сайта для перелинковки...")
     def _scan():
         conn = get_db_connection()
         cur = conn.cursor()
@@ -236,24 +244,106 @@ def kb_gen_internal_logic(chat_id, pid):
         cur.close()
         conn.close()
         
-        msg = f"✅ Найдено {len(clean_links)} ссылок."
+        msg = f"✅ Найдено внутренних страниц: {len(clean_links)}."
         if len(clean_links) > 0:
-            if len(clean_links) <= 20:
+            if len(clean_links) <= 10:
                 msg += "\n\n" + "\n".join(clean_links)
                 bot.send_message(chat_id, msg)
             else:
-                msg += "\n\n(Первые 20):\n" + "\n".join(clean_links[:20])
+                msg += f"\n(Показаны первые 10 из {len(clean_links)}):\n" + "\n".join(clean_links[:10])
                 bot.send_message(chat_id, msg)
-                file_str = "\n".join(clean_links)
-                file_io = io.BytesIO(file_str.encode('utf-8'))
-                file_io.name = "all_links.txt"
-                bot.send_document(chat_id, file_io, caption="📂 Полный список ссылок")
         
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("➡️ Идем дальше (Шаг 6)", callback_data=f"finish_step5_{pid}"))
-        bot.send_message(chat_id, "Ссылки собраны. Продолжим?", reply_markup=markup)
+        # КНОПКА ПЕРЕХОДА К ПОИСКУ ВНЕШНИХ ССЫЛОК
+        markup.add(types.InlineKeyboardButton("🌐 Часть 2: Найти внешние ссылки", callback_data=f"step5_ext_start_{pid}"))
+        bot.send_message(chat_id, "Внутренняя структура сохранена. Теперь найдем авторитетные источники?", reply_markup=markup)
 
     threading.Thread(target=_scan).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("step5_ext_start_"))
+def step5_start_external_search(call):
+    """Часть 2: Поиск в DuckDuckGo"""
+    try: bot.answer_callback_query(call.id); 
+    except: pass
+    pid = call.data.split("_")[-1]
+    chat_id = call.message.chat.id
+    
+    bot.send_message(chat_id, "🔎 **Часть 2.** Ищу трастовые сайты по вашей тематике в интернете...")
+    
+    def _search_thread():
+        # Получаем тему из ответов пользователя
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
+        info = cur.fetchone()[0] or {}
+        cur.close()
+        conn.close()
+        
+        # Формируем запрос: Тема + "полезные статьи"
+        topic = info.get('survey_step1', 'SEO')
+        query = f"{topic} полезные статьи википедия обзор"
+        
+        # Ищем через наш модуль
+        results = search_relevant_links(query, max_results=6)
+        
+        # Сохраняем во временный кэш
+        SEARCH_CACHE[call.from_user.id] = {'pid': pid, 'links': results}
+        
+        # Отправляем пользователю
+        msg_text = format_search_results(results)
+        
+        # Если ссылок нет - сразу кнопку дальше
+        if not results:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"finish_step5_{pid}"))
+            bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='HTML')
+        else:
+            # Ждем ввода цифр
+            msg = bot.send_message(chat_id, msg_text, parse_mode='HTML', disable_web_page_preview=True)
+            bot.register_next_step_handler(msg, step5_process_selection)
+
+    threading.Thread(target=_search_thread).start()
+
+def step5_process_selection(message):
+    uid = message.from_user.id
+    if uid not in SEARCH_CACHE: return # Если стейт потерян
+
+    user_input = message.text.strip()
+    data = SEARCH_CACHE[uid]
+    pid = data['pid']
+    found_links = data['links']
+    
+    selected_links = []
+
+    if user_input == '0':
+        pass # Ничего не выбрали
+    else:
+        try:
+            # Парсим "1, 3"
+            indices = [int(x.strip()) - 1 for x in user_input.replace('.',',').split(',') if x.strip().isdigit()]
+            for i in indices:
+                if 0 <= i < len(found_links):
+                    selected_links.append(found_links[i])
+        except:
+            bot.send_message(message.chat.id, "⚠️ Не понял цифры. Напишите, например: `1, 2` или `0`.", parse_mode='Markdown')
+            bot.register_next_step_handler(message, step5_process_selection)
+            return
+
+    # Сохраняем в БД
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Берем старые (если были) или перезаписываем
+    cur.execute("UPDATE projects SET approved_external_links=%s WHERE id=%s", (json.dumps(selected_links), pid))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    # Очищаем кэш
+    del SEARCH_CACHE[uid]
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➡️ Идем дальше (Шаг 6)", callback_data=f"finish_step5_{pid}"))
+    bot.send_message(message.chat.id, f"✅ Принято! Добавлено внешних источников: {len(selected_links)}.", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("finish_step5_"))
 def finish_step5_handler(call):
