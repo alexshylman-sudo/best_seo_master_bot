@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-ADMIN_ID = 203473623 # Замените на свой ID
+ADMIN_ID = 203473623  # Вставьте ваш ID
 SUPPORT_ID = 203473623 
 DB_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -250,6 +250,7 @@ def check_site_availability(url):
     except: return False
 
 def update_project_progress(pid, step_key):
+    """Обновляет JSON progress, добавляя новый ключ как выполненный."""
     conn = get_db_connection()
     if not conn: return
     cur = conn.cursor()
@@ -462,6 +463,35 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
         print(f"WP Upload Error: {e}")
         return None, None, f"❌ WP Connection Error: {e}"
 
+# --- HELPER: ARTICLE QUALITY VALIDATION ---
+def validate_article_quality(content_html, project_sitemap_links):
+    errors = []
+    garbage_phrases = ["Here is the article", "Sure, here is", "json", "```", "[Insert link]", "lorem ipsum"]
+    for phrase in garbage_phrases:
+        if phrase.lower() in str(content_html).lower()[:100]: 
+            errors.append(f"Мусорный текст в начале: '{phrase}'")
+        if "```" in str(content_html):
+             errors.append("Остались Markdown символы (```)")
+    soup = BeautifulSoup(content_html, 'html.parser')
+    if not soup.find(['h2', 'h3']):
+        errors.append("Нет подзаголовков (H2/H3).")
+    if len(soup.get_text()) < 500:
+        errors.append("Статья слишком короткая (<500 символов).")
+    links_found = soup.find_all('a', href=True)
+    if links_found:
+        valid_urls = set()
+        for link in project_sitemap_links:
+            clean = link.replace("http://", "").replace("https://", "").rstrip('/')
+            valid_urls.add(clean)
+        for link in links_found:
+            href = link['href']
+            clean_href = href.replace("http://", "").replace("https://", "").rstrip('/')
+            is_external = "wikipedia" in href or "google" in href
+            if not is_external and clean_href not in valid_urls and len(valid_urls) > 0:
+                 if clean_href.count('/') > 1:
+                     errors.append(f"Подозрительная ссылка: {href}")
+    return errors
+
 # --- 5. MENUS & BOT HANDLERS ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -536,14 +566,26 @@ def list_projects(user_id, chat_id):
     bot.send_message(chat_id, "Ваши проекты:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("open_proj_mgmt_"))
-def open_proj_mgmt(call):
+def open_proj_mgmt(call, mode="management", msg_id=None, new_site_url=None):
     """
     DISPATCHER: Checks project progress. If incomplete, forces Wizard flow.
     """
     try: bot.answer_callback_query(call.id)
     except: pass
-    pid = call.data.split("_")[3]
-    USER_CONTEXT[call.from_user.id] = pid
+    
+    # Extract ID
+    if isinstance(call, types.CallbackQuery):
+        pid = call.data.split("_")[3]
+        uid = call.from_user.id
+        chat_id = call.message.chat.id
+        msg_id = call.message.message_id
+    else:
+        # Fallback if called directly (not callback)
+        pid = call.data.split("_")[3] if hasattr(call, 'data') else None
+        uid = call.from_user.id
+        chat_id = call.chat.id
+        
+    USER_CONTEXT[uid] = pid
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -553,7 +595,7 @@ def open_proj_mgmt(call):
     conn.close()
     
     if not res: 
-        bot.send_message(call.message.chat.id, "❌ Проект не найден.")
+        bot.send_message(chat_id, "❌ Проект не найден.")
         return
 
     url = res[0]
@@ -562,55 +604,57 @@ def open_proj_mgmt(call):
     # === WIZARD CHECKPOINTS ===
     # Step 2: Scan
     if not progress.get("step2_scan_done"):
-        send_resume_wizard(call.message.chat.id, pid, 2, "Сканирование сайта", f"step2_retry_{pid}")
+        send_resume_wizard(chat_id, pid, 2, "Сканирование сайта", f"step2_retry_{pid}")
         return
     # Step 3: Survey
     if not progress.get("step3_survey_done"):
-        send_resume_wizard(call.message.chat.id, pid, 3, "Опрос (Брифинг)", f"srv_{pid}")
+        send_resume_wizard(chat_id, pid, 3, "Опрос (Брифинг)", f"srv_{pid}")
         return
     # Step 4: Competitors
     if not progress.get("step4_competitors_done"):
-        send_resume_wizard(call.message.chat.id, pid, 4, "Анализ конкурентов", f"step4_comp_start_{pid}")
+        send_resume_wizard(chat_id, pid, 4, "Анализ конкурентов", f"step4_comp_start_{pid}")
         return
     # Step 5: Links
     if not progress.get("step5_links_done"):
-        send_resume_wizard(call.message.chat.id, pid, 5, "Генерация ссылок", f"step5_links_{pid}")
+        send_resume_wizard(chat_id, pid, 5, "Генерация ссылок", f"step5_links_{pid}")
         return
     # Step 6: Gallery
     if not progress.get("step6_gallery_done"):
-        send_resume_wizard(call.message.chat.id, pid, 6, "Галерея (Референсы)", f"step6_gallery_{pid}")
+        send_resume_wizard(chat_id, pid, 6, "Галерея (Референсы)", f"step6_gallery_{pid}")
         return
     # Step 7: Img Style
     if not progress.get("step7_imgprompts_done"):
-        send_resume_wizard(call.message.chat.id, pid, 7, "Генератор стиля фото", f"step7_imgprompts_{pid}")
+        send_resume_wizard(chat_id, pid, 7, "Генератор стиля фото", f"step7_imgprompts_{pid}")
         return
     # Step 8: Text Style
     if not progress.get("step8_textprompts_done"):
-        send_resume_wizard(call.message.chat.id, pid, 8, "Текстовые настройки", f"step8_textprompts_{pid}")
+        send_resume_wizard(chat_id, pid, 8, "Текстовые настройки", f"step8_textprompts_{pid}")
         return
     # Step 9: CMS
     if not progress.get("step9_cms_done"):
-        send_resume_wizard(call.message.chat.id, pid, 9, "Подключение к сайту", f"step9_cms_{pid}")
+        send_resume_wizard(chat_id, pid, 9, "Подключение к сайту", f"step9_cms_{pid}")
         return
     # Step 10: Article
     if not progress.get("step10_article_done"):
-        send_resume_wizard(call.message.chat.id, pid, 10, "Тестовая статья", f"step10_testart_{pid}")
+        send_resume_wizard(chat_id, pid, 10, "Тестовая статья", f"step10_testart_{pid}")
         return
     # Step 11: Strategy
     if not progress.get("step11_strategy_done"):
-        send_resume_wizard(call.message.chat.id, pid, 11, "Стратегия и План", f"step11_strategy_{pid}")
+        send_resume_wizard(chat_id, pid, 11, "Стратегия и План", f"step11_strategy_{pid}")
         return
 
     # === DASHBOARD (ALL DONE) ===
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("🚀 СТРАТЕГИЯ И СТАТЬИ", callback_data=f"strat_{pid}"))
-    markup.add(types.InlineKeyboardButton("📊 Анализ сайта", callback_data=f"sel_anz_{pid}"))
     markup.add(types.InlineKeyboardButton("⚙️ Настройки проекта", callback_data=f"proj_settings_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back_main"))
     
     safe_url = url.replace("https://", "").replace("http://", "").rstrip('/')
     text = f"📂 **Проект:** {safe_url}\n✅ Настройка завершена.\n\nУправляйте проектом:"
-    bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode='Markdown')
+    try:
+        bot.edit_message_text(text, chat_id, msg_id, reply_markup=markup, parse_mode='Markdown')
+    except:
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
 
 def send_resume_wizard(chat_id, pid, step_num, step_name, callback):
     markup = types.InlineKeyboardMarkup()
@@ -631,7 +675,6 @@ def project_settings_menu(call):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("⚡ Написать тестовую статью", callback_data=f"test_article_{pid}"))
     markup.add(types.InlineKeyboardButton("🧠 База Знаний (Стиль)", callback_data=f"kb_menu_{pid}"))
-    markup.add(types.InlineKeyboardButton("🔑 Ключевые слова", callback_data=f"view_kw_{pid}"))
     markup.add(types.InlineKeyboardButton("🔗 Конкуренты", callback_data=f"step4_comp_start_{pid}"))
     markup.add(types.InlineKeyboardButton("⚙️ CMS (Сайт)", callback_data=f"step9_cms_{pid}"))
     markup.add(types.InlineKeyboardButton("🗑 Удалить проект", callback_data=f"ask_del_{pid}"))
@@ -1244,19 +1287,43 @@ def propose_test_topics(chat_id, pid):
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
-            res = cur.fetchone()[0] or {}
-            prompt = f"Generate 5 blog topics for {res.get('survey_step1','')}. Output JSON array."
+            cur.execute("SELECT info, keywords FROM projects WHERE id=%s", (pid,))
+            res = cur.fetchone()
+            info = res[0] or {}
+            kw = res[1] or ""
+            
+            # IMPROVED PROMPT
+            prompt = (
+                f"Role: SEO Expert. Task: Generate 5 viral blog article titles for this niche: "
+                f"{info.get('survey_step1', 'General')}. "
+                f"Keywords context: {str(kw)[:200]}. "
+                f"Language: Russian. "
+                f"Strict Output Format: JSON Array of Strings ONLY. Example: [\"Title 1\", \"Title 2\"]"
+            )
+            
             resp = get_gemini_response(prompt)
-            topics = clean_and_parse_json(resp) or ["Topic 1", "Topic 2"]
-            res["temp_topics"] = topics
-            cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(res), pid))
+            topics = clean_and_parse_json(resp)
+            
+            # FALLBACK
+            if not topics or not isinstance(topics, list):
+                topics = ["Почему важно SEO?", "Как продвинуть сайт?", "Тренды 2025 года", "Секреты оптимизации", "Ошибки новичков"]
+            
+            # Store temp topics
+            info["temp_topics"] = topics
+            cur.execute("UPDATE projects SET info=%s WHERE id=%s", (json.dumps(info), pid))
             conn.commit()
             cur.close()
             conn.close()
+            
             markup = types.InlineKeyboardMarkup(row_width=1)
             for i, t in enumerate(topics[:5]):
-                markup.add(types.InlineKeyboardButton(t, callback_data=f"write_{pid}_topic_{i}"))
+                # --- FIX 400 ERROR: STRING SANITIZATION ---
+                if isinstance(t, dict): t = list(t.values())[0] # Handle dict case
+                btn_text = str(t).replace('"', '').replace("'", "").strip()
+                if not btn_text: btn_text = f"Вариант {i+1}"
+                if len(btn_text) > 60: btn_text = btn_text[:57] + "..." # Truncate for button limit
+                markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"write_{pid}_topic_{i}"))
+                
             bot.send_message(chat_id, "Выберите тему:", reply_markup=markup)
         except Exception as e: bot.send_message(chat_id, f"Error: {e}")
     threading.Thread(target=_gen).start()
