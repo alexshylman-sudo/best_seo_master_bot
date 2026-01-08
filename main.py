@@ -388,6 +388,52 @@ def get_project_prompt_limit(user_id, tariff):
     if 'start' in t: return 15
     return 5
 
+# --- HELPER: ARTICLE QUALITY VALIDATION ---
+def validate_article_quality(content_html, project_sitemap_links):
+    errors = []
+    
+    # 1. Check for Garbage / Placeholders
+    garbage_phrases = ["Here is the article", "Sure, here is", "json", "```", "[Insert link]", "lorem ipsum"]
+    for phrase in garbage_phrases:
+        if phrase.lower() in str(content_html).lower()[:100]: # Check mostly start
+            errors.append(f"Мусорный текст в начале: '{phrase}'")
+        if "```" in str(content_html):
+             errors.append("Остались Markdown символы (```)")
+
+    # 2. Check HTML Structure
+    soup = BeautifulSoup(content_html, 'html.parser')
+    if not soup.find(['h2', 'h3']):
+        errors.append("Нет подзаголовков (H2/H3).")
+    if len(soup.get_text()) < 500:
+        errors.append("Статья слишком короткая (<500 символов).")
+
+    # 3. Check Internal Links (Hallucinations)
+    links_found = soup.find_all('a', href=True)
+    if not links_found:
+        pass # No links is technically allowed, though not ideal for SEO
+    else:
+        # Prepare sitemap for comparison (strip trailing slashes, protocol)
+        valid_urls = set()
+        for link in project_sitemap_links:
+            clean = link.replace("http://", "").replace("https://", "").rstrip('/')
+            valid_urls.add(clean)
+        
+        for link in links_found:
+            href = link['href']
+            # Only check absolute URLs that look like they belong to the site
+            # For simplicity, we check if the link is NOT in valid_urls but looks like an internal link
+            clean_href = href.replace("http://", "").replace("https://", "").rstrip('/')
+            
+            # If it's a relative link or matches the domain, check validity
+            # (Simplified check: if it's not in sitemap and not a common external site like wiki)
+            is_external = "wikipedia" in href or "google" in href
+            if not is_external and clean_href not in valid_urls and len(valid_urls) > 0:
+                 # Check if it's just a root domain
+                 if clean_href.count('/') > 1: # deeper than root
+                     errors.append(f"Подозрительная ссылка (нет в sitemap): {href}")
+
+    return errors
+
 # --- 5. MENUS ---
 def main_menu_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -1003,7 +1049,7 @@ def show_tariff_periods(user_id):
            "3️⃣ **СЕО Профи** — 2500р/мес\n• 30 генераций\n• Год: 21000р\n\n"
            "4️⃣ **PBN Агент** — 7500р/мес\n• 100 генераций\n• Год: 62999р")
     markup = types.InlineKeyboardMarkup(row_width=1)
-    gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080242.gif"
+    gif_url = "[https://ecosteni.ru/wp-content/uploads/2026/01/202601080242.gif](https://ecosteni.ru/wp-content/uploads/2026/01/202601080242.gif)"
     markup.add(types.InlineKeyboardButton("🏎 Тест-драйв (500р)", callback_data="period_test"))
     markup.add(types.InlineKeyboardButton("📅 На Месяц", callback_data="period_month"))
     markup.add(types.InlineKeyboardButton("📆 На Год (Выгодно)", callback_data="period_year"))
@@ -1593,7 +1639,7 @@ def write_article_handler(call):
     pid = parts[1]
     idx = int(parts[3])
     bot.delete_message(call.message.chat.id, call.message.message_id)
-    gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif"
+    gif_url = "[https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif](https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif)"
     caption = "⏳ Пишу статью..."
     try: bot.send_animation(call.message.chat.id, gif_url, caption=caption, parse_mode='Markdown')
     except: bot.send_message(call.message.chat.id, caption, parse_mode='Markdown')
@@ -1669,7 +1715,7 @@ def rewrite_article(call):
         return
     cur.execute("UPDATE articles SET rewrite_count = rewrite_count + 1 WHERE id=%s", (aid,))
     conn.commit()
-    gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif"
+    gif_url = "[https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif](https://ecosteni.ru/wp-content/uploads/2026/01/202601080219.gif)"
     caption = "⏳ Переписываю..."
     try: bot.send_animation(call.message.chat.id, gif_url, caption=caption, parse_mode='Markdown')
     except: bot.send_message(call.message.chat.id, caption, parse_mode='Markdown')
@@ -1724,75 +1770,208 @@ def pre_approve_check(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
 def approve_publish(call):
     try:
-        bot.answer_callback_query(call.id, "Публикую...")
+        bot.answer_callback_query(call.id, "Проверяю качество...")
     except:
         pass
     aid = call.data.split("_")[1]
-    bot.send_message(call.message.chat.id, "🚀 Публикация... (2-3 мин)")
-    def _pub_process():
+    
+    # --- PHASE 1: SELF-CHECK (BEFORE GENERATION) ---
+    def _validation_phase():
         conn = get_db_connection()
+        if not conn: return
         cur = conn.cursor()
         try:
             cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
             row = cur.fetchone()
+            if not row: return
             pid, title, content, seo_json = row
-            seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
-            cur.execute("SELECT cms_url, cms_login, cms_password, style_prompt, style_negative_prompt FROM projects WHERE id=%s", (pid,))
+            
+            cur.execute("SELECT sitemap_links FROM projects WHERE id=%s", (pid,))
             res = cur.fetchone()
-            if not res:
-                bot.send_message(call.message.chat.id, "❌ Проект не найден.")
-                cur.close()
-                conn.close()
-                return
-            url, login, pwd, project_style, neg_style = res
-            focus_kw = seo_data.get('focus_kw', 'seo-article')
-            img_matches = re.findall(r'\[IMG: (.*?)\]', content)
-            final_content = content
-            for i, prompt in enumerate(img_matches):
-                media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", f"{focus_kw}-{i+1}", project_style, neg_style)
-                if source_url:
-                    img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{focus_kw}" class="wp-image-{media_id}"/></figure>'
-                    final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
-                else:
-                    final_content = final_content.replace(f'[IMG: {prompt}]', '', 1)
-            feat_media_id = None
-            if seo_data.get('featured_img_prompt'):
-                feat_media_id, _, _ = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, f"{focus_kw}-main", project_style, neg_style)
-            creds = f"{login}:{pwd}"
-            token = base64.b64encode(creds.encode()).decode()
-            headers = {'Authorization': 'Basic ' + token, 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
-            post_data = {'title': seo_data.get('seo_title', title), 'content': final_content.replace("\n", "<br>"), 'status': 'publish', 'meta': {'_yoast_wpseo_focuskw': focus_kw}}
-            if feat_media_id: post_data['featured_media'] = feat_media_id
-            r = requests.post(f"{url}/wp-json/wp/v2/posts", headers=headers, json=post_data, timeout=60)
-            if r.status_code == 201:
-                link = r.json().get('link')
-                cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
-                cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
-                left = cur.fetchone()[0]
-                
-                # --- FIXED SYNTAX ERROR HERE ---
-                conn.commit()
-                cur.close()
-                conn.close()
-                
-                try: 
-                    bot.delete_message(call.message.chat.id, call.message.message_id)
-                except: 
-                    pass
-                # -------------------------------
+            sitemap_links = res[0] or []
+            if isinstance(sitemap_links, str): 
+                try: sitemap_links = json.loads(sitemap_links)
+                except: sitemap_links = []
 
-                success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080228.gif"
-                markup_final = types.InlineKeyboardMarkup()
-                markup_final.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
-                try: bot.send_animation(call.message.chat.id, success_gif, caption=f"✅ Успешно! 🔗 {link}\n⚡ Осталось: {left}", reply_markup=markup_final)
-                except: bot.send_message(call.message.chat.id, f"✅ Успешно! 🔗 {link}", reply_markup=markup_final)
-            else: 
-                conn.close()
-                bot.send_message(call.message.chat.id, f"❌ Ошибка WP: {r.status_code}")
-        except Exception as e: 
-            if conn: conn.close()
-            bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
-    threading.Thread(target=_pub_process).start()
+            # 1. Run Validation
+            errors = validate_article_quality(content, sitemap_links)
+            
+            if errors:
+                # FAILURE: Stop and Ask User
+                error_text = "\n".join([f"❌ {e}" for e in errors])
+                msg = f"✋ **Стоп! Я проверил статью и нашел ошибки:**\n\n{error_text}\n\nЯ не хочу публиковать мусор. Дай мне второй шанс исправить это?"
+                
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("🛠 Исправить и Опубликовать", callback_data=f"repair_{aid}"))
+                markup.add(types.InlineKeyboardButton("🔙 Отмена (Вернуть деньги)", callback_data=f"cancel_pub_{aid}"))
+                
+                bot.send_message(call.message.chat.id, msg, reply_markup=markup, parse_mode='Markdown')
+                return # Stop execution here
+            
+            # SUCCESS: Proceed to Publishing Phase
+            start_publishing_phase(call, aid, conn, cur)
+            
+        except Exception as e:
+            print(f"Validation Error: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Ошибка валидации: {e}")
+        finally:
+            cur.close()
+            conn.close()
+
+    threading.Thread(target=_validation_phase).start()
+
+def start_publishing_phase(call, aid, conn, cur):
+    # This runs inside the thread from _validation_phase, so we reuse connection if possible, 
+    # but practically we should just use a fresh one to be safe or pass arguments carefully.
+    # To keep code clean, we will re-fetch minimal data or use passed args.
+    
+    bot.send_message(call.message.chat.id, "✅ Проверка пройдена! Генерация картинок и публикация... (2-3 мин)")
+    
+    try:
+        # Re-fetch is safer for thread stability if logic grew complex
+        cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
+        row = cur.fetchone()
+        pid, title, content, seo_json = row
+        seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
+        
+        cur.execute("SELECT cms_url, cms_login, cms_password, style_prompt, style_negative_prompt FROM projects WHERE id=%s", (pid,))
+        proj_res = cur.fetchone()
+        url, login, pwd, project_style, neg_style = proj_res
+        
+        focus_kw = seo_data.get('focus_kw', 'seo-article')
+        
+        # 1. Images in Text
+        img_matches = re.findall(r'\[IMG: (.*?)\]', content)
+        final_content = content
+        
+        for i, prompt in enumerate(img_matches):
+            media_id, source_url, msg = generate_and_upload_image(url, login, pwd, prompt, f"{focus_kw} {i}", f"{focus_kw}-{i+1}", project_style, neg_style)
+            
+            if not source_url:
+                # FAILURE: Refund and Stop
+                cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
+                conn.commit()
+                bot.send_message(call.message.chat.id, f"⛔ **Публикация отменена!**\n❌ Ошибка генерации картинки: _{msg}_\n\n💰 **Кредит возвращен.**", parse_mode='Markdown')
+                return 
+
+            img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{focus_kw}" class="wp-image-{media_id}"/></figure>'
+            final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
+
+        # 2. Featured Image
+        feat_media_id = None
+        if seo_data.get('featured_img_prompt'):
+            feat_media_id, feat_url, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, f"{focus_kw}-main", project_style, neg_style)
+            
+            if not feat_media_id:
+                # FAILURE: Refund and Stop
+                cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
+                conn.commit()
+                bot.send_message(call.message.chat.id, f"⛔ **Публикация отменена!**\n❌ Ошибка генерации обложки: _{feat_msg}_\n\n💰 **Кредит возвращен.**", parse_mode='Markdown')
+                return
+
+        # 3. Publish to WP
+        creds = f"{login}:{pwd}"
+        token = base64.b64encode(creds.encode()).decode()
+        headers = {'Authorization': 'Basic ' + token, 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
+        post_data = {
+            'title': seo_data.get('seo_title', title), 
+            'content': final_content.replace("\n", "<br>"), 
+            'status': 'publish', 
+            'meta': {'_yoast_wpseo_focuskw': focus_kw}
+        }
+        if feat_media_id: post_data['featured_media'] = feat_media_id
+        
+        r = requests.post(f"{url}/wp-json/wp/v2/posts", headers=headers, json=post_data, timeout=60)
+        
+        if r.status_code == 201:
+            link = r.json().get('link')
+            cur.execute("UPDATE articles SET status='published', published_url=%s WHERE id=%s", (link, aid))
+            cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
+            left = cur.fetchone()[0]
+            conn.commit()
+            
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except: pass
+            
+            success_gif = "[https://ecosteni.ru/wp-content/uploads/2026/01/202601080228.gif](https://ecosteni.ru/wp-content/uploads/2026/01/202601080228.gif)"
+            markup_final = types.InlineKeyboardMarkup()
+            markup_final.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
+            caption = f"✅ Успешно! 🔗 {link}\n⚡ Осталось генераций: {left}"
+            try: bot.send_animation(call.message.chat.id, success_gif, caption=caption, reply_markup=markup_final)
+            except: bot.send_message(call.message.chat.id, caption, reply_markup=markup_final)
+        else:
+            # FAILURE: Refund
+            cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
+            conn.commit()
+            bot.send_message(call.message.chat.id, f"⛔ **Ошибка WordPress!**\nКод: {r.status_code}\n\n💰 **Кредит возвращен.**", parse_mode='HTML')
+
+    except Exception as e:
+        if conn:
+            try:
+                cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
+                conn.commit()
+            except: pass
+        print(f"Pub Error: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Критическая ошибка: {e}\n💰 Кредит возвращен.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("repair_"))
+def repair_article_handler(call):
+    try: bot.answer_callback_query(call.id, "Исправляю..."); except: pass
+    aid = call.data.split("_")[1]
+    
+    bot.edit_message_text("🛠 **Исправляю ошибки ИИ...**\nПодождите, я переписываю проблемные места.", call.message.chat.id, call.message.message_id)
+    
+    def _repair():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
+        row = cur.fetchone()
+        pid, title, content, seo_json = row
+        
+        # Auto-Repair Prompt
+        prompt = f"""
+        TASK: FIX THIS ARTICLE HTML. 
+        Problem: The validation failed (garbage text, broken links, or bad formatting).
+        INPUT HTML: {content}
+        INSTRUCTIONS:
+        1. Remove any conversational filler (e.g. 'Here is the article', 'Sure').
+        2. Ensure only VALID links exist (remove or fix broken internal links).
+        3. Keep the layout Magazine Style.
+        4. RETURN ONLY JSON: {{ "html_content": "..." }}
+        """
+        resp = get_gemini_response(prompt)
+        data = clean_and_parse_json(resp)
+        new_html = data.get("html_content", resp) if data else resp
+        
+        cur.execute("UPDATE articles SET content=%s WHERE id=%s", (new_html, aid))
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        # Retry Publishing (Recursion back to Approve)
+        call.data = f"approve_{aid}"
+        approve_publish(call)
+        
+    threading.Thread(target=_repair).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_pub_"))
+def cancel_publish_handler(call):
+    try: bot.answer_callback_query(call.id, "Отменено"); except: pass
+    aid = call.data.split("_")[2]
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Refund
+    cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
+    cur.execute("SELECT project_id FROM articles WHERE id=%s", (aid,))
+    pid = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    bot.edit_message_text("❌ Публикация отменена.\n💰 **Кредит возвращен на баланс.**", call.message.chat.id, call.message.message_id)
+    time.sleep(2)
+    open_project_menu(call.message.chat.id, pid)
 
 def run_scheduler():
     while True: time.sleep(60)
