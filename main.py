@@ -68,7 +68,6 @@ def patch_db_schema():
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_images JSONB DEFAULT '[]'")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS approved_prompts JSONB DEFAULT '[]'")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS prompt_gens_count INT DEFAULT 0")
-        # --- NEW COLUMNS FOR LINKS ---
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS approved_internal_links JSONB DEFAULT '[]'")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS approved_external_links JSONB DEFAULT '[]'")
         conn.commit()
@@ -237,13 +236,11 @@ def check_site_availability(url):
 def parse_sitemap(url):
     links = []
     try:
-        # Пробуем разные варианты sitemap
         sitemap_urls = [
             url.rstrip('/') + '/sitemap.xml',
             url.rstrip('/') + '/sitemap_index.xml',
             url.rstrip('/') + '/wp-sitemap.xml'
         ]
-        
         target_sitemap = None
         for s_url in sitemap_urls:
             try:
@@ -252,7 +249,6 @@ def parse_sitemap(url):
                     target_sitemap = s_url
                     break
             except: continue
-            
         if not target_sitemap:
             return parse_html_links(url)
 
@@ -261,19 +257,13 @@ def parse_sitemap(url):
             try:
                 resp = requests.get(xml_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
                 if resp.status_code != 200: return []
-                
                 root = ET.fromstring(resp.content)
-                # Удаляем namespaces
                 for elem in root.iter():
                     if '}' in elem.tag: elem.tag = elem.tag.split('}', 1)[1]
-                
-                # Ищем вложенные карты
                 for sm in root.findall('sitemap'):
                     loc = sm.find('loc')
                     if loc is not None and loc.text:
                         found.extend(fetch_sitemap_recursive(loc.text))
-                
-                # Ищем ссылки
                 for u in root.findall('url'):
                     loc = u.find('loc')
                     if loc is not None and loc.text:
@@ -282,10 +272,8 @@ def parse_sitemap(url):
             return found
 
         links = fetch_sitemap_recursive(target_sitemap)
-        
         if not links:
             links = parse_html_links(url)
-            
         clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', '.pdf', 'wp-admin', 'feed', '.xml', 'sitemap'])]
         return clean_links[:100]
     except: return []
@@ -306,22 +294,16 @@ def parse_html_links(url):
 # --- CONTACTS EXTRACTION ---
 def extract_contacts_from_soup(soup):
     contacts = []
-    # 1. Ищем Email
     emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', soup.get_text())
     if emails: contacts.append(f"Email: {emails[0]}")
-    
-    # 2. Ищем Телефоны
     phones = re.findall(r'(?:\+7|8)[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}', soup.get_text())
     if phones: contacts.append(f"Phone: {phones[0]}")
-    
-    # 3. Ищем Адрес
     address_keywords = ["г.", "ул.", "город", "проспект", "шоссе", "Address", "Location"]
     text_blocks = soup.get_text().split('\n')
     for line in text_blocks:
         if any(x in line for x in address_keywords) and len(line) < 100 and len(line) > 10:
             contacts.append(f"Address: {line.strip()}")
             break
-            
     return "\n".join(list(set(contacts)))
 
 def deep_analyze_site(url):
@@ -329,15 +311,10 @@ def deep_analyze_site(url):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
         resp = requests.get(url, timeout=15, headers=headers)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        
         title = soup.title.string if soup.title else "No Title"
         desc = soup.find("meta", attrs={"name": "description"})
         desc = desc["content"] if desc else "No Description"
-        
-        # --- Поиск контактов ---
         contact_info = extract_contacts_from_soup(soup)
-        
-        # Если пусто, ищем страницу контактов
         if "Phone" not in contact_info:
             for a in soup.find_all('a', href=True):
                 href = a['href'].lower()
@@ -350,12 +327,9 @@ def deep_analyze_site(url):
                         contact_info += "\n" + more_contacts
                         break
                     except: pass
-
         raw_text = soup.get_text()[:4000].strip()
-        
         result_text = f"URL: {url}\nTitle: {title}\nDesc: {desc}\nREAL_CONTACTS_DATA: {contact_info}\nContent: {raw_text}"
         return result_text, []
-        
     except Exception as e: return f"Error: {e}", []
 
 def update_project_progress(pid, step_key):
@@ -485,32 +459,23 @@ def get_project_prompt_limit(user_id, tariff):
 # --- HELPER: ARTICLE QUALITY VALIDATION ---
 def validate_article_quality(content_html, project_sitemap_links):
     errors = []
-    
-    # 1. Garbage
     garbage_phrases = ["Here is the article", "Sure, here is", "json", "```", "[Insert link]", "lorem ipsum"]
     for phrase in garbage_phrases:
         if phrase.lower() in str(content_html).lower()[:100]: 
             errors.append(f"Мусорный текст в начале: '{phrase}'")
         if "```" in str(content_html):
              errors.append("Остались Markdown символы (```)")
-
-    # 2. Structure
     soup = BeautifulSoup(content_html, 'html.parser')
     if not soup.find(['h2', 'h3']):
         errors.append("Нет подзаголовков (H2/H3).")
     if len(soup.get_text()) < 500:
         errors.append("Статья слишком короткая (<500 символов).")
-
-    # 3. Links
     links_found = soup.find_all('a', href=True)
-    if not links_found:
-        pass 
-    else:
+    if links_found:
         valid_urls = set()
         for link in project_sitemap_links:
             clean = link.replace("http://", "").replace("https://", "").rstrip('/')
             valid_urls.add(clean)
-        
         for link in links_found:
             href = link['href']
             clean_href = href.replace("http://", "").replace("https://", "").rstrip('/')
@@ -518,7 +483,6 @@ def validate_article_quality(content_html, project_sitemap_links):
             if not is_external and clean_href not in valid_urls and len(valid_urls) > 0:
                  if clean_href.count('/') > 1:
                      errors.append(f"Подозрительная ссылка: {href}")
-
     return errors
 
 # --- 5. MENUS ---
@@ -747,7 +711,7 @@ def cms_save_password_step(message, pid):
     bot.send_message(message.chat.id, "✅ CMS данные сохранены!")
     open_project_menu(message.chat.id, pid)
 
-# --- KNOWLEDGE BASE HANDLERS ---
+# --- KNOWLEDGE BASE HANDLERS (RESTRUCTURED) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_menu_"))
 def kb_menu(call):
     try:
@@ -756,55 +720,55 @@ def kb_menu(call):
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT style_prompt, style_images, style_negative_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
+    cur.execute("SELECT approved_prompts, style_images FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close()
     conn.close()
-    style_text = res[0] or "Не задан"; images = res[1] or []; neg_prompt = res[2] or "Не задан"; app_p = res[3] or []
-    msg = (f"🧠 **База Знаний**\n\n🎨 **Промпт:** _{escape_md(style_text)}_\n🚫 **Анти-промпт:** _{escape_md(neg_prompt)}_\n"
-           f"🖼 **Фото:** {len(images)}/30.\n✅ **Утвержденных промптов:** {len(app_p)}")
+    
+    app_p = res[0] or []
+    images = res[1] or []
+    
+    msg = (f"🧠 **База Знаний**\n\n"
+           f"Здесь вы управляете стилем и ссылками для статей.\n\n"
+           f"✅ Утверждено промптов: {len(app_p)}\n"
+           f"🖼 Загружено фото (референсов): {len(images)}")
+    
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔗 Ссылки (Link Building)", callback_data=f"kb_links_menu_{pid}"))
-    markup.add(types.InlineKeyboardButton("🎨 Генератор промптов (из ваших фото)", callback_data=f"kb_prompt_gen_menu_{pid}"))
-    markup.add(types.InlineKeyboardButton("🎨 Промпт для изображений", callback_data=f"kb_set_text_{pid}"))
-    markup.add(types.InlineKeyboardButton("🚫 Анти-промпт (Запрет)", callback_data=f"kb_set_negative_{pid}"))
-    markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
-    if images:
-        markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
-        markup.add(types.InlineKeyboardButton("🗑 Очистить все фото", callback_data=f"kb_clear_photos_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔗 Генератор ссылок", callback_data=f"kb_links_menu_{pid}"))
+    markup.add(types.InlineKeyboardButton("🎨 Генератор промптов (Изображения)", callback_data=f"kb_prompt_gen_menu_{pid}"))
+    markup.add(types.InlineKeyboardButton("📝 Генератор текстовых промптов", callback_data=f"kb_text_menu_{pid}"))
+    markup.add(types.InlineKeyboardButton("🖼 Галерея", callback_data=f"kb_gallery_main_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
-    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    
+    try:
+        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    except:
+        bot.send_message(call.message.chat.id, msg, reply_markup=markup, parse_mode='Markdown')
 
-# --- LINKS MANAGEMENT ---
+# --- KB: LINKS GENERATOR ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_links_menu_"))
 def kb_links_menu(call):
     try:
         bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[3]
-    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT approved_internal_links, approved_external_links FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close()
     conn.close()
-    
     int_links = res[0] or []
     ext_links = res[1] or []
-    
     msg = (f"🔗 **Управление ссылками**\n\n"
-           f"🏠 **Внутренние (с вашего сайта):** {len(int_links)} шт.\n"
-           f"🌍 **Внешние (авторитетные):** {len(ext_links)} шт.\n\n"
-           f"Эти ссылки будут использоваться при написании статей.")
-    
+           f"🏠 **Внутренние:** {len(int_links)} шт.\n"
+           f"🌍 **Внешние:** {len(ext_links)} шт.")
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔄 Ген. Внутренние", callback_data=f"kb_gen_int_{pid}"),
                types.InlineKeyboardButton("🌍 Ген. Внешние", callback_data=f"kb_gen_ext_{pid}"))
     markup.add(types.InlineKeyboardButton("📂 Загрузить Внутренние (.txt)", callback_data=f"kb_up_int_{pid}"),
                types.InlineKeyboardButton("📂 Загрузить Внешние (.txt)", callback_data=f"kb_up_ext_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
-    
     bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_int_"))
@@ -814,7 +778,6 @@ def kb_gen_internal(call):
     except: pass
     pid = call.data.split("_")[3]
     bot.send_message(call.message.chat.id, "⏳ Сканирую карту сайта (рекурсивно)...")
-    
     def _scan():
         conn = get_db_connection()
         cur = conn.cursor()
@@ -822,21 +785,16 @@ def kb_gen_internal(call):
         url = cur.fetchone()[0]
         cur.close()
         conn.close()
-        
         links = parse_sitemap(url)
         clean_links = [l for l in links if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed', '.xml'])]
         clean_links = clean_links[:50] 
-        
         TEMP_LINKS[f"int_{pid}"] = clean_links
-        
         msg = f"✅ Найдено {len(clean_links)} ссылок.\n\n" + "\n".join(clean_links[:10]) + ("\n..." if len(clean_links) > 10 else "")
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("✅ Утвердить все", callback_data=f"kb_save_int_{pid}"),
                    types.InlineKeyboardButton("📄 Скачать .txt", callback_data=f"kb_dl_temp_int_{pid}"))
         markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_links_menu_{pid}"))
-        
         bot.send_message(call.message.chat.id, msg, reply_markup=markup, disable_web_page_preview=True)
-        
     threading.Thread(target=_scan).start()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_ext_"))
@@ -846,7 +804,6 @@ def kb_gen_external(call):
     except: pass
     pid = call.data.split("_")[3]
     bot.send_message(call.message.chat.id, "⏳ Подбираю качественные статьи...")
-    
     def _ai_search():
         conn = get_db_connection()
         cur = conn.cursor()
@@ -854,34 +811,19 @@ def kb_gen_external(call):
         res = cur.fetchone()
         cur.close()
         conn.close()
-        
         info = res[0] or {}
         kw = res[1] or ""
-        
-        prompt = f"""
-        Role: SEO Expert. Topic: {info.get('survey_step1', 'General')}. Keywords: {kw[:200]}.
-        Task: Find 10-15 SPECIFIC URLs to articles on high-authority websites.
-        STRICT RULES:
-        1. NO homepage URLs. Give deep links to specific articles.
-        2. URLs must look valid.
-        3. Mix of Russian and English.
-        4. Output format: Just the list of URLs.
-        """
-        
+        prompt = f"""Role: SEO Expert. Topic: {info.get('survey_step1', 'General')}. Keywords: {kw[:200]}. Task: Find 10-15 SPECIFIC URLs to articles on high-authority websites. STRICT RULES: 1. NO homepage URLs. Give deep links to specific articles. 2. URLs must look valid. 3. Mix of Russian and English. 4. Output format: Just the list of URLs."""
         text = get_gemini_response(prompt)
         links = re.findall(r'https?://[^\s\n,"]+', text)
         clean_links = [l for l in list(set(links)) if len(l.split('/')) > 3][:15]
-        
         TEMP_LINKS[f"ext_{pid}"] = clean_links
-        
         msg = f"🌍 Предлагаю {len(clean_links)} ресурсов:\n\n" + "\n".join(clean_links[:10]) + ("\n..." if len(clean_links) > 10 else "")
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("✅ Утвердить все", callback_data=f"kb_save_ext_{pid}"),
                    types.InlineKeyboardButton("📄 Скачать .txt", callback_data=f"kb_dl_temp_ext_{pid}"))
         markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_links_menu_{pid}"))
-        
         bot.send_message(call.message.chat.id, msg, reply_markup=markup, disable_web_page_preview=True)
-        
     threading.Thread(target=_ai_search).start()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_save_"))
@@ -892,7 +834,6 @@ def kb_save_links(call):
     parts = call.data.split("_")
     type_ = parts[2]
     pid = parts[3]
-    
     key = f"{type_}_{pid}"
     if key in TEMP_LINKS:
         links = TEMP_LINKS[key]
@@ -917,7 +858,6 @@ def kb_dl_temp(call):
     type_ = parts[3]
     pid = parts[4]
     key = f"{type_}_{pid}"
-    
     if key in TEMP_LINKS:
         data = "\n".join(TEMP_LINKS[key])
         file = io.BytesIO(data.encode('utf-8'))
@@ -947,7 +887,6 @@ def handle_docs(message):
             bot.send_message(message.chat.id, "❌ Нужен файл .txt")
             return
         bot.send_message(message.chat.id, "⏳ Проверяю валидность (игнорирую блокировки ботов)...")
-        
         def _process_file():
             try:
                 file_info = bot.get_file(message.document.file_id)
@@ -957,7 +896,6 @@ def handle_docs(message):
                 valid_links = []
                 errors = []
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/115.0.0.0 Safari/537.36"}
-                
                 for link in raw_links:
                     if not link.startswith('http'):
                         errors.append(f"❌ Формат: {link[:30]}...")
@@ -974,11 +912,9 @@ def handle_docs(message):
                                 errors.append(f"❌ {r.status_code}: {link}")
                     except:
                         errors.append(f"❌ Ошибка сети: {link}")
-                
                 if not valid_links:
                     bot.send_message(message.chat.id, "❌ Нет рабочих ссылок.")
                     return
-
                 col = "approved_internal_links" if link_type == "int" else "approved_external_links"
                 conn = get_db_connection()
                 cur = conn.cursor()
@@ -986,7 +922,6 @@ def handle_docs(message):
                 conn.commit()
                 cur.close()
                 conn.close()
-                
                 del LINK_UPLOAD_STATE[message.from_user.id]
                 msg = f"✅ Сохранено: {len(valid_links)} шт."
                 if errors: msg += f"\n⚠️ Не прошли: {len(errors)}"
@@ -995,14 +930,131 @@ def handle_docs(message):
                 bot.send_message(message.chat.id, msg, reply_markup=markup)
             except Exception as e:
                 bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-        
         threading.Thread(target=_process_file).start()
         return
-
     if message.from_user.id in UPLOAD_STATE:
         handle_photo_upload(message)
 
-# --- PROMPTS/PHOTOS ---
+# --- KB: TEXT PROMPT GENERATOR (NEW) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_text_menu_"))
+def kb_text_menu(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[3]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT style_prompt, style_negative_prompt FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    style = res[0] or "Не задан"
+    neg_style = res[1] or "Не задан"
+    
+    msg = (f"📝 **Генератор текстовых промптов**\n\n"
+           f"Это **общие настройки стиля** для всех генерируемых изображений вашего проекта (теги качества, освещение, стиль).\n\n"
+           f"✅ **Текущий стиль:**\n_{escape_md(style)}_\n\n"
+           f"🚫 **Запрещено (Negative):**\n_{escape_md(neg_style)}_")
+           
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✏️ Изменить Позитивный (Вручную)", callback_data=f"kb_set_text_{pid}"))
+    markup.add(types.InlineKeyboardButton("✏️ Изменить Негативный (Вручную)", callback_data=f"kb_set_negative_{pid}"))
+    markup.add(types.InlineKeyboardButton("✨ Авто-подбор (AI)", callback_data=f"kb_auto_style_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
+    
+    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_auto_style_"))
+def kb_auto_style_gen(call):
+    try:
+        bot.answer_callback_query(call.id, "Генерирую...")
+    except: pass
+    pid = call.data.split("_")[3]
+    bot.send_message(call.message.chat.id, "⏳ ИИ подбирает лучшие теги стиля для вашей ниши...")
+    
+    def _gen_style():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
+        info = cur.fetchone()[0] or {}
+        niche = info.get("survey_step1", "General Website")
+        
+        prompt = f"""
+        Act as an Expert AI Art Prompter.
+        Topic: {niche}.
+        Task: Create a list of GENERAL style modifiers for high-quality images.
+        Rules:
+        1. Output ONLY two strings separated by '|||'.
+        2. First string: Positive prompt (e.g., "Photorealistic, 8k, cinematic lighting, high detail, professional photography").
+        3. Second string: Negative prompt (e.g., "Blurry, low quality, distorted, watermark, text").
+        4. English language only.
+        """
+        resp = get_gemini_response(prompt)
+        try:
+            parts = resp.split('|||')
+            if len(parts) == 2:
+                pos = parts[0].strip()
+                neg = parts[1].strip()
+                cur.execute("UPDATE projects SET style_prompt=%s, style_negative_prompt=%s WHERE id=%s", (pos, neg, pid))
+                conn.commit()
+                msg = f"✅ **Стиль обновлен!**\n\n**Pos:** {pos}\n\n**Neg:** {neg}"
+            else:
+                msg = "⚠️ Ошибка формата ответа ИИ."
+        except Exception as e:
+            msg = f"Ошибка: {e}"
+        finally:
+            cur.close()
+            conn.close()
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 Меню текста", callback_data=f"kb_text_menu_{pid}"))
+        bot.send_message(call.message.chat.id, msg, reply_markup=markup)
+        
+    threading.Thread(target=_gen_style).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_text_"))
+def kb_set_text(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[3]
+    msg = bot.send_message(call.message.chat.id, "📝 Введите **позитивный промпт** (теги стиля через запятую, на английском):")
+    bot.register_next_step_handler(msg, save_kb_text, pid)
+
+def save_kb_text(message, pid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE projects SET style_prompt=%s WHERE id=%s", (message.text, pid))
+    conn.commit()
+    cur.close()
+    conn.close()
+    bot.send_message(message.chat.id, "✅ Сохранено!")
+    kb_text_menu_wrapper(message.chat.id, pid)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_negative_"))
+def kb_set_negative(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[3]
+    msg = bot.send_message(call.message.chat.id, "🚫 Введите **негативный промпт** (чего не должно быть, на английском):")
+    bot.register_next_step_handler(msg, save_kb_negative, pid)
+
+def save_kb_negative(message, pid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE projects SET style_negative_prompt=%s WHERE id=%s", (message.text, pid))
+    conn.commit()
+    cur.close()
+    conn.close()
+    bot.send_message(message.chat.id, "✅ Сохранено!")
+    kb_text_menu_wrapper(message.chat.id, pid)
+
+def kb_text_menu_wrapper(chat_id, pid):
+    kb_text_menu(types.CallbackQuery(id='0', from_user=types.User(chat_id, False, 'u'), data=f"kb_text_menu_{pid}", message=types.Message(0, None, None, types.Chat(chat_id, 'private'), 'text', {}, '')))
+
+# --- KB: PROMPT GENERATOR (VISION) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_prompt_gen_menu_"))
 def kb_prompt_gen_menu(call):
     try:
@@ -1025,7 +1077,7 @@ def kb_prompt_gen_menu(call):
     else:
         markup.add(types.InlineKeyboardButton("🔒 Лимит исчерпан", callback_data="none"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
-    bot.edit_message_text(f"🎨 **Генератор промптов**\n\n📊 **Генераций: {used} / {limit}**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    bot.edit_message_text(f"🎨 **Генератор промптов (Vision)**\n\nИИ анализирует ваши фото из Галереи и создает описание стиля.\n\n📊 **Генераций: {used} / {limit}**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_new_prompt_"))
 def kb_gen_new_prompt(call):
@@ -1051,13 +1103,13 @@ def kb_gen_new_prompt(call):
     if len(images_b64) < 1:
         cur.close()
         conn.close()
-        bot.send_message(call.message.chat.id, "⚠️ Загрузите фото!")
+        bot.send_message(call.message.chat.id, "⚠️ Сначала загрузите фото в Галерею!")
         return
     cur.execute("UPDATE projects SET prompt_gens_count = prompt_gens_count + 1 WHERE id = %s", (pid,))
     conn.commit()
     cur.close()
     conn.close()
-    bot.send_message(call.message.chat.id, "⏳ Анализирую стиль...")
+    bot.send_message(call.message.chat.id, "⏳ Анализирую стиль по фото из Галереи...")
     try:
         content_parts = []
         instruction = f"Role: Expert AI Image Prompt Engineer. Context: {info.get('survey_step1', 'General')}. Analyze images. Create English Prompt."
@@ -1111,43 +1163,28 @@ def kb_approve_prompt(call):
     else:
         bot.send_message(call.message.chat.id, "⚠️ Устарело.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_text_"))
-def kb_set_text(call):
+# --- KB: GALLERY (NEW) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gallery_main_"))
+def kb_gallery_main(call):
     try:
         bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "📝 Введите промпт:")
-    bot.register_next_step_handler(msg, save_kb_text, pid)
-
-def save_kb_text(message, pid):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE projects SET style_prompt=%s WHERE id=%s", (message.text, pid))
-    conn.commit()
+    cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
+    images = cur.fetchone()[0] or []
     cur.close()
     conn.close()
-    bot.send_message(message.chat.id, "✅ Сохранено!")
-    kb_menu_wrapper(message.chat.id, pid)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_negative_"))
-def kb_set_negative(call):
-    try:
-        bot.answer_callback_query(call.id)
-    except: pass
-    pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "🚫 Введите анти-промпт:")
-    bot.register_next_step_handler(msg, save_kb_negative, pid)
-
-def save_kb_negative(message, pid):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE projects SET style_negative_prompt=%s WHERE id=%s", (message.text, pid))
-    conn.commit()
-    cur.close()
-    conn.close()
-    bot.send_message(message.chat.id, "✅ Сохранено!")
-    kb_menu_wrapper(message.chat.id, pid)
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("➕ Добавить фото", callback_data=f"kb_add_photo_{pid}"))
+    if images:
+        markup.add(types.InlineKeyboardButton("📂 Просмотр списка", callback_data=f"kb_gallery_view_{pid}"))
+        markup.add(types.InlineKeyboardButton("🗑 Очистить все фото", callback_data=f"kb_clear_photos_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
+    
+    bot.edit_message_text(f"🖼 **Галерея референсов**\n\nВсего загружено: {len(images)}/30.", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_add_photo_"))
 def kb_add_photo(call):
@@ -1156,7 +1193,7 @@ def kb_add_photo(call):
     except: pass
     pid = call.data.split("_")[3]
     UPLOAD_STATE[call.from_user.id] = pid
-    bot.send_message(call.message.chat.id, "🖼 Отправьте фото.")
+    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (референс стиля).")
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo_upload(message):
@@ -1184,17 +1221,17 @@ def handle_photo_upload(message):
             conn.close()
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("➕ Еще", callback_data=f"kb_add_photo_{pid}"),
-                       types.InlineKeyboardButton("🔙 Меню", callback_data=f"kb_menu_{pid}"))
+                       types.InlineKeyboardButton("🔙 Галерея", callback_data=f"kb_gallery_main_{pid}"))
             bot.reply_to(message, f"✅ Фото №{len(images)} сохранено", reply_markup=markup)
         except Exception as e: print(f"Upload Error: {e}")
     threading.Thread(target=_save_photo).start()
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gallery_"))
-def kb_gallery(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gallery_view_"))
+def kb_gallery_view_list(call):
     try:
         bot.answer_callback_query(call.id)
     except: pass
-    pid = call.data.split("_")[2]
+    pid = call.data.split("_")[3]
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
@@ -1205,8 +1242,8 @@ def kb_gallery(call):
     btns = []
     for i in range(len(images)): btns.append(types.InlineKeyboardButton(f"Фото {i+1}", callback_data=f"kb_view_{pid}_{i}"))
     markup.add(*btns)
-    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
-    msg_text = f"📁 **Галерея ({len(images)} фото)**"
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_gallery_main_{pid}"))
+    msg_text = f"📁 **Список фото ({len(images)})**"
     try: bot.edit_message_text(text=msg_text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode='Markdown')
     except: bot.send_message(chat_id=call.message.chat.id, text=msg_text, reply_markup=markup, parse_mode='Markdown')
 
@@ -1226,13 +1263,12 @@ def kb_view_photo(call):
     conn.close()
     if idx >= len(images): 
         bot.send_message(call.message.chat.id, "❌ Удалено.")
-        kb_gallery(call)
         return
     b64_data = images[idx]
     img_bytes = base64.b64decode(b64_data)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"kb_del_{pid}_{idx}"))
-    markup.add(types.InlineKeyboardButton("🔙 Галерея", callback_data=f"kb_gallery_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 Список", callback_data=f"kb_gallery_view_{pid}"))
     try: bot.send_photo(call.message.chat.id, img_bytes, caption=f"🖼 Фото #{idx+1}", reply_markup=markup)
     except Exception as e: bot.send_message(call.message.chat.id, "❌ Ошибка.")
 
@@ -1259,7 +1295,8 @@ def kb_delete_single(call):
         bot.send_message(call.message.chat.id, f"✅ Удалено.")
     cur.close()
     conn.close()
-    kb_gallery(call)
+    # Возврат в список
+    kb_gallery_view_list(types.CallbackQuery(id='0', from_user=types.User(call.message.chat.id, False, 'u'), data=f"kb_gallery_view_{pid}", message=call.message))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_clear_photos_"))
 def kb_clear_photos(call):
@@ -1273,7 +1310,7 @@ def kb_clear_photos(call):
     conn.commit()
     cur.close()
     conn.close()
-    kb_menu(call)
+    kb_gallery_main(call)
 
 def kb_menu_wrapper(chat_id, pid):
     kb_menu(types.CallbackQuery(id='0', from_user=types.User(chat_id, False, 'u'), data=f"kb_menu_{pid}", message=types.Message(0, None, None, types.Chat(chat_id, 'private'), 'text', {}, '')))
