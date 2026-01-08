@@ -233,30 +233,74 @@ def check_site_availability(url):
         return response.status_code == 200
     except: return False
 
+# --- RECURSIVE SITEMAP PARSER ---
 def parse_sitemap(url):
     links = []
     try:
-        sitemap_url = url.rstrip('/') + '/sitemap.xml'
-        resp = requests.get(sitemap_url, timeout=10)
-        if resp.status_code == 200:
-            try:
-                root = ET.fromstring(resp.content)
-                ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-                for url_tag in root.findall('.//s:loc', ns): links.append(url_tag.text)
-                if not links:
-                    for url_tag in root.findall('.//loc'): links.append(url_tag.text)
-            except: pass
-        if not links:
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            domain = urlparse(url).netloc
-            for a in soup.find_all('a', href=True):
-                full_url = urljoin(url, a['href'])
-                if urlparse(full_url).netloc == domain: links.append(full_url)
+        # Пробуем разные варианты sitemap
+        sitemap_urls = [
+            url.rstrip('/') + '/sitemap.xml',
+            url.rstrip('/') + '/sitemap_index.xml',
+            url.rstrip('/') + '/wp-sitemap.xml'
+        ]
         
-        # --- FIXED: Strict filter for clean links ---
-        clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed', '.xml', 'sitemap'])]
+        target_sitemap = None
+        for s_url in sitemap_urls:
+            try:
+                r = requests.get(s_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200:
+                    target_sitemap = s_url
+                    break
+            except: continue
+            
+        if not target_sitemap:
+            return parse_html_links(url)
+
+        def fetch_sitemap_recursive(xml_url):
+            found = []
+            try:
+                resp = requests.get(xml_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code != 200: return []
+                
+                root = ET.fromstring(resp.content)
+                # Удаляем namespaces
+                for elem in root.iter():
+                    if '}' in elem.tag: elem.tag = elem.tag.split('}', 1)[1]
+                
+                # Ищем вложенные карты
+                for sm in root.findall('sitemap'):
+                    loc = sm.find('loc')
+                    if loc is not None and loc.text:
+                        found.extend(fetch_sitemap_recursive(loc.text))
+                
+                # Ищем ссылки
+                for u in root.findall('url'):
+                    loc = u.find('loc')
+                    if loc is not None and loc.text:
+                        found.append(loc.text)
+            except: pass
+            return found
+
+        links = fetch_sitemap_recursive(target_sitemap)
+        
+        if not links:
+            links = parse_html_links(url)
+            
+        clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', '.pdf', 'wp-admin', 'feed', '.xml', 'sitemap'])]
         return clean_links[:100]
+    except: return []
+
+def parse_html_links(url):
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        domain = urlparse(url).netloc
+        local_links = []
+        for a in soup.find_all('a', href=True):
+            full_url = urljoin(url, a['href'])
+            if urlparse(full_url).netloc == domain:
+                local_links.append(full_url)
+        return local_links
     except: return []
 
 # --- CONTACTS EXTRACTION ---
@@ -266,17 +310,17 @@ def extract_contacts_from_soup(soup):
     emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', soup.get_text())
     if emails: contacts.append(f"Email: {emails[0]}")
     
-    # 2. Ищем Телефоны (улучшенный regex для РФ/СНГ)
+    # 2. Ищем Телефоны
     phones = re.findall(r'(?:\+7|8)[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}', soup.get_text())
     if phones: contacts.append(f"Phone: {phones[0]}")
     
-    # 3. Ищем Адрес (по ключевым словам)
+    # 3. Ищем Адрес
     address_keywords = ["г.", "ул.", "город", "проспект", "шоссе", "Address", "Location"]
     text_blocks = soup.get_text().split('\n')
     for line in text_blocks:
         if any(x in line for x in address_keywords) and len(line) < 100 and len(line) > 10:
             contacts.append(f"Address: {line.strip()}")
-            break # Берем первый найденный
+            break
             
     return "\n".join(list(set(contacts)))
 
@@ -290,10 +334,10 @@ def deep_analyze_site(url):
         desc = soup.find("meta", attrs={"name": "description"})
         desc = desc["content"] if desc else "No Description"
         
-        # --- NEW: Пытаемся найти страницу контактов ---
+        # --- Поиск контактов ---
         contact_info = extract_contacts_from_soup(soup)
         
-        # Если на главной мало контактов, ищем ссылку на /contacts
+        # Если пусто, ищем страницу контактов
         if "Phone" not in contact_info:
             for a in soup.find_all('a', href=True):
                 href = a['href'].lower()
@@ -309,7 +353,6 @@ def deep_analyze_site(url):
 
         raw_text = soup.get_text()[:4000].strip()
         
-        # Возвращаем расширенные данные
         result_text = f"URL: {url}\nTitle: {title}\nDesc: {desc}\nREAL_CONTACTS_DATA: {contact_info}\nContent: {raw_text}"
         return result_text, []
         
@@ -443,27 +486,26 @@ def get_project_prompt_limit(user_id, tariff):
 def validate_article_quality(content_html, project_sitemap_links):
     errors = []
     
-    # 1. Check for Garbage / Placeholders
+    # 1. Garbage
     garbage_phrases = ["Here is the article", "Sure, here is", "json", "```", "[Insert link]", "lorem ipsum"]
     for phrase in garbage_phrases:
-        if phrase.lower() in str(content_html).lower()[:100]: # Check mostly start
+        if phrase.lower() in str(content_html).lower()[:100]: 
             errors.append(f"Мусорный текст в начале: '{phrase}'")
         if "```" in str(content_html):
              errors.append("Остались Markdown символы (```)")
 
-    # 2. Check HTML Structure
+    # 2. Structure
     soup = BeautifulSoup(content_html, 'html.parser')
     if not soup.find(['h2', 'h3']):
         errors.append("Нет подзаголовков (H2/H3).")
     if len(soup.get_text()) < 500:
         errors.append("Статья слишком короткая (<500 символов).")
 
-    # 3. Check Internal Links (Hallucinations)
+    # 3. Links
     links_found = soup.find_all('a', href=True)
     if not links_found:
-        pass # No links is technically allowed, though not ideal for SEO
+        pass 
     else:
-        # Prepare sitemap for comparison (strip trailing slashes, protocol)
         valid_urls = set()
         for link in project_sitemap_links:
             clean = link.replace("http://", "").replace("https://", "").rstrip('/')
@@ -471,17 +513,11 @@ def validate_article_quality(content_html, project_sitemap_links):
         
         for link in links_found:
             href = link['href']
-            # Only check absolute URLs that look like they belong to the site
-            # For simplicity, we check if the link is NOT in valid_urls but looks like an internal link
             clean_href = href.replace("http://", "").replace("https://", "").rstrip('/')
-            
-            # If it's a relative link or matches the domain, check validity
-            # (Simplified check: if it's not in sitemap and not a common external site like wiki)
             is_external = "wikipedia" in href or "google" in href
             if not is_external and clean_href not in valid_urls and len(valid_urls) > 0:
-                 # Check if it's just a root domain
-                 if clean_href.count('/') > 1: # deeper than root
-                     errors.append(f"Подозрительная ссылка (нет в sitemap): {href}")
+                 if clean_href.count('/') > 1:
+                     errors.append(f"Подозрительная ссылка: {href}")
 
     return errors
 
@@ -654,8 +690,7 @@ def open_project_menu(chat_id, pid, mode="management", msg_id=None, new_site_url
 def open_proj_mgmt(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
     USER_CONTEXT[call.from_user.id] = pid
     open_project_menu(call.message.chat.id, pid, mode="management", msg_id=call.message.message_id)
@@ -664,8 +699,7 @@ def open_proj_mgmt(call):
 def project_settings_menu(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("⚡ Написать тестовую статью", callback_data=f"test_article_{pid}"))
@@ -683,8 +717,7 @@ def project_settings_menu(call):
 def cms_start_setup(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup(); markup.add(types.InlineKeyboardButton("🔙 Отмена", callback_data=f"proj_settings_{pid}"))
     msg = bot.send_message(call.message.chat.id, "🔐 **Настройка WordPress**\n\n1. Убедитесь, что включены 'Application Passwords'.\n2. Введите **Логин** администратора:", reply_markup=markup, parse_mode='Markdown')
@@ -719,8 +752,7 @@ def cms_save_password_step(message, pid):
 def kb_menu(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -743,13 +775,12 @@ def kb_menu(call):
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
     bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
-# --- LINKS MANAGEMENT HANDLERS ---
+# --- LINKS MANAGEMENT ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_links_menu_"))
 def kb_links_menu(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
     
     conn = get_db_connection()
@@ -776,15 +807,13 @@ def kb_links_menu(call):
     
     bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
-# --- LINK GENERATION (INTERNAL) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_int_"))
 def kb_gen_internal(call):
     try:
         bot.answer_callback_query(call.id, "Сканирую...")
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
-    bot.send_message(call.message.chat.id, "⏳ Сканирую карту сайта...")
+    bot.send_message(call.message.chat.id, "⏳ Сканирую карту сайта (рекурсивно)...")
     
     def _scan():
         conn = get_db_connection()
@@ -796,7 +825,7 @@ def kb_gen_internal(call):
         
         links = parse_sitemap(url)
         clean_links = [l for l in links if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed', '.xml'])]
-        clean_links = clean_links[:50] # Limit to 50
+        clean_links = clean_links[:50] 
         
         TEMP_LINKS[f"int_{pid}"] = clean_links
         
@@ -810,15 +839,13 @@ def kb_gen_internal(call):
         
     threading.Thread(target=_scan).start()
 
-# --- LINK GENERATION (EXTERNAL) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_ext_"))
 def kb_gen_external(call):
     try:
         bot.answer_callback_query(call.id, "Генерирую...")
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
-    bot.send_message(call.message.chat.id, "⏳ Ищу авторитетные ресурсы...")
+    bot.send_message(call.message.chat.id, "⏳ Подбираю качественные статьи...")
     
     def _ai_search():
         conn = get_db_connection()
@@ -831,17 +858,19 @@ def kb_gen_external(call):
         info = res[0] or {}
         kw = res[1] or ""
         
-        prompt = f"""Task: Provide 15 high-authority external URL links related to this topic: {info.get('survey_step1', 'General')}. 
-        Keywords: {kw[:200]}.
-        Requirements:
-        1. Only REAL, existing websites (Wikipedia, reputable news, niche authority blogs).
-        2. Format: Just the URL, one per line.
-        3. Language: Russian or English (relevant to topic).
+        prompt = f"""
+        Role: SEO Expert. Topic: {info.get('survey_step1', 'General')}. Keywords: {kw[:200]}.
+        Task: Find 10-15 SPECIFIC URLs to articles on high-authority websites.
+        STRICT RULES:
+        1. NO homepage URLs. Give deep links to specific articles.
+        2. URLs must look valid.
+        3. Mix of Russian and English.
+        4. Output format: Just the list of URLs.
         """
         
         text = get_gemini_response(prompt)
-        links = re.findall(r'https?://[^\s]+', text)
-        clean_links = [l.strip('",') for l in links][:20]
+        links = re.findall(r'https?://[^\s\n,"]+', text)
+        clean_links = [l for l in list(set(links)) if len(l.split('/')) > 3][:15]
         
         TEMP_LINKS[f"ext_{pid}"] = clean_links
         
@@ -855,41 +884,35 @@ def kb_gen_external(call):
         
     threading.Thread(target=_ai_search).start()
 
-# --- SAVE LINKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_save_"))
 def kb_save_links(call):
     try:
         bot.answer_callback_query(call.id, "Сохранено")
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
-    type_ = parts[2] # int or ext
+    type_ = parts[2]
     pid = parts[3]
     
     key = f"{type_}_{pid}"
     if key in TEMP_LINKS:
         links = TEMP_LINKS[key]
         col = "approved_internal_links" if type_ == "int" else "approved_external_links"
-        
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(f"UPDATE projects SET {col}=%s WHERE id=%s", (json.dumps(links), pid))
         conn.commit()
         cur.close()
         conn.close()
-        
         del TEMP_LINKS[key]
         kb_links_menu(call)
     else:
         bot.send_message(call.message.chat.id, "❌ Данные устарели.")
 
-# --- DOWNLOAD TEMP LINKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_dl_temp_"))
 def kb_dl_temp(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     type_ = parts[3]
     pid = parts[4]
@@ -903,33 +926,27 @@ def kb_dl_temp(call):
     else:
         bot.send_message(call.message.chat.id, "❌ Нет данных.")
 
-# --- UPLOAD LINKS HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_up_"))
 def kb_upload_start(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
-    type_ = parts[2] # int or ext
+    type_ = parts[2]
     pid = parts[3]
-    
     LINK_UPLOAD_STATE[call.from_user.id] = {"pid": pid, "type": type_}
-    bot.send_message(call.message.chat.id, f"📂 Отправьте **.txt файл** со списком {'внутренних' if type_=='int' else 'внешних'} ссылок (каждая с новой строки).")
+    bot.send_message(call.message.chat.id, f"📂 Отправьте **.txt файл** со списком {'внутренних' if type_=='int' else 'внешних'} ссылок.")
 
 @bot.message_handler(content_types=['document'])
 def handle_docs(message):
-    # Check if this is for Link Upload
     if message.from_user.id in LINK_UPLOAD_STATE:
         state = LINK_UPLOAD_STATE[message.from_user.id]
         pid = state['pid']
         link_type = state['type']
-        
         if not message.document.file_name.endswith('.txt'):
-            bot.send_message(message.chat.id, "❌ Пожалуйста, отправьте файл формата .txt")
+            bot.send_message(message.chat.id, "❌ Нужен файл .txt")
             return
-
-        bot.send_message(message.chat.id, "⏳ Проверяю файл и валидность ссылок (это может занять время)...")
+        bot.send_message(message.chat.id, "⏳ Проверяю валидность (игнорирую блокировки ботов)...")
         
         def _process_file():
             try:
@@ -937,31 +954,29 @@ def handle_docs(message):
                 downloaded = bot.download_file(file_info.file_path)
                 content = downloaded.decode('utf-8')
                 raw_links = [line.strip() for line in content.split('\n') if line.strip()]
-                
                 valid_links = []
                 errors = []
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/115.0.0.0 Safari/537.36"}
                 
                 for link in raw_links:
                     if not link.startswith('http'):
-                        errors.append(f"❌ Формат: {link}")
+                        errors.append(f"❌ Формат: {link[:30]}...")
                         continue
                     try:
-                        # Validate URL existence
-                        r = requests.head(link, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-                        if r.status_code < 400:
+                        r = requests.head(link, timeout=10, headers=headers, allow_redirects=True)
+                        if r.status_code < 400 or r.status_code in [403, 406, 418, 429, 503]:
                             valid_links.append(link)
                         else:
-                            # Fallback to GET if HEAD failed
-                            r2 = requests.get(link, timeout=5, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
-                            if r2.status_code < 400:
+                            r2 = requests.get(link, timeout=10, headers=headers, stream=True)
+                            if r2.status_code < 400 or r2.status_code in [403, 406, 418, 429, 503]:
                                 valid_links.append(link)
                             else:
                                 errors.append(f"❌ {r.status_code}: {link}")
                     except:
-                        errors.append(f"❌ Недоступен: {link}")
+                        errors.append(f"❌ Ошибка сети: {link}")
                 
-                if len(valid_links) == 0:
-                    bot.send_message(message.chat.id, "❌ Не найдено ни одной рабочей ссылки. Проверьте файл.")
+                if not valid_links:
+                    bot.send_message(message.chat.id, "❌ Нет рабочих ссылок.")
                     return
 
                 col = "approved_internal_links" if link_type == "int" else "approved_external_links"
@@ -973,193 +988,136 @@ def handle_docs(message):
                 conn.close()
                 
                 del LINK_UPLOAD_STATE[message.from_user.id]
-                
-                msg = f"✅ Успешно загружено: {len(valid_links)} шт."
-                if errors:
-                    msg += f"\n⚠️ Ошибок: {len(errors)}\n(Например: {errors[0]})"
-                
+                msg = f"✅ Сохранено: {len(valid_links)} шт."
+                if errors: msg += f"\n⚠️ Не прошли: {len(errors)}"
                 markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("🔙 В меню ссылок", callback_data=f"kb_links_menu_{pid}"))
+                markup.add(types.InlineKeyboardButton("🔙 Меню ссылок", callback_data=f"kb_links_menu_{pid}"))
                 bot.send_message(message.chat.id, msg, reply_markup=markup)
-                
             except Exception as e:
-                bot.send_message(message.chat.id, f"❌ Ошибка обработки: {e}")
+                bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
         
         threading.Thread(target=_process_file).start()
         return
 
-    # Existing Photo/Doc logic fallback
     if message.from_user.id in UPLOAD_STATE:
         handle_photo_upload(message)
 
-# --- PROMPT GENERATOR WITH LIMITS ---
+# --- PROMPTS/PHOTOS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_prompt_gen_menu_"))
 def kb_prompt_gen_menu(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[4]
-    
     conn = get_db_connection()
     cur = conn.cursor()
-    # Получаем кол-во сделанных генераций и тариф пользователя
-    cur.execute("""
-        SELECT p.prompt_gens_count, u.tariff, u.user_id 
-        FROM projects p 
-        JOIN users u ON p.user_id = u.user_id 
-        WHERE p.id = %s
-    """, (pid,))
+    cur.execute("SELECT p.prompt_gens_count, u.tariff, u.user_id FROM projects p JOIN users u ON p.user_id = u.user_id WHERE p.id = %s", (pid,))
     res = cur.fetchone()
     cur.close()
     conn.close()
-    
     used = res[0] or 0
     tariff = res[1] or "No Tariff"
     owner_id = res[2]
-    
     limit = get_project_prompt_limit(owner_id, tariff)
-    
     markup = types.InlineKeyboardMarkup()
     if used < limit:
         markup.add(types.InlineKeyboardButton("🎲 Сгенерировать вариант", callback_data=f"kb_gen_new_prompt_{pid}"))
     else:
         markup.add(types.InlineKeyboardButton("🔒 Лимит исчерпан", callback_data="none"))
-        
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
-    
-    # --- UPDATED: BOLD VISIBLE COUNTER ---
-    bot.edit_message_text(f"🎨 **Генератор промптов**\n\n📊 **Генераций: {used} / {limit}**\n\nЯ проанализирую ваши фото и создам описание стиля.", 
-                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    bot.edit_message_text(f"🎨 **Генератор промптов**\n\n📊 **Генераций: {used} / {limit}**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_new_prompt_"))
 def kb_gen_new_prompt(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[4]
-    
     conn = get_db_connection()
     cur = conn.cursor()
-    # Проверка лимитов перед генерацией (Double check)
-    cur.execute("""
-        SELECT p.prompt_gens_count, u.tariff, u.user_id, p.style_images, p.info 
-        FROM projects p 
-        JOIN users u ON p.user_id = u.user_id 
-        WHERE p.id = %s
-    """, (pid,))
+    cur.execute("SELECT p.prompt_gens_count, u.tariff, u.user_id, p.style_images, p.info FROM projects p JOIN users u ON p.user_id = u.user_id WHERE p.id = %s", (pid,))
     res = cur.fetchone()
-    
     if not res: 
         cur.close()
         conn.close()
         return
     used, tariff, owner_id, images_b64, info = res[0] or 0, res[1], res[2], res[3] or [], res[4] or {}
-    
     limit = get_project_prompt_limit(owner_id, tariff)
-    
     if used >= limit:
         cur.close()
         conn.close()
-        bot.send_message(call.message.chat.id, "⚠️ Лимит генераций промптов для этого проекта исчерпан.")
+        bot.send_message(call.message.chat.id, "⚠️ Лимит исчерпан.")
         return
-
     if len(images_b64) < 1:
         cur.close()
         conn.close()
-        bot.send_message(call.message.chat.id, "⚠️ Сначала загрузите хотя бы 1 фото в галерею!")
+        bot.send_message(call.message.chat.id, "⚠️ Загрузите фото!")
         return
-
-    # Увеличиваем счетчик
     cur.execute("UPDATE projects SET prompt_gens_count = prompt_gens_count + 1 WHERE id = %s", (pid,))
     conn.commit()
     cur.close()
     conn.close()
-
-    bot.send_message(call.message.chat.id, "⏳ Анализирую ваши фото и придумываю стиль...")
-    
+    bot.send_message(call.message.chat.id, "⏳ Анализирую стиль...")
     try:
         content_parts = []
-        instruction = f"""
-        Role: Expert AI Image Prompt Engineer.
-        Context: {info.get('survey_step1', 'General website')}.
-        TASK:
-        1. Analyze the attached images deeply. Pay attention to lighting, colors, composition, materials, and mood.
-        2. Create a detailed TEXT-TO-IMAGE PROMPT that recreates this exact style.
-        3. The prompt MUST be in ENGLISH.
-        4. Focus on visual descriptors (e.g., "Cinematic lighting, neon orange accents, high fashion, marble texture").
-        5. Output ONLY the prompt text.
-        """
+        instruction = f"Role: Expert AI Image Prompt Engineer. Context: {info.get('survey_step1', 'General')}. Analyze images. Create English Prompt."
         content_parts.append(genai_types.Part.from_text(text=instruction))
-
         for b64_str in images_b64[:4]:
             try:
                 img_bytes = base64.b64decode(b64_str)
                 mime = "image/png" if img_bytes.startswith(b'\x89PNG') else "image/jpeg"
                 content_parts.append(genai_types.Part.from_bytes(data=img_bytes, mime_type=mime))
             except: pass
-
         response = client.models.generate_content(model="gemini-2.0-flash", contents=[genai_types.Content(parts=content_parts)])
         prompt_text = response.text.strip()
-        
     except Exception as e:
-        print(f"Vision Generation Error: {e}")
-        prompt_text = "Ошибка анализа. Попробуйте еще раз."
-
-    bot.send_message(call.message.chat.id, f"🎨 Генерирую превью по промпту:\n\n`{prompt_text}`", parse_mode='Markdown')
+        print(f"Vision Error: {e}")
+        prompt_text = "Error."
+    bot.send_message(call.message.chat.id, f"🎨 Генерирую превью:\n\n`{prompt_text}`", parse_mode='Markdown')
     img_bytes = generate_image_bytes(prompt_text)
-    
     if img_bytes:
         prompt_id = f"{pid}_{int(time.time())}"
         TEMP_PROMPTS[prompt_id] = prompt_text
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("✅ Сохранить", callback_data=f"kb_approve_p_{prompt_id}"),
-                   types.InlineKeyboardButton("❌ Нет, другой", callback_data=f"kb_gen_new_prompt_{pid}"))
-        bot.send_photo(call.message.chat.id, img_bytes, caption="Нравится такой стиль?", reply_markup=markup)
+                   types.InlineKeyboardButton("❌ Другой", callback_data=f"kb_gen_new_prompt_{pid}"))
+        bot.send_photo(call.message.chat.id, img_bytes, caption="Нравится стиль?", reply_markup=markup)
     else:
-        bot.send_message(call.message.chat.id, "❌ Не удалось сгенерировать превью.")
+        bot.send_message(call.message.chat.id, "❌ Не удалось создать превью.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_approve_p_"))
 def kb_approve_prompt(call):
     try:
         bot.answer_callback_query(call.id, "Сохранено!")
-    except:
-        pass
+    except: pass
     prompt_id = call.data.split("p_")[1]
     pid = prompt_id.split("_")[0]
-    
     if prompt_id in TEMP_PROMPTS:
         text = TEMP_PROMPTS[prompt_id]
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT approved_prompts FROM projects WHERE id=%s", (pid,))
-        res = cur.fetchone()
-        current_list = res[0] or []
+        current_list = cur.fetchone()[0] or []
         current_list.append(text)
         cur.execute("UPDATE projects SET approved_prompts=%s WHERE id=%s", (json.dumps(current_list), pid))
         conn.commit()
         cur.close()
         conn.close()
         del TEMP_PROMPTS[prompt_id]
-        
-        # --- NEW MENU AFTER SAVE ---
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🎲 Сгенерировать еще вариант", callback_data=f"kb_prompt_gen_menu_{pid}"))
-        markup.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
-        
-        bot.send_message(call.message.chat.id, "✅ Промпт добавлен в базу! Теперь я буду использовать его в статьях.", reply_markup=markup)
+        markup.add(types.InlineKeyboardButton("🎲 Еще вариант", callback_data=f"kb_prompt_gen_menu_{pid}"))
+        markup.add(types.InlineKeyboardButton("🔙 В меню", callback_data=f"open_proj_mgmt_{pid}"))
+        bot.send_message(call.message.chat.id, "✅ Промпт добавлен!", reply_markup=markup)
     else:
-        bot.send_message(call.message.chat.id, "⚠️ Промпт устарел.")
+        bot.send_message(call.message.chat.id, "⚠️ Устарело.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_text_"))
 def kb_set_text(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "📝 Опишите идеальный стиль картинок (промпт).")
+    msg = bot.send_message(call.message.chat.id, "📝 Введите промпт:")
     bot.register_next_step_handler(msg, save_kb_text, pid)
 
 def save_kb_text(message, pid):
@@ -1169,17 +1127,16 @@ def save_kb_text(message, pid):
     conn.commit()
     cur.close()
     conn.close()
-    bot.send_message(message.chat.id, "✅ Стиль сохранен!")
+    bot.send_message(message.chat.id, "✅ Сохранено!")
     kb_menu_wrapper(message.chat.id, pid)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_negative_"))
 def kb_set_negative(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "🚫 Напишите, чего НЕ должно быть на фото (Anti-prompt).")
+    msg = bot.send_message(call.message.chat.id, "🚫 Введите анти-промпт:")
     bot.register_next_step_handler(msg, save_kb_negative, pid)
 
 def save_kb_negative(message, pid):
@@ -1189,18 +1146,17 @@ def save_kb_negative(message, pid):
     conn.commit()
     cur.close()
     conn.close()
-    bot.send_message(message.chat.id, "✅ Анти-промпт сохранен!")
+    bot.send_message(message.chat.id, "✅ Сохранено!")
     kb_menu_wrapper(message.chat.id, pid)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_add_photo_"))
 def kb_add_photo(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
     UPLOAD_STATE[call.from_user.id] = pid
-    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (JPG/PNG).")
+    bot.send_message(call.message.chat.id, "🖼 Отправьте фото.")
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo_upload(message):
@@ -1219,10 +1175,6 @@ def handle_photo_upload(message):
                 bot.send_message(message.chat.id, "⚠️ Лимит 30 фото.")
                 return 
             file_info = bot.get_file(message.photo[-1].file_id)
-            if file_info.file_size > 1048576: 
-                cur.close()
-                conn.close()
-                return
             downloaded_file = bot.download_file(file_info.file_path)
             b64_img = base64.b64encode(downloaded_file).decode('utf-8')
             images.append(b64_img)
@@ -1237,13 +1189,11 @@ def handle_photo_upload(message):
         except Exception as e: print(f"Upload Error: {e}")
     threading.Thread(target=_save_photo).start()
 
-# --- NEW: GALLERY & DELETE (FIXED) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gallery_"))
 def kb_gallery(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1256,7 +1206,7 @@ def kb_gallery(call):
     for i in range(len(images)): btns.append(types.InlineKeyboardButton(f"Фото {i+1}", callback_data=f"kb_view_{pid}_{i}"))
     markup.add(*btns)
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
-    msg_text = f"📁 **Галерея ({len(images)} фото)**\n\nНажмите на кнопку, чтобы увидеть фото и удалить его."
+    msg_text = f"📁 **Галерея ({len(images)} фото)**"
     try: bot.edit_message_text(text=msg_text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode='Markdown')
     except: bot.send_message(chat_id=call.message.chat.id, text=msg_text, reply_markup=markup, parse_mode='Markdown')
 
@@ -1264,8 +1214,7 @@ def kb_gallery(call):
 def kb_view_photo(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     pid = parts[2]
     idx = int(parts[3])
@@ -1276,23 +1225,22 @@ def kb_view_photo(call):
     cur.close()
     conn.close()
     if idx >= len(images): 
-        bot.send_message(call.message.chat.id, "❌ Фото уже удалено.")
+        bot.send_message(call.message.chat.id, "❌ Удалено.")
         kb_gallery(call)
         return
     b64_data = images[idx]
     img_bytes = base64.b64decode(b64_data)
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🗑 Удалить это фото", callback_data=f"kb_del_{pid}_{idx}"))
-    markup.add(types.InlineKeyboardButton("🔙 В галерею", callback_data=f"kb_gallery_{pid}"))
+    markup.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"kb_del_{pid}_{idx}"))
+    markup.add(types.InlineKeyboardButton("🔙 Галерея", callback_data=f"kb_gallery_{pid}"))
     try: bot.send_photo(call.message.chat.id, img_bytes, caption=f"🖼 Фото #{idx+1}", reply_markup=markup)
-    except Exception as e: bot.send_message(call.message.chat.id, "❌ Ошибка отображения фото.")
+    except Exception as e: bot.send_message(call.message.chat.id, "❌ Ошибка.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_del_"))
 def kb_delete_single(call):
     try:
         bot.answer_callback_query(call.id, "Удалено")
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     pid = parts[2]
     idx = int(parts[3])
@@ -1307,12 +1255,8 @@ def kb_delete_single(call):
         conn.commit()
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        bot.send_message(call.message.chat.id, f"✅ Фото удалено. Осталось: {len(images)}")
-    else: 
-        conn.rollback()
-        bot.send_message(call.message.chat.id, "❌ Фото уже не существует.")
+        except: pass
+        bot.send_message(call.message.chat.id, f"✅ Удалено.")
     cur.close()
     conn.close()
     kb_gallery(call)
@@ -1320,9 +1264,8 @@ def kb_delete_single(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_clear_photos_"))
 def kb_clear_photos(call):
     try:
-        bot.answer_callback_query(call.id, "Фото удалены.")
-    except:
-        pass
+        bot.answer_callback_query(call.id, "Удалено")
+    except: pass
     pid = call.data.split("_")[3]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1333,24 +1276,7 @@ def kb_clear_photos(call):
     kb_menu(call)
 
 def kb_menu_wrapper(chat_id, pid):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT style_prompt, style_images, style_negative_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
-    res = cur.fetchone()
-    cur.close()
-    conn.close()
-    style_text = res[0] or "Не задан"; images = res[1] or []; neg = res[2] or "Не задан"; app_p = res[3] or []
-    msg = (f"🧠 **База Знаний**\n\n🎨 **Промпт:** {escape_md(style_text[:50])}...\n🚫 **Анти-промпт:** {escape_md(neg[:50])}...\n"
-           f"🖼 **Фото:** {len(images)}/30.\n✅ **Утвержденных промптов:** {len(app_p)}")
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔗 Ссылки (Link Building)", callback_data=f"kb_links_menu_{pid}"))
-    markup.add(types.InlineKeyboardButton("🎨 Генератор промптов", callback_data=f"kb_prompt_gen_menu_{pid}"))
-    markup.add(types.InlineKeyboardButton("🎨 Промпт", callback_data=f"kb_set_text_{pid}"),
-               types.InlineKeyboardButton("🚫 Анти-промпт", callback_data=f"kb_set_negative_{pid}"),
-               types.InlineKeyboardButton("🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
-    if images: markup.add(types.InlineKeyboardButton("📂 Галерея", callback_data=f"kb_gallery_{pid}"))
-    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
-    bot.send_message(chat_id, msg, reply_markup=markup, parse_mode='Markdown')
+    kb_menu(types.CallbackQuery(id='0', from_user=types.User(chat_id, False, 'u'), data=f"kb_menu_{pid}", message=types.Message(0, None, None, types.Chat(chat_id, 'private'), 'text', {}, '')))
 
 # --- UTILS (PROFILE) ---
 def show_profile(uid):
@@ -1371,7 +1297,11 @@ def show_profile(uid):
            f"💰 Расходы: {u[4]}р\n"
            f"📂 Проектов: {projs}\n📄 Опубликовано статей: {arts}")
     markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Пополнить баланс", callback_data="period_test"))
-    bot.send_message(uid, txt, reply_markup=markup, parse_mode='Markdown')
+    gif_url = "[https://ecosteni.ru/wp-content/uploads/2026/01/202601081509.gif](https://ecosteni.ru/wp-content/uploads/2026/01/202601081509.gif)"
+    try:
+        bot.send_animation(uid, gif_url, caption=txt, reply_markup=markup, parse_mode='Markdown')
+    except:
+        bot.send_message(uid, txt, reply_markup=markup, parse_mode='Markdown')
 
 def show_tariff_periods(user_id):
     txt = ("💎 **ТАРИФНЫЕ ПЛАНЫ**\n\n"
@@ -1412,7 +1342,11 @@ def show_admin_panel(uid):
         text = (f"⚙️ **АДМИН ПАНЕЛЬ**\n\n👥 **Активность:**\n• Заходили сегодня: {dau}\n• Новых сегодня: {new_today}\n• Новых за месяц: {new_month}\n\n"
             f"💰 **Финансы (Месяц):**\n• Рубли: {profit_rub}₽\n• Звезды: {profit_stars}⭐️\n\n📄 **Контент:**\n• Статей за сегодня: {articles_today}\n"
             f"• Всего проектов: {total_projects}\n\n📊 **Продажи тарифов:**\n{tariff_text}")
-        bot.send_message(uid, text, parse_mode='Markdown')
+        gif_url = "[https://ecosteni.ru/wp-content/uploads/2026/01/202601081455.gif](https://ecosteni.ru/wp-content/uploads/2026/01/202601081455.gif)"
+        try:
+            bot.send_animation(uid, gif_url, caption=text, parse_mode='Markdown')
+        except:
+            bot.send_message(uid, text, parse_mode='Markdown')
     except Exception as e: bot.send_message(uid, f"Ошибка админки: {e}")
     finally:
         cur.close()
@@ -1423,8 +1357,7 @@ def show_admin_panel(uid):
 def tariff_period_select(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     p_type = call.data.split("_")[1]
     if p_type == "test": process_tariff_selection(call, "Тест-драйв", 500, "test")
     elif p_type == "month":
@@ -1446,9 +1379,7 @@ def tariff_period_select(call):
 def back_to_periods(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
-    
+    except: pass
     show_tariff_periods(call.from_user.id)
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1464,8 +1395,7 @@ def process_tariff_selection(call, name, price, code):
 def pre_payment(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     tariff_code = parts[1]
     period = parts[2]
@@ -1486,26 +1416,21 @@ def pre_payment(call):
 def process_payment(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     currency = parts[1]
     tariff_type_code = parts[2]
     amount = int(parts[3])
-    
-    # Determine Specific Tariff Name
     final_tariff_name = "Premium"
     if "test" in tariff_type_code: final_tariff_name = "Test Drive"
     elif "start" in tariff_type_code: final_tariff_name = "Start"
     elif "pro" in tariff_type_code: final_tariff_name = "Pro"
     elif "agent" in tariff_type_code: final_tariff_name = "Agent"
-
     gens = 5
     if amount >= 1400: gens = 15
     if amount >= 2500: gens = 30
     if amount >= 7500: gens = 100
     if amount > 10000: gens *= 12 
-    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("UPDATE users SET balance = balance + %s, gens_left = gens_left + %s, tariff=%s WHERE user_id=%s", 
@@ -1521,8 +1446,7 @@ def process_payment(call):
 def ask_del(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[-1]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1537,8 +1461,7 @@ def ask_del(call):
 def kw_ask_count(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[3]
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton("50", callback_data=f"kw_gen_{pid}_50"),
@@ -1552,8 +1475,7 @@ def kw_ask_count(call):
 def kw_gen_handler(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     pid = parts[2]
     count = parts[3]
@@ -1586,8 +1508,7 @@ def kw_gen_handler(call):
 def kw_approve(call):
     try:
         bot.answer_callback_query(call.id, "Сохранено!")
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     open_project_menu(call.message.chat.id, pid)
 
@@ -1595,8 +1516,7 @@ def kw_approve(call):
 def kw_download(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1609,13 +1529,11 @@ def kw_download(call):
     file_data.name = "keywords.txt"
     bot.send_document(call.message.chat.id, file_data, caption="📂 Ваше семантическое ядро")
 
-# --- UPDATED SURVEY LOGIC (4 STEPS) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("srv_"))
 def start_survey_handler(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[1]
     SURVEY_STATE[call.from_user.id] = {'pid': pid, 'step': 1}
     msg = bot.send_message(call.message.chat.id, "📝 **Опрос (Шаг 1/4)**\n\nКратко опишите суть вашего сайта/бизнеса.", parse_mode='Markdown')
@@ -1664,8 +1582,7 @@ def survey_step_router(message):
 def view_kw(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1690,8 +1607,7 @@ def view_kw(call):
 def comp_start(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     USER_CONTEXT[call.from_user.id] = pid
     msg = bot.send_message(call.message.chat.id, "🔗 Пришлите ссылку на 1-го конкурента:")
@@ -1734,8 +1650,7 @@ def analyze_competitor_step(message, pid):
 def comp_finish(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     update_project_progress(pid, "competitors_done")
     open_project_menu(call.message.chat.id, pid, mode="onboarding", msg_id=call.message.message_id)
@@ -1744,8 +1659,7 @@ def comp_finish(call):
 def select_analysis_type(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("⚡ Быстрый", callback_data=f"do_anz_{pid}_fast"))
@@ -1758,8 +1672,7 @@ def select_analysis_type(call):
 def perform_analysis(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     _, _, pid, type_ = call.data.split("_")
     bot.edit_message_text(f"⏳ Выполняю {type_} анализ и поиск контактов...", call.message.chat.id, call.message.message_id)
     
@@ -1771,18 +1684,13 @@ def perform_analysis(call):
             res = cur.fetchone()
             url = res[0]
             info = res[1] or {}
-            
             cur.close()
             conn.close()
             
-            # Парсим сайт + контакты
             raw_data, links = deep_analyze_site(url)
-            
-            # Вытаскиваем контакты из raw_data для сохранения в JSON
             contacts_match = re.search(r'REAL_CONTACTS_DATA: (.*?)\nContent:', raw_data, re.DOTALL)
             real_contacts = contacts_match.group(1).strip() if contacts_match else ""
             
-            # Сохраняем контакты в базу
             conn = get_db_connection()
             cur = conn.cursor()
             info['real_contacts'] = real_contacts
@@ -1810,8 +1718,7 @@ def perform_analysis(call):
 def strategy_start(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[1]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1835,8 +1742,7 @@ def strategy_start(call):
 def show_current_plan(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1852,8 +1758,7 @@ def show_current_plan(call):
 def reset_plan(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1873,8 +1778,7 @@ def strategy_start_helper(call, pid):
 def save_freq_and_plan(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     _, pid, freq = call.data.split("_")
     freq = int(freq)
     days_map = {0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"}
@@ -1923,8 +1827,7 @@ def save_freq_and_plan(call):
 def replace_topic(call):
     try:
         bot.answer_callback_query(call.id, "🔄 Меняю тему...")
-    except:
-        pass
+    except: pass
     _, _, pid, idx = call.data.split("_")
     idx = int(idx)
     def _repl_topic():
@@ -1965,8 +1868,7 @@ def replace_topic(call):
 def approve_plan(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1983,8 +1885,7 @@ def approve_plan(call):
 def test_article_start(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT gens_left FROM users WHERE user_id=%s", (call.from_user.id,))
@@ -2034,8 +1935,7 @@ def propose_test_topics(chat_id, pid):
 def write_article_handler(call):
     try:
         bot.answer_callback_query(call.id, "Пишу статью...")
-    except:
-        pass
+    except: pass
     parts = call.data.split("_")
     pid = parts[1]
     idx = int(parts[3])
@@ -2056,13 +1956,11 @@ def write_article_handler(call):
             style_prompt = res[3] or ""
             app_p = res[4] or []
             
-            # --- LINKS SELECTION LOGIC ---
-            # 1. Use Approved Internal Links first, fallback to sitemap
-            approved_int = res[5] or [] # from JSONB
+            # 1. Internal Links
+            approved_int = res[5] or [] 
             if approved_int:
-                links_text = "\n".join(approved_int[:30]) # Prioritize approved
+                links_text = "\n".join(approved_int[:30])
             else:
-                # Fallback
                 if isinstance(sitemap_data, list): sitemap_list = sitemap_data
                 elif isinstance(sitemap_data, str):
                     try: sitemap_list = json.loads(sitemap_data)
@@ -2071,11 +1969,11 @@ def write_article_handler(call):
                 clean_sitemap_list = [l for l in sitemap_list if not any(x in l for x in ['.xml', 'sitemap', 'wp-json', 'feed'])]
                 links_text = "\n".join(clean_sitemap_list[:25]) if clean_sitemap_list else "None"
 
-            # 2. Use Approved External Links
+            # 2. External Links
             approved_ext = res[6] or []
             ext_links_text = "\n".join(approved_ext[:15]) if approved_ext else "Generate relevant external links"
 
-            # Berem реальные контакты из базы (если их нет - пробуем взять из URL)
+            # 3. Real Contacts
             real_contacts = info.get('real_contacts', '')
 
             topics = info.get("temp_topics", [])
@@ -2085,7 +1983,6 @@ def write_article_handler(call):
             cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,))
             conn.commit()
 
-            # --- YOAST SEO + REAL CONTACTS + APPROVED LINKS PROMPT ---
             prompt = f"""
             Act as a Senior SEO Copywriter adhering to Yoast SEO 2025 rules.
             
@@ -2094,7 +1991,7 @@ def write_article_handler(call):
             
             🛑 CRITICAL DATA (USE EXACTLY):
             1. REAL CONTACTS: 
-               {real_contacts if real_contacts else "NO CONTACTS FOUND. DO NOT INVENT PHONE NUMBERS OR EMAILS. Just link to the contact page."}
+               {real_contacts if real_contacts else "NO CONTACTS FOUND. Link to contact page."}
             2. INTERNAL LINKS (Insert 2-3 naturally):
                {links_text}
             3. EXTERNAL LINKS (Insert 1-2 naturally):
@@ -2105,7 +2002,7 @@ def write_article_handler(call):
             2. **Title**: Start with the Topic. Max 60 chars.
             3. **Meta Description**: Actionable, contains keyword, max 150 chars.
             4. **Structure**: Use H2 and H3. Short paragraphs.
-            5. **Accuracy**: If you mention "Contact us", use the REAL CONTACTS above. NEVER use "+7 (XXX)..." or "info@example.com".
+            5. **Accuracy**: If you mention "Contact us", use the REAL CONTACTS above.
 
             OUTPUT FORMAT (JSON):
             {{
@@ -2116,7 +2013,6 @@ def write_article_handler(call):
                 "html_content": "<h3>Intro</h3><p>...</p>...",
                 "featured_img_prompt": "Prompt for image generation"
             }}
-            
             Language: Russian.
             """
             
@@ -2151,8 +2047,7 @@ def write_article_handler(call):
 def rewrite_article(call):
     try:
         bot.answer_callback_query(call.id, "Переписываю...")
-    except:
-        pass
+    except: pass
     aid = call.data.split("_")[1]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -2209,8 +2104,7 @@ def rewrite_article(call):
 def pre_approve_check(call):
     try:
         bot.answer_callback_query(call.id)
-    except:
-        pass
+    except: pass
     aid = call.data.split("_")[2]
     conn = get_db_connection()
     cur = conn.cursor()
@@ -2226,11 +2120,9 @@ def pre_approve_check(call):
 def approve_publish(call):
     try:
         bot.answer_callback_query(call.id, "Проверяю качество...")
-    except:
-        pass
+    except: pass
     aid = call.data.split("_")[1]
     
-    # --- PHASE 1: SELF-CHECK (BEFORE GENERATION) ---
     def _validation_phase():
         conn = get_db_connection()
         if not conn: return
@@ -2240,64 +2132,49 @@ def approve_publish(call):
             row = cur.fetchone()
             if not row: return
             pid, title, content, seo_json = row
-            
             cur.execute("SELECT sitemap_links FROM projects WHERE id=%s", (pid,))
             res = cur.fetchone()
             sitemap_links = res[0] or []
             if isinstance(sitemap_links, str): 
                 try: sitemap_links = json.loads(sitemap_links)
                 except: sitemap_links = []
-
-            # 1. Run Validation
+            
             errors = validate_article_quality(content, sitemap_links)
-            
             if errors:
-                # FAILURE: Stop and Ask User
                 error_text = "\n".join([f"❌ {e}" for e in errors])
-                msg = f"✋ **Стоп! Я проверил статью и нашел ошибки:**\n\n{error_text}\n\nЯ не хочу публиковать мусор. Дай мне второй шанс исправить это?"
-                
+                msg = f"✋ **Стоп! Я нашел ошибки:**\n\n{error_text}\n\nИсправить?"
                 markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("🛠 Исправить и Опубликовать", callback_data=f"repair_{aid}"))
-                markup.add(types.InlineKeyboardButton("🔙 Отмена (Вернуть деньги)", callback_data=f"cancel_pub_{aid}"))
-                
+                markup.add(types.InlineKeyboardButton("🛠 Исправить", callback_data=f"repair_{aid}"))
+                markup.add(types.InlineKeyboardButton("🔙 Отмена", callback_data=f"cancel_pub_{aid}"))
                 bot.send_message(call.message.chat.id, msg, reply_markup=markup, parse_mode='Markdown')
-                return # Stop execution here
+                return 
             
-            # SUCCESS: Proceed to Publishing Phase
             start_publishing_phase(call, aid, conn, cur)
-            
         except Exception as e:
             print(f"Validation Error: {e}")
-            bot.send_message(call.message.chat.id, f"❌ Ошибка валидации: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
         finally:
             cur.close()
             conn.close()
-
     threading.Thread(target=_validation_phase).start()
 
 def start_publishing_phase(call, aid, conn, cur):
-    bot.send_message(call.message.chat.id, "✅ Проверка пройдена! Публикация с настройками Yoast SEO... (2-3 мин)")
-    
+    bot.send_message(call.message.chat.id, "✅ Проверка пройдена! Публикация... (2-3 мин)")
     try:
         cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
         row = cur.fetchone()
         pid, title, content, seo_json = row
         seo_data = seo_json if isinstance(seo_json, dict) else json.loads(seo_json or '{}')
-        
         cur.execute("SELECT cms_url, cms_login, cms_password, style_prompt, style_negative_prompt FROM projects WHERE id=%s", (pid,))
         proj_res = cur.fetchone()
         url, login, pwd, project_style, neg_style = proj_res
         
-        # Извлекаем данные из JSON от ИИ
         focus_kw = seo_data.get('focus_kw', '')
         seo_title = seo_data.get('seo_title', title)
         meta_desc = seo_data.get('meta_desc', '')
         slug = seo_data.get('slug', slugify(title))
-        
-        # Очистка слага от эмодзи и мусора (на всякий случай)
         slug = re.sub(r'[^\w\d-]', '', slug.lower())
 
-        # 1. Images in Text (Логика та же)
         img_matches = re.findall(r'\[IMG: (.*?)\]', content)
         final_content = content
         for i, prompt in enumerate(img_matches):
@@ -2305,12 +2182,11 @@ def start_publishing_phase(call, aid, conn, cur):
             if not source_url:
                 cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
                 conn.commit()
-                bot.send_message(call.message.chat.id, f"⛔ Ошибка генерации картинки: _{msg}_. Кредит возвращен.", parse_mode='Markdown')
+                bot.send_message(call.message.chat.id, f"⛔ Ошибка картинки: _{msg}_. Кредит возвращен.", parse_mode='Markdown')
                 return 
             img_html = f'<figure class="wp-block-image"><img src="{source_url}" alt="{focus_kw} {i}" class="wp-image-{media_id}"/></figure>'
             final_content = final_content.replace(f'[IMG: {prompt}]', img_html, 1)
 
-        # 2. Featured Image (Логика та же)
         feat_media_id = None
         if seo_data.get('featured_img_prompt'):
             feat_media_id, feat_url, feat_msg = generate_and_upload_image(url, login, pwd, seo_data['featured_img_prompt'], focus_kw, f"{focus_kw}-main", project_style, neg_style)
@@ -2320,27 +2196,22 @@ def start_publishing_phase(call, aid, conn, cur):
                 bot.send_message(call.message.chat.id, f"⛔ Ошибка обложки: _{feat_msg}_. Кредит возвращен.", parse_mode='Markdown')
                 return
 
-        # 3. Publish to WP with YOAST META FIELDS
         creds = f"{login}:{pwd}"
         token = base64.b64encode(creds.encode()).decode()
         headers = {'Authorization': 'Basic ' + token, 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
         
-        # Формируем payload. Важно: Yoast поля передаем через 'meta'
         post_data = {
-            'title': title, # Заголовок статьи в админке
+            'title': title, 
             'content': final_content.replace("\n", "<br>"), 
             'status': 'publish',
             'slug': slug,
             'meta': {
-                # Основные поля Yoast SEO
                 '_yoast_wpseo_focuskw': focus_kw,
                 '_yoast_wpseo_title': seo_title,
                 '_yoast_wpseo_metadesc': meta_desc,
-                # Дополнительно можно выставить, чтобы не индексировалось, если черновик, но у нас publish
-                '_yoast_wpseo_content_score': '90' # Это не меняет реальную оценку, но может служить маркером
+                '_yoast_wpseo_content_score': '90'
             }
         }
-        
         if feat_media_id: post_data['featured_media'] = feat_media_id
         
         r = requests.post(f"{url}/wp-json/wp/v2/posts", headers=headers, json=post_data, timeout=60)
@@ -2358,21 +2229,13 @@ def start_publishing_phase(call, aid, conn, cur):
             success_gif = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080228.gif"
             markup_final = types.InlineKeyboardMarkup()
             markup_final.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"open_proj_mgmt_{pid}"))
-            
-            # Отчет по SEO полям
-            seo_report = (f"✅ **Опубликовано!**\n\n"
-                          f"🔗 [Ссылка на статью]({link})\n"
-                          f"🔑 **Ключ:** `{focus_kw}`\n"
-                          f"📄 **Slug:** `{slug}`\n"
-                          f"📝 **Meta Desc:** {meta_desc[:50]}...\n"
-                          f"⚡ Осталось генераций: {left}")
-            
+            seo_report = (f"✅ **Опубликовано!**\n\n🔗 [Ссылка]({link})\n🔑 **Ключ:** `{focus_kw}`\n⚡ Осталось: {left}")
             try: bot.send_animation(call.message.chat.id, success_gif, caption=seo_report, reply_markup=markup_final, parse_mode='Markdown')
             except: bot.send_message(call.message.chat.id, seo_report, reply_markup=markup_final, parse_mode='Markdown')
         else:
             cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
             conn.commit()
-            bot.send_message(call.message.chat.id, f"⛔ **Ошибка WordPress!**\nКод: {r.status_code}\nОтвет: {r.text[:200]}\n\n💰 **Кредит возвращен.**", parse_mode='HTML')
+            bot.send_message(call.message.chat.id, f"⛔ **Ошибка WP!**\nКод: {r.status_code}\n\n💰 Кредит возвращен.", parse_mode='HTML')
 
     except Exception as e:
         if conn:
@@ -2381,75 +2244,58 @@ def start_publishing_phase(call, aid, conn, cur):
                 conn.commit()
             except: pass
         print(f"Pub Error: {e}")
-        bot.send_message(call.message.chat.id, f"❌ Критическая ошибка: {e}\n💰 Кредит возвращен.")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}\n💰 Кредит возвращен.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("repair_"))
 def repair_article_handler(call):
     try:
         bot.answer_callback_query(call.id, "Исправляю...")
-    except:
-        pass
+    except: pass
     aid = call.data.split("_")[1]
-    
-    bot.edit_message_text("🛠 **Исправляю ошибки ИИ...**\nПодождите, я переписываю проблемные места.", call.message.chat.id, call.message.message_id)
-    
+    bot.edit_message_text("🛠 **Исправляю...**", call.message.chat.id, call.message.message_id)
     def _repair():
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT project_id, title, content, seo_data FROM articles WHERE id=%s", (aid,))
         row = cur.fetchone()
         pid, title, content, seo_json = row
-        
-        # Auto-Repair Prompt
-        prompt = f"""
-        TASK: FIX THIS ARTICLE HTML. 
-        Problem: The validation failed (garbage text, broken links, or bad formatting).
-        INPUT HTML: {content}
-        INSTRUCTIONS:
-        1. Remove any conversational filler (e.g. 'Here is the article', 'Sure').
-        2. Ensure only VALID links exist (remove or fix broken internal links).
-        3. Keep the layout Magazine Style.
-        4. RETURN ONLY JSON: {{ "html_content": "..." }}
-        """
+        prompt = f"""TASK: FIX THIS ARTICLE HTML. Validation failed. INPUT HTML: {content}. INSTRUCTIONS: Remove filler text. Ensure valid links. Keep layout. RETURN ONLY JSON: {{ "html_content": "..." }}"""
         resp = get_gemini_response(prompt)
         data = clean_and_parse_json(resp)
         new_html = data.get("html_content", resp) if data else resp
-        
         cur.execute("UPDATE articles SET content=%s WHERE id=%s", (new_html, aid))
         conn.commit()
         cur.close()
         conn.close()
-        
-        # Retry Publishing (Recursion back to Approve)
         call.data = f"approve_{aid}"
         approve_publish(call)
-        
     threading.Thread(target=_repair).start()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_pub_"))
 def cancel_publish_handler(call):
     try:
         bot.answer_callback_query(call.id, "Отменено")
-    except:
-        pass
+    except: pass
     aid = call.data.split("_")[2]
-    
     conn = get_db_connection()
     cur = conn.cursor()
-    # Refund
     cur.execute("UPDATE users SET gens_left = gens_left + 1 WHERE user_id=%s", (call.from_user.id,))
     cur.execute("SELECT project_id FROM articles WHERE id=%s", (aid,))
     pid = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
-    
-    bot.edit_message_text("❌ Публикация отменена.\n💰 **Кредит возвращен на баланс.**", call.message.chat.id, call.message.message_id)
+    bot.edit_message_text("❌ Отменено.\n💰 **Кредит возвращен.**", call.message.chat.id, call.message.message_id)
     time.sleep(2)
     open_project_menu(call.message.chat.id, pid)
 
 def run_scheduler():
-    while True: time.sleep(60)
+    while True:
+        try:
+            schedule.run_pending()
+            if APP_URL: requests.get(APP_URL, timeout=10)
+        except: pass
+        time.sleep(600)
 
 app = Flask(__name__)
 @app.route('/')
@@ -2457,7 +2303,12 @@ def h(): return "Alive", 200
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000, use_reloader=False), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
     print("🤖 Бот запущен...")
-    bot.infinity_polling(skip_pending=True)
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"Polling Error: {e}")
+            time.sleep(5)
