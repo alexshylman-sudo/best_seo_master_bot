@@ -32,7 +32,7 @@ STEP_GIFS = {
     "survey": "https://ecosteni.ru/wp-content/uploads/2026/01/202601082231.gif",
     "competitors": "https://ecosteni.ru/wp-content/uploads/2026/01/202601082256.gif",
     "links": "https://ecosteni.ru/wp-content/uploads/2026/01/202601082306.gif",
-    "gallery": "https://media.giphy.com/media/l41YtZOb9EUABfje8/giphy.gif",
+    "gallery": "https://ecosteni.ru/wp-content/uploads/2026/01/a_girl_stands_202601082318.gif",
     "img_prompts": "https://media.giphy.com/media/d31vTpVi1LAcDvgi/giphy.gif",
     "text_prompts": "https://media.giphy.com/media/l0HlPybHMx6D3iaHO/giphy.gif",
     "cms": "https://media.giphy.com/media/3oKIPnAiaMCws8nOsE/giphy.gif",
