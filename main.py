@@ -782,28 +782,29 @@ def kb_gen_new_prompt(call):
         # --- FIXED VISION LOGIC ---
         content_parts = []
         
+        # Instruction in English as requested
         instruction = f"""
-        Роль: Эксперт по генерации изображений (Prompt Engineer) и Дизайну.
-        Контекст проекта: {info.get('survey_step1', 'Не указан')}.
+        Role: Expert AI Image Prompt Engineer.
+        Context: {info.get('survey_step1', 'General website')}.
         
-        ЗАДАЧА:
-        1. Внимательно рассмотри прикрепленные изображения.
-        2. Проанализируй их визуальный стиль: освещение, цветовую палитру (яркие цвета, неон, и т.д.), композицию, одежду людей, настроение.
-        3. Напиши детальный ТЕКСТОВЫЙ ПРОМПТ, который позволит сгенерировать НОВЫЕ изображения в точно таком же стиле.
-        
-        ВАЖНО:
-        - Промпт должен быть на РУССКОМ языке.
-        - Описывай именно СТИЛЬ (например: "Яркая фэшн фотография, оранжевые тона, неоновый свет"), а не просто то, что происходит на фото.
-        - Сделай описание богатым и вдохновляющим.
+        TASK:
+        1. Analyze the attached images deeply. Pay attention to lighting, colors, composition, materials, and mood.
+        2. Create a detailed TEXT-TO-IMAGE PROMPT that recreates this exact style.
+        3. The prompt MUST be in ENGLISH.
+        4. Focus on visual descriptors (e.g., "Cinematic lighting, neon orange accents, high fashion, marble texture").
+        5. Output ONLY the prompt text.
         """
-        content_parts.append(instruction)
+        
+        # Convert text to Part explicitly to avoid type errors
+        content_parts.append(genai_types.Part.from_text(text=instruction))
 
-        # Decode up to 4 images to avoid payload limits
         for b64_str in images_b64[:4]:
             try:
                 img_bytes = base64.b64decode(b64_str)
-                # Using genai_types.Part.from_bytes for the V2 SDK
-                image_part = genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+                # Simple header check for PNG
+                mime = "image/png" if img_bytes.startswith(b'\x89PNG') else "image/jpeg"
+                
+                image_part = genai_types.Part.from_bytes(data=img_bytes, mime_type=mime)
                 content_parts.append(image_part)
             except Exception as inner_e:
                 print(f"Image decode error: {inner_e}")
