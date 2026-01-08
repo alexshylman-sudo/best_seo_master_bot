@@ -260,7 +260,8 @@ def parse_sitemap(url):
                 if urlparse(full_url).netloc == domain:
                     links.append(full_url)
         
-        clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed'])]
+        # --- FIXED: FILTER OUT .XML AND SITEMAP LINKS ---
+        clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed', '.xml', 'sitemap'])]
         return clean_links[:100]
     except:
         return []
@@ -789,7 +790,8 @@ def kb_prompt_gen_menu(call):
         
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
     
-    bot.edit_message_text(f"🎨 **Генератор промптов**\n\nЛимит генераций для проекта: {used} / {limit}\n\nЯ проанализирую ваши фото и создам описание стиля.", 
+    # --- UPDATED: BOLD VISIBLE COUNTER ---
+    bot.edit_message_text(f"🎨 **Генератор промптов**\n\n📊 **Генераций: {used} / {limit}**\n\nЯ проанализирую ваши фото и создам описание стиля.", 
                           call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_new_prompt_"))
@@ -830,14 +832,10 @@ def kb_gen_new_prompt(call):
     bot.send_message(call.message.chat.id, "⏳ Анализирую ваши фото и придумываю стиль...")
     
     try:
-        # --- FIXED VISION LOGIC ---
         content_parts = []
-        
-        # Instruction in English as requested
         instruction = f"""
         Role: Expert AI Image Prompt Engineer.
         Context: {info.get('survey_step1', 'General website')}.
-        
         TASK:
         1. Analyze the attached images deeply. Pay attention to lighting, colors, composition, materials, and mood.
         2. Create a detailed TEXT-TO-IMAGE PROMPT that recreates this exact style.
@@ -845,7 +843,6 @@ def kb_gen_new_prompt(call):
         4. Focus on visual descriptors (e.g., "Cinematic lighting, neon orange accents, high fashion, marble texture").
         5. Output ONLY the prompt text.
         """
-        
         content_parts.append(genai_types.Part.from_text(text=instruction))
 
         for b64_str in images_b64[:4]:
@@ -853,22 +850,16 @@ def kb_gen_new_prompt(call):
                 img_bytes = base64.b64decode(b64_str)
                 mime = "image/png" if img_bytes.startswith(b'\x89PNG') else "image/jpeg"
                 content_parts.append(genai_types.Part.from_bytes(data=img_bytes, mime_type=mime))
-            except Exception as inner_e:
-                print(f"Image decode error: {inner_e}")
+            except: pass
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[genai_types.Content(parts=content_parts)]
-        )
-        
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=[genai_types.Content(parts=content_parts)])
         prompt_text = response.text.strip()
         
     except Exception as e:
         print(f"Vision Generation Error: {e}")
-        prompt_text = "Ошибка анализа изображений. Попробуйте еще раз."
+        prompt_text = "Ошибка анализа. Попробуйте еще раз."
 
     bot.send_message(call.message.chat.id, f"🎨 Генерирую превью по промпту:\n\n`{prompt_text}`", parse_mode='Markdown')
-    
     img_bytes = generate_image_bytes(prompt_text)
     
     if img_bytes:
@@ -980,107 +971,52 @@ def kb_gallery(call):
     try: bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[2]
-    
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
     images = cur.fetchone()[0] or []
     cur.close(); conn.close()
-    
     markup = types.InlineKeyboardMarkup(row_width=3)
     btns = []
-    for i in range(len(images)):
-        btns.append(types.InlineKeyboardButton(f"Фото {i+1}", callback_data=f"kb_view_{pid}_{i}"))
-    
+    for i in range(len(images)): btns.append(types.InlineKeyboardButton(f"Фото {i+1}", callback_data=f"kb_view_{pid}_{i}"))
     markup.add(*btns)
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
-    
     msg_text = f"📁 **Галерея ({len(images)} фото)**\n\nНажмите на кнопку, чтобы увидеть фото и удалить его."
-    
-    try:
-        # Попытка отредактировать сообщение (если это текст)
-        bot.edit_message_text(
-            text=msg_text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    except Exception:
-        # Если редактирование не удалось (например, предыдущее сообщение было фото),
-        # удаляем старое и отправляем новое.
-        try:
-            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
-        except:
-            pass
-        
-        bot.send_message(
-            chat_id=call.message.chat.id,
-            text=msg_text,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
+    try: bot.edit_message_text(text=msg_text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+    except: bot.send_message(chat_id=call.message.chat.id, text=msg_text, reply_markup=markup, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_view_"))
 def kb_view_photo(call):
     try: bot.answer_callback_query(call.id)
     except: pass
-    parts = call.data.split("_")
-    pid, idx = parts[2], int(parts[3])
-    
+    parts = call.data.split("_"); pid, idx = parts[2], int(parts[3])
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT style_images FROM projects WHERE id=%s", (pid,))
     images = cur.fetchone()[0] or []
     cur.close(); conn.close()
-    
-    if idx >= len(images):
-        bot.send_message(call.message.chat.id, "❌ Фото уже удалено.")
-        kb_gallery(call) # Refresh
-        return
-
-    b64_data = images[idx]
-    img_bytes = base64.b64decode(b64_data)
-    
+    if idx >= len(images): bot.send_message(call.message.chat.id, "❌ Фото уже удалено."); kb_gallery(call); return
+    b64_data = images[idx]; img_bytes = base64.b64decode(b64_data)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🗑 Удалить это фото", callback_data=f"kb_del_{pid}_{idx}"))
     markup.add(types.InlineKeyboardButton("🔙 В галерею", callback_data=f"kb_gallery_{pid}"))
-    
-    try:
-        bot.send_photo(call.message.chat.id, img_bytes, caption=f"🖼 Фото #{idx+1}", reply_markup=markup)
-    except Exception as e:
-        bot.send_message(call.message.chat.id, "❌ Ошибка отображения фото.")
+    try: bot.send_photo(call.message.chat.id, img_bytes, caption=f"🖼 Фото #{idx+1}", reply_markup=markup)
+    except Exception as e: bot.send_message(call.message.chat.id, "❌ Ошибка отображения фото.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_del_"))
 def kb_delete_single(call):
     try: bot.answer_callback_query(call.id, "Удалено")
     except: pass
-    parts = call.data.split("_")
-    pid, idx = parts[2], int(parts[3])
-    
-    conn = get_db_connection()
-    if not conn: return
-    cur = conn.cursor()
-    
-    # Блокировка для безопасного удаления
+    parts = call.data.split("_"); pid, idx = parts[2], int(parts[3])
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT style_images FROM projects WHERE id=%s FOR UPDATE", (pid,))
     images = cur.fetchone()[0] or []
-    
     if idx < len(images):
         del images[idx]
         cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
-        conn.commit()
-        # Попытка удалить фото перед возвратом в галерею
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
+        conn.commit(); try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         bot.send_message(call.message.chat.id, f"✅ Фото удалено. Осталось: {len(images)}")
-    else:
-        conn.rollback()
-        bot.send_message(call.message.chat.id, "❌ Фото уже не существует.")
-        
-    cur.close(); conn.close()
-    
-    # Возвращаем в галерею
-    kb_gallery(call)
+    else: conn.rollback(); bot.send_message(call.message.chat.id, "❌ Фото уже не существует.")
+    cur.close(); conn.close(); kb_gallery(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_clear_photos_"))
 def kb_clear_photos(call):
@@ -1095,8 +1031,7 @@ def kb_clear_photos(call):
 def kb_menu_wrapper(chat_id, pid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT style_prompt, style_images, style_negative_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
-    res = cur.fetchone()
-    cur.close(); conn.close()
+    res = cur.fetchone(); cur.close(); conn.close()
     style_text = res[0] or "Не задан"; images = res[1] or []; neg = res[2] or "Не задан"; app_p = res[3] or []
     msg = (f"🧠 **База Знаний**\n\n🎨 **Промпт:** {escape_md(style_text[:50])}...\n🚫 **Анти-промпт:** {escape_md(neg[:50])}...\n"
            f"🖼 **Фото:** {len(images)}/30.\n✅ **Утвержденных промптов:** {len(app_p)}")
@@ -1599,7 +1534,10 @@ def write_article_handler(call):
                 try: sitemap_list = json.loads(sitemap_data)
                 except: sitemap_list = []
             else: sitemap_list = []
-            links_text = "\n".join(sitemap_list[:50]) if sitemap_list else "No internal links."
+            # --- FIXED: CLEAN SITEMAP LINKS ---
+            clean_sitemap_list = [l for l in sitemap_list if not any(x in l for x in ['.xml', 'sitemap'])]
+            links_text = "\n".join(clean_sitemap_list[:50]) if clean_sitemap_list else "No internal links."
+            # ----------------------------------
             topics = info.get("temp_topics", []); topic_text = topics[idx] if len(topics) > idx else "SEO Article"
             current_year = datetime.datetime.now().year
             cur.execute("UPDATE users SET gens_left = gens_left - 1 WHERE user_id = (SELECT user_id FROM projects WHERE id=%s) AND is_admin = FALSE", (pid,)); conn.commit()
