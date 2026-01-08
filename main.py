@@ -160,7 +160,8 @@ def update_last_active(user_id):
             conn.commit()
             cur.close()
             conn.close()
-        except: pass
+        except:
+            pass
     threading.Thread(target=_update).start()
 
 # --- 3. UTILITIES ---
@@ -621,10 +622,7 @@ def kb_menu(call):
     res = cur.fetchone()
     cur.close()
     conn.close()
-    style_text = res[0] or "Не задан"
-    images = res[1] or []
-    neg_prompt = res[2] or "Не задан"
-    app_p = res[3] or []
+    style_text = res[0] or "Не задан"; images = res[1] or []; neg_prompt = res[2] or "Не задан"; app_p = res[3] or []
     msg = (f"🧠 **База Знаний**\n\n🎨 **Промпт:** _{escape_md(style_text)}_\n🚫 **Анти-промпт:** _{escape_md(neg_prompt)}_\n"
            f"🖼 **Фото:** {len(images)}/30.\n✅ **Утвержденных промптов:** {len(app_p)}")
     markup = types.InlineKeyboardMarkup()
@@ -933,8 +931,10 @@ def kb_delete_single(call):
         del images[idx]
         cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
         conn.commit()
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except: pass
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
         bot.send_message(call.message.chat.id, f"✅ Фото удалено. Осталось: {len(images)}")
     else: 
         conn.rollback()
@@ -963,10 +963,7 @@ def kb_menu_wrapper(chat_id, pid):
     res = cur.fetchone()
     cur.close()
     conn.close()
-    style_text = res[0] or "Не задан"
-    images = res[1] or []
-    neg = res[2] or "Не задан"
-    app_p = res[3] or []
+    style_text = res[0] or "Не задан"; images = res[1] or []; neg = res[2] or "Не задан"; app_p = res[3] or []
     msg = (f"🧠 **База Знаний**\n\n🎨 **Промпт:** {escape_md(style_text[:50])}...\n🚫 **Анти-промпт:** {escape_md(neg[:50])}...\n"
            f"🖼 **Фото:** {len(images)}/30.\n✅ **Утвержденных промптов:** {len(app_p)}")
     markup = types.InlineKeyboardMarkup()
@@ -1068,10 +1065,13 @@ def tariff_period_select(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_periods")
 def back_to_periods(call):
-    try: bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
     except: pass
+    
     show_tariff_periods(call.from_user.id)
-    try: bot.delete_message(call.message.chat.id, call.message.message_id)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
     except: pass
 
 def process_tariff_selection(call, name, price, code):
