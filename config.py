@@ -28,10 +28,10 @@ COMPETITOR_STATE = {}
 
 # --- GIF DICTIONARY ---
 STEP_GIFS = {
-    "scan": "https://media.giphy.com/media/l3vR85PnGgmwvPspG/giphy.gif",
-    "survey": "https://media.giphy.com/media/3o7TKSjRrfIPjeiVyM/giphy.gif",
-    "competitors": "https://media.giphy.com/media/l0HlOaQcLJ2hHpYzg/giphy.gif",
-    "links": "https://media.giphy.com/media/3o7TKIeW38L3O3pXeo/giphy.gif",
+    "scan": "https://ecosteni.ru/wp-content/uploads/2026/01/202601081821.gif",
+    "survey": "https://ecosteni.ru/wp-content/uploads/2026/01/202601082231.gif",
+    "competitors": "https://ecosteni.ru/wp-content/uploads/2026/01/202601082256.gif",
+    "links": "https://ecosteni.ru/wp-content/uploads/2026/01/202601082306.gif",
     "gallery": "https://media.giphy.com/media/l41YtZOb9EUABfje8/giphy.gif",
     "img_prompts": "https://media.giphy.com/media/d31vTpVi1LAcDvgi/giphy.gif",
     "text_prompts": "https://media.giphy.com/media/l0HlPybHMx6D3iaHO/giphy.gif",
