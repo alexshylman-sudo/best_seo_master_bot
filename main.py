@@ -34,10 +34,10 @@ bot = TeleBot(TOKEN)
 client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 UPLOAD_STATE = {} 
-LINK_UPLOAD_STATE = {} # New state for link files
+LINK_UPLOAD_STATE = {} 
 SURVEY_STATE = {} 
 TEMP_PROMPTS = {} 
-TEMP_LINKS = {} # Buffer for links before approval
+TEMP_LINKS = {} 
 
 # --- 2. DATABASE ---
 def get_db_connection():
@@ -746,7 +746,10 @@ def kb_menu(call):
 # --- LINKS MANAGEMENT HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_links_menu_"))
 def kb_links_menu(call):
-    try: bot.answer_callback_query(call.id); except: pass
+    try:
+        bot.answer_callback_query(call.id)
+    except:
+        pass
     pid = call.data.split("_")[3]
     
     conn = get_db_connection()
@@ -776,7 +779,10 @@ def kb_links_menu(call):
 # --- LINK GENERATION (INTERNAL) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_int_"))
 def kb_gen_internal(call):
-    try: bot.answer_callback_query(call.id, "Сканирую..."); except: pass
+    try:
+        bot.answer_callback_query(call.id, "Сканирую...")
+    except:
+        pass
     pid = call.data.split("_")[3]
     bot.send_message(call.message.chat.id, "⏳ Сканирую карту сайта...")
     
@@ -807,7 +813,10 @@ def kb_gen_internal(call):
 # --- LINK GENERATION (EXTERNAL) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_ext_"))
 def kb_gen_external(call):
-    try: bot.answer_callback_query(call.id, "Генерирую..."); except: pass
+    try:
+        bot.answer_callback_query(call.id, "Генерирую...")
+    except:
+        pass
     pid = call.data.split("_")[3]
     bot.send_message(call.message.chat.id, "⏳ Ищу авторитетные ресурсы...")
     
@@ -849,7 +858,10 @@ def kb_gen_external(call):
 # --- SAVE LINKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_save_"))
 def kb_save_links(call):
-    try: bot.answer_callback_query(call.id, "Сохранено"); except: pass
+    try:
+        bot.answer_callback_query(call.id, "Сохранено")
+    except:
+        pass
     parts = call.data.split("_")
     type_ = parts[2] # int or ext
     pid = parts[3]
@@ -874,7 +886,10 @@ def kb_save_links(call):
 # --- DOWNLOAD TEMP LINKS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_dl_temp_"))
 def kb_dl_temp(call):
-    try: bot.answer_callback_query(call.id); except: pass
+    try:
+        bot.answer_callback_query(call.id)
+    except:
+        pass
     parts = call.data.split("_")
     type_ = parts[3]
     pid = parts[4]
@@ -891,7 +906,10 @@ def kb_dl_temp(call):
 # --- UPLOAD LINKS HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_up_"))
 def kb_upload_start(call):
-    try: bot.answer_callback_query(call.id); except: pass
+    try:
+        bot.answer_callback_query(call.id)
+    except:
+        pass
     parts = call.data.split("_")
     type_ = parts[2] # int or ext
     pid = parts[3]
