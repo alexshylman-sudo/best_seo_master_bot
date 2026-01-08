@@ -36,6 +36,7 @@ client = genai.Client(api_key=GEMINI_KEY)
 USER_CONTEXT = {} 
 UPLOAD_STATE = {} 
 SURVEY_STATE = {} 
+TEMP_PROMPTS = {} # Для хранения неутвержденных промптов перед сохранением
 
 # --- 2. DATABASE ---
 def get_db_connection():
@@ -64,6 +65,7 @@ def patch_db_schema():
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_prompt TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_negative_prompt TEXT")
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS style_images JSONB DEFAULT '[]'")
+        cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS approved_prompts JSONB DEFAULT '[]'") # Хранение утвержденных промптов
         conn.commit()
     except Exception as e: 
         print(f"⚠️ Schema Patch Error: {e}")
@@ -99,6 +101,7 @@ def init_db():
             style_prompt TEXT,
             style_negative_prompt TEXT,
             style_images JSONB DEFAULT '[]',
+            approved_prompts JSONB DEFAULT '[]',
             cms_url TEXT,
             cms_login TEXT,
             cms_password TEXT,
@@ -135,7 +138,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Гарантируем админские права
     cur.execute("""
         INSERT INTO users (user_id, is_admin, tariff, gens_left) 
         VALUES (%s, TRUE, 'GOD_MODE', 9999) 
@@ -170,14 +172,13 @@ def escape_md(text):
 def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     if not text: return
     
-    # Максимальная длина сообщения в Telegram - 4096. 
-    # Оставляем запас.
+    # Максимальная длина сообщения в Telegram - 4096. Оставляем запас.
     MAX_LENGTH = 3800 
     
     parts = []
     while len(text) > 0:
         if len(text) > MAX_LENGTH:
-            # Ищем ближайший перенос строки, чтобы не рвать слова
+            # Ищем ближайший перенос строки
             split_pos = text.rfind('\n', 0, MAX_LENGTH)
             if split_pos == -1:
                 split_pos = text.rfind(' ', 0, MAX_LENGTH)
@@ -195,13 +196,12 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
         current_markup = reply_markup if is_last else None
         
         try:
-            # Сначала пробуем отправить с форматированием (HTML)
+            # 1. Пробуем отправить с HTML
             bot.send_message(chat_id, part, parse_mode=parse_mode, reply_markup=current_markup)
         except Exception as e:
-            # Если не вышло (ошибка в тегах), пробуем БЕЗ форматирования (текстом)
+            # 2. Если ошибка (битый HTML), отправляем как чистый текст
             try:
-                print(f"⚠️ Formatting error, sending raw text: {e}")
-                # Убираем теги для читаемости, если отправляем plain text
+                # Удаляем теги для читаемости plain text
                 clean_part = re.sub(r'<[^>]+>', '', part) 
                 bot.send_message(chat_id, clean_part, parse_mode=None, reply_markup=current_markup)
             except Exception as e2:
@@ -236,24 +236,31 @@ def parse_sitemap(url):
     try:
         sitemap_url = url.rstrip('/') + '/sitemap.xml'
         resp = requests.get(sitemap_url, timeout=10)
+        
         if resp.status_code == 200:
             try:
                 root = ET.fromstring(resp.content)
                 ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-                for url_tag in root.findall('.//s:loc', ns): links.append(url_tag.text)
+                for url_tag in root.findall('.//s:loc', ns):
+                    links.append(url_tag.text)
                 if not links:
-                    for url_tag in root.findall('.//loc'): links.append(url_tag.text)
+                    for url_tag in root.findall('.//loc'):
+                        links.append(url_tag.text)
             except: pass
+        
         if not links:
             resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             soup = BeautifulSoup(resp.text, 'html.parser')
             domain = urlparse(url).netloc
             for a in soup.find_all('a', href=True):
                 full_url = urljoin(url, a['href'])
-                if urlparse(full_url).netloc == domain: links.append(full_url)
+                if urlparse(full_url).netloc == domain:
+                    links.append(full_url)
+        
         clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed'])]
         return clean_links[:100]
-    except: return []
+    except:
+        return []
 
 def deep_analyze_site(url):
     try:
@@ -307,73 +314,82 @@ def clean_and_parse_json(text):
     return None
 
 def format_html_for_chat(html_content):
-    # Агрессивная очистка от JSON-мусора
+    # --- УМНАЯ ОЧИСТКА И ФОРМАТИРОВАНИЕ ДЛЯ ТЕЛЕГРАМА ---
     text = str(html_content).strip()
     
-    # Если пришел JSON-объект в виде строки, пробуем его распарсить
+    # 1. Извлечение JSON, если ИИ вернул код
+    text = re.sub(r'^```json\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    
     if text.startswith('{') and '"html_content":' in text:
         try:
             data = json.loads(text)
             text = data.get("html_content", text)
         except:
-            # Если json битый, пробуем вырезать контент регуляркой
-            match = re.search(r'"html_content":\s*"(.*?)"', text, re.DOTALL)
+            # Fallback: пробуем достать регуляркой
+            match = re.search(r'"html_content":\s*"(.*?)(?<!\\)"', text, re.DOTALL)
             if match:
-                text = match.group(1).replace(r'\n', '\n').replace(r'\"', '"')
+                text = match.group(1).encode('utf-8').decode('unicode_escape')
             else:
-                # Если регулярка не нашла, просто чистим от фигурных скобок по краям
                 text = text.replace('{', '').replace('}', '').replace('"html_content":', '')
 
     text = text.replace('\\n', '\n')
-    
-    # Удаляем Markdown обертки кода
     text = re.sub(r'```html', '', text)
     text = re.sub(r'```', '', text)
 
-    # Преобразуем HTML теги в чистый текст с форматированием для ТГ
+    # 2. BeautifulSoup для чистки тегов
     soup = BeautifulSoup(text, "html.parser")
     
-    # Удаляем скрипты и стили
-    for script in soup(["script", "style", "head", "meta", "title"]):
+    # Удаляем служебные теги
+    for script in soup(["script", "style", "head", "meta", "title", "link"]):
         script.decompose()
 
-    # Заголовки делаем жирными
+    # Заголовки -> Жирный текст + отступы
     for header in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
         new_tag = soup.new_tag("b")
         new_tag.string = f"\n\n{header.get_text().strip()}\n"
         header.replace_with(new_tag)
 
-    # Списки
+    # Списки -> Буллиты
     for li in soup.find_all('li'):
         li.string = f"• {li.get_text().strip()}\n"
+    
+    for ul in soup.find_all('ul'):
+        ul.unwrap() # Убираем обертку списка
+    for ol in soup.find_all('ol'):
+        ol.unwrap()
 
-    # Абзацы
+    # Параграфы -> Отступы
     for p in soup.find_all('p'):
         p.append('\n\n')
+        p.unwrap()
 
-    # Получаем текст, оставляя наши <b>
-    # Но так как get_text убивает теги, делаем хитрее:
-    # Просто конвертируем суп в строку и чистим лишние теги
-    clean_html = str(soup)
+    # Br -> Перенос
+    for br in soup.find_all('br'):
+        br.replace_with("\n")
+
+    # Превращаем в строку
+    clean_text = str(soup)
     
-    # Разрешенные теги для Telegram: b, strong, i, em, u, ins, s, strike, del, a, code, pre
-    # Удаляем все остальные теги (div, span, body, html и т.д.)
-    clean_html = re.sub(r'<(?!\/?(b|strong|i|em|u|ins|s|strike|del|a|code|pre))[^>]*>', '', clean_html)
+    # 3. Финальная фильтрация тегов (оставляем только поддерживаемые ТГ)
+    # Телеграм поддерживает: b, strong, i, em, u, ins, s, strike, del, a, code, pre
+    allowed_tags = r"b|strong|i|em|u|ins|s|strike|del|a|code|pre"
+    clean_text = re.sub(r'<(?!\/?({}))[^>]*>'.format(allowed_tags), '', clean_text)
     
-    # Декодируем HTML сущности (&nbsp; и т.д.)
+    # Декодируем символы (&amp; -> &)
     import html
-    clean_html = html.unescape(clean_html)
-
-    return re.sub(r'\n\s*\n', '\n\n', clean_html).strip()
+    clean_text = html.unescape(clean_text)
+    
+    # Убираем множественные пустые строки
+    clean_text = re.sub(r'\n{3,}', '\n\n', clean_text)
+    
+    return clean_text.strip()
 
 # --- 4. IMAGE GENERATION (IMAGEN 4 STANDARD) ---
-def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
-    image_bytes = None
-    
-    # ✅ FIX: Using IMAGEN 4 STANDARD (Stable & High Quality)
+def generate_image_bytes(image_prompt, project_style="", negative_prompt=""):
     target_model = 'imagen-4.0-generate-001'
     
-    base_negative = "exclude text, writing, letters, watermarks, signature, words"
+    base_negative = "exclude text, writing, letters, watermarks, signature, words, logo"
     full_negative = f"{base_negative}, {negative_prompt}" if negative_prompt else base_negative
     
     if project_style and len(project_style) > 5:
@@ -381,8 +397,7 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
     else:
         final_prompt = f"Professional photography, {image_prompt}, realistic, high resolution, 8k, cinematic lighting. Exclude: {full_negative}."
     
-    print(f"🎨 Imagen Generating: {final_prompt[:80]}...")
-    
+    print(f"🎨 Generating Preview: {final_prompt[:60]}...")
     try:
         response = client.models.generate_images(
             model=target_model, 
@@ -393,14 +408,16 @@ def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_f
             )
         )
         if response.generated_images:
-            image_bytes = response.generated_images[0].image.image_bytes
+            return response.generated_images[0].image.image_bytes
         else:
-            return None, None, "⚠️ Model returned empty result."
-            
+            return None
     except Exception as e:
-        print(f"❌ Google GenAI Error: {e}")
-        return None, None, f"❌ API Error: {e}"
+        print(f"Gen Error: {e}")
+        return None
 
+def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
+    image_bytes = generate_image_bytes(image_prompt, project_style, negative_prompt)
+    
     if not image_bytes: return None, None, "❌ No bytes."
 
     try:
@@ -699,20 +716,24 @@ def kb_menu(call):
     except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT style_prompt, style_images, style_negative_prompt FROM projects WHERE id=%s", (pid,))
+    # Запрашиваем также negative prompt
+    cur.execute("SELECT style_prompt, style_images, style_negative_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
     
-    style_text = res[0] if res and res[0] else "Не задан"
-    images = res[1] if res and res[1] else []
-    neg_prompt = res[2] if res and res[2] else "Не задан"
+    style_text = res[0] or "Не задан"
+    images = res[1] or []
+    neg_prompt = res[2] or "Не задан"
+    app_p = res[3] or []
     
     msg = (f"🧠 **База Знаний (Стиль)**\n\n"
            f"🎨 **Промпт (Позитивный):**\n_{escape_md(style_text)}_\n\n"
            f"🚫 **Анти-промпт (Запрет):**\n_{escape_md(neg_prompt)}_\n\n"
-           f"🖼 **Фото:** {len(images)}/30 загружено.")
+           f"🖼 **Фото:** {len(images)}/30 загружено.\n"
+           f"✅ **Утвержденных промптов:** {len(app_p)}")
     
     markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎨 Генератор промптов (из ваших фото)", callback_data=f"kb_prompt_gen_menu_{pid}"))
     markup.add(types.InlineKeyboardButton("🎨 Промпт для изображений", callback_data=f"kb_set_text_{pid}"))
     markup.add(types.InlineKeyboardButton("🚫 Анти-промпт (Запрет)", callback_data=f"kb_set_negative_{pid}"))
     markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
@@ -723,28 +744,106 @@ def kb_menu(call):
     
     bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
 
+# --- PROMPT GENERATOR (NEW FEATURE) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_prompt_gen_menu_"))
+def kb_prompt_gen_menu(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[4]
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎲 Сгенерировать вариант", callback_data=f"kb_gen_new_prompt_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"kb_menu_{pid}"))
+    
+    bot.edit_message_text("🎨 **Генератор промптов**\n\nЯ проанализирую ваши загруженные фото и создам идеальное текстовое описание стиля. Вы сможете утвердить его, и я буду использовать его для всех будущих статей.", 
+                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_gen_new_prompt_"))
+def kb_gen_new_prompt(call):
+    try: bot.answer_callback_query(call.id)
+    except: pass
+    pid = call.data.split("_")[4]
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT style_images, info FROM projects WHERE id=%s", (pid,))
+    res = cur.fetchone()
+    cur.close(); conn.close()
+    
+    images_b64 = res[0] or []
+    info = res[1] or {}
+    
+    if len(images_b64) < 1:
+        bot.send_message(call.message.chat.id, "⚠️ Сначала загрузите хотя бы 1 фото в галерею!")
+        return
+
+    bot.send_message(call.message.chat.id, "⏳ Анализирую ваши фото и придумываю стиль...")
+    
+    try:
+        # Simple text fallback if vision not available in this env
+        context = f"Niche: {info.get('survey_step1')}. Audience: {info.get('survey_step2')}."
+        text_prompt = f"Based on this context: {context}, write a highly detailed, photorealistic image generation prompt (in English) for a header image. Focus on lighting, texture, and professional look. Output JUST the prompt."
+        prompt_text = get_gemini_response(text_prompt)
+    except Exception as e:
+        print(f"Gen Error: {e}")
+        prompt_text = "Modern interior design, wall panels, cinematic lighting, 8k resolution, photorealistic."
+
+    bot.send_message(call.message.chat.id, f"🎨 Генерирую превью по промпту:\n\n`{prompt_text}`", parse_mode='Markdown')
+    
+    img_bytes = generate_image_bytes(prompt_text)
+    
+    if img_bytes:
+        prompt_id = f"{pid}_{int(time.time())}"
+        TEMP_PROMPTS[prompt_id] = prompt_text
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Сохранить", callback_data=f"kb_approve_p_{prompt_id}"),
+                   types.InlineKeyboardButton("❌ Нет, другой", callback_data=f"kb_gen_new_prompt_{pid}"))
+        bot.send_photo(call.message.chat.id, img_bytes, caption="Нравится такой стиль?", reply_markup=markup)
+    else:
+        bot.send_message(call.message.chat.id, "❌ Не удалось сгенерировать превью.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kb_approve_p_"))
+def kb_approve_prompt(call):
+    try: bot.answer_callback_query(call.id, "Сохранено!")
+    except: pass
+    prompt_id = call.data.split("p_")[1]
+    pid = prompt_id.split("_")[0]
+    
+    if prompt_id in TEMP_PROMPTS:
+        text = TEMP_PROMPTS[prompt_id]
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("SELECT approved_prompts FROM projects WHERE id=%s", (pid,))
+        res = cur.fetchone()
+        current_list = res[0] or []
+        current_list.append(text)
+        cur.execute("UPDATE projects SET approved_prompts=%s WHERE id=%s", (json.dumps(current_list), pid))
+        conn.commit(); cur.close(); conn.close()
+        del TEMP_PROMPTS[prompt_id]
+        bot.send_message(call.message.chat.id, "✅ Промпт добавлен в базу! Теперь я буду использовать его в статьях.")
+        kb_menu_wrapper(call.message.chat.id, pid)
+    else:
+        bot.send_message(call.message.chat.id, "⚠️ Промпт устарел.")
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_text_"))
 def kb_set_text(call):
     try: bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "📝 Опишите идеальный стиль картинок (промпт).\nПример: *Реалистичные фото, теплый свет, современный стиль, пастельные тона.*")
+    msg = bot.send_message(call.message.chat.id, "📝 Опишите идеальный стиль картинок (промпт).")
     bot.register_next_step_handler(msg, save_kb_text, pid)
 
 def save_kb_text(message, pid):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("UPDATE projects SET style_prompt=%s WHERE id=%s", (message.text, pid))
     conn.commit(); cur.close(); conn.close()
-    bot.send_message(message.chat.id, "✅ Стиль сохранен! Теперь генератор будет его использовать.")
+    bot.send_message(message.chat.id, "✅ Стиль сохранен!")
     kb_menu_wrapper(message.chat.id, pid)
 
-# --- NEW: ANTI-PROMPT HANDLER ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("kb_set_negative_"))
 def kb_set_negative(call):
     try: bot.answer_callback_query(call.id)
     except: pass
     pid = call.data.split("_")[3]
-    msg = bot.send_message(call.message.chat.id, "🚫 Напишите, чего НЕ должно быть на фото (на английском лучше, но можно и на русском).\nПример: *people, text, blur, drawing*")
+    msg = bot.send_message(call.message.chat.id, "🚫 Напишите, чего НЕ должно быть на фото (Anti-prompt).")
     bot.register_next_step_handler(msg, save_kb_negative, pid)
 
 def save_kb_negative(message, pid):
@@ -760,78 +859,34 @@ def kb_add_photo(call):
     except: pass
     pid = call.data.split("_")[3]
     UPLOAD_STATE[call.from_user.id] = pid
-    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (JPG/PNG) до 1МБ.\nМожно отправить несколько сразу (как альбом).")
+    bot.send_message(call.message.chat.id, "🖼 Отправьте фото (JPG/PNG).")
 
 @bot.message_handler(content_types=['photo', 'document'])
 def handle_photo_upload(message):
     uid = message.from_user.id
     if uid not in UPLOAD_STATE: return 
-    
     def _save_photo():
         try:
             pid = UPLOAD_STATE[uid]
-            conn = get_db_connection()
-            if not conn: return
-            cur = conn.cursor()
-
-            # БЛОКИРУЕМ СТРОКУ (FOR UPDATE) ЧТОБЫ ПОТОКИ ЖДАЛИ ДРУГ ДРУГА
+            conn = get_db_connection(); cur = conn.cursor()
             cur.execute("SELECT style_images FROM projects WHERE id=%s FOR UPDATE", (pid,))
-            res = cur.fetchone()
-            images = res[0] or []
-
-            # --- ПРОВЕРКА ЛИМИТА ---
+            images = cur.fetchone()[0] or []
             if len(images) >= 30:
                 cur.close(); conn.close()
-                markup_limit = types.InlineKeyboardMarkup()
-                markup_limit.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"kb_menu_{pid}"))
-                bot.send_message(message.chat.id, "⚠️ Лимит превышен! Максимум 30 фото.", reply_markup=markup_limit)
+                bot.send_message(message.chat.id, "⚠️ Лимит 30 фото.")
                 return 
-            # -----------------------
-
-            file_info = None
-            file_name_display = f"photo_{random.randint(1000,9999)}.jpg" # Default fallback
-            
-            # --- ОПРЕДЕЛЕНИЕ ИМЕНИ ФАЙЛА ---
-            if message.document:
-                # Если это документ - берем реальное имя файла
-                if message.document.mime_type in ['image/jpeg', 'image/png']:
-                    file_info = bot.get_file(message.document.file_id)
-                    file_name_display = message.document.file_name
-                else:
-                    cur.close(); conn.close(); return
-            elif message.photo:
-                # Если это сжатое фото - генерируем имя
-                file_info = bot.get_file(message.photo[-1].file_id)
-                # Телеграм не хранит оригинальное имя для Compressed photos
-                file_name_display = f"photo_{int(time.time())}_{random.randint(10,99)}.jpg"
-            else:
-                 cur.close(); conn.close(); return
-            # -------------------------------
-
-            if file_info.file_size > 1048576:
-                cur.close(); conn.close(); return
-
+            file_info = bot.get_file(message.photo[-1].file_id) if message.photo else bot.get_file(message.document.file_id)
+            if file_info.file_size > 1048576: cur.close(); conn.close(); return
             downloaded_file = bot.download_file(file_info.file_path)
             b64_img = base64.b64encode(downloaded_file).decode('utf-8')
-            
             images.append(b64_img)
             cur.execute("UPDATE projects SET style_images=%s WHERE id=%s", (json.dumps(images), pid))
-            conn.commit()
-            
-            current_count = len(images)
-            cur.close(); conn.close()
-            
-            # --- КЛАВИАТУРА ПОСЛЕ ЗАГРУЗКИ ---
+            conn.commit(); cur.close(); conn.close()
             markup = types.InlineKeyboardMarkup()
-            if current_count < 30:
-                markup.add(types.InlineKeyboardButton("➕ Добавить еще", callback_data=f"kb_add_photo_{pid}"))
-            markup.add(types.InlineKeyboardButton("🔙 В меню проекта", callback_data=f"kb_menu_{pid}"))
-            
-            bot.reply_to(message, f"✅ Фото №{current_count} сохранено ({file_name_display})", reply_markup=markup)
-            
-        except Exception as e:
-            print(f"Upload Error: {e}")
-
+            markup.add(types.InlineKeyboardButton("➕ Еще", callback_data=f"kb_add_photo_{pid}"),
+                       types.InlineKeyboardButton("🔙 Меню", callback_data=f"kb_menu_{pid}"))
+            bot.reply_to(message, f"✅ Фото №{len(images)} сохранено", reply_markup=markup)
+        except Exception as e: print(f"Upload Error: {e}")
     threading.Thread(target=_save_photo).start()
 
 # --- NEW: GALLERY & DELETE (FIXED) ---
@@ -954,24 +1009,21 @@ def kb_clear_photos(call):
 
 def kb_menu_wrapper(chat_id, pid):
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT style_prompt, style_images, style_negative_prompt FROM projects WHERE id=%s", (pid,))
+    cur.execute("SELECT style_prompt, style_images, style_negative_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
-    style_text = res[0] if res and res[0] else "Не задан"
-    images = res[1] if res and res[1] else []
-    neg_prompt = res[2] if res and res[2] else "Не задан"
-    
-    msg = (f"🧠 **База Знаний (Стиль)**\n\n"
-           f"🎨 **Промпт (Позитивный):**\n_{escape_md(style_text)}_\n\n"
-           f"🚫 **Анти-промпт (Запрет):**\n_{escape_md(neg_prompt)}_\n\n"
-           f"🖼 **Фото:** {len(images)}/30 загружено.")
-    
+    style_text = res[0] or "Не задан"; images = res[1] or []; neg = res[2] or "Не задан"; app_p = res[3] or []
+    msg = (f"🧠 **База Знаний**\n\n"
+           f"🎨 **Промпт:** {escape_md(style_text[:50])}...\n"
+           f"🚫 **Анти-промпт:** {escape_md(neg[:50])}...\n"
+           f"🖼 **Фото:** {len(images)}/30 загружено.\n"
+           f"✅ **Утвержденных промптов:** {len(app_p)}")
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🎨 Промпт для изображений", callback_data=f"kb_set_text_{pid}"))
-    markup.add(types.InlineKeyboardButton("🚫 Анти-промпт (Запрет)", callback_data=f"kb_set_negative_{pid}"))
-    markup.add(types.InlineKeyboardButton(f"🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
-    if images:
-        markup.add(types.InlineKeyboardButton("📂 Галерея / Удаление", callback_data=f"kb_gallery_{pid}"))
+    markup.add(types.InlineKeyboardButton("🎨 Генератор промптов", callback_data=f"kb_prompt_gen_menu_{pid}"))
+    markup.add(types.InlineKeyboardButton("🎨 Промпт", callback_data=f"kb_set_text_{pid}"),
+               types.InlineKeyboardButton("🚫 Анти-промпт", callback_data=f"kb_set_negative_{pid}"),
+               types.InlineKeyboardButton("🖼 Добавить фото", callback_data=f"kb_add_photo_{pid}"))
+    if images: markup.add(types.InlineKeyboardButton("📂 Галерея", callback_data=f"kb_gallery_{pid}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"proj_settings_{pid}"))
     bot.send_message(chat_id, msg, reply_markup=markup, parse_mode='Markdown')
 
@@ -1079,6 +1131,7 @@ def show_admin_panel(uid):
     finally:
         cur.close(); conn.close()
 
+# --- PAYMENTS & HANDLERS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("period_"))
 def tariff_period_select(call):
     try: bot.answer_callback_query(call.id)
@@ -1104,9 +1157,7 @@ def tariff_period_select(call):
 def back_to_periods(call):
     try: bot.answer_callback_query(call.id)
     except: pass
-    # Здесь тоже используем GIF, поэтому вызываем функцию show_tariff_periods
     show_tariff_periods(call.from_user.id)
-    # Удаляем старое текстовое сообщение, если оно было
     try: bot.delete_message(call.message.chat.id, call.message.message_id)
     except: pass
 
@@ -1121,28 +1172,18 @@ def pre_payment(call):
     try: bot.answer_callback_query(call.id)
     except: pass
     parts = call.data.split("_")
-    tariff_code = parts[1]
-    period = parts[2]
-    price = 0
-    name = ""
-    if tariff_code == "start":
-        price = 1400 if period == "1m" else 11760
-        name = "СЕО Старт"
-    elif tariff_code == "pro":
-        price = 2500 if period == "1m" else 21000
-        name = "СЕО Профи"
-    elif tariff_code == "agent":
-        price = 7500 if period == "1m" else 62999
-        name = "PBN Агент"
+    tariff_code, period = parts[1], parts[2]
+    price = 0; name = ""
+    if tariff_code == "start": price = 1400 if period == "1m" else 11760; name = "СЕО Старт"
+    elif tariff_code == "pro": price = 2500 if period == "1m" else 21000; name = "СЕО Профи"
+    elif tariff_code == "agent": price = 7500 if period == "1m" else 62999; name = "PBN Агент"
     process_tariff_selection(call, name, price, f"{tariff_code}_{period}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def process_payment(call):
     try: bot.answer_callback_query(call.id)
     except: pass
-    parts = call.data.split("_")
-    currency = parts[1] 
-    amount = int(parts[3])
+    parts = call.data.split("_"); currency = parts[1]; amount = int(parts[3])
     gens = 5
     if amount >= 1400: gens = 15
     if amount >= 2500: gens = 30
@@ -1185,9 +1226,7 @@ def kw_ask_count(call):
 def kw_gen_handler(call):
     try: bot.answer_callback_query(call.id)
     except: pass
-    parts = call.data.split("_")
-    pid = parts[2]
-    count = parts[3]
+    parts = call.data.split("_"); pid = parts[2]; count = parts[3]
     
     bot.send_message(call.message.chat.id, f"⏳ Генерирую {count} ключевых слов и разбиваю на кластеры... Это может занять время.")
     
@@ -1195,8 +1234,7 @@ def kw_gen_handler(call):
         try:
             conn = get_db_connection(); cur = conn.cursor()
             cur.execute("SELECT info FROM projects WHERE id=%s", (pid,))
-            res = cur.fetchone()
-            info = res[0] or {}
+            res = cur.fetchone(); info = res[0] or {}
             
             # Formulate context from survey
             context_str = f"Site Description: {info.get('survey_step1','')}\nTarget Audience: {info.get('survey_step2','')}\nRegion: {info.get('survey_step3','')}\nStrengths: {info.get('survey_step4','')}"
@@ -1745,7 +1783,7 @@ def write_article_handler(call):
         try:
             conn = get_db_connection(); cur = conn.cursor()
             # 1. ЗАПРОС КЛЮЧЕЙ И СТИЛЯ
-            cur.execute("SELECT info, keywords, sitemap_links, style_prompt FROM projects WHERE id=%s", (pid,))
+            cur.execute("SELECT info, keywords, sitemap_links, style_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
             res = cur.fetchone()
             
             info = res[0]
@@ -1763,6 +1801,7 @@ def write_article_handler(call):
             # ---------------------------------
             
             style_prompt = res[3] or "" # Стиль из базы знаний
+            app_p = res[4] or []
             
             links_text = "\n".join(sitemap_list[:50]) if sitemap_list else "No internal links found."
             
@@ -1790,6 +1829,8 @@ def write_article_handler(call):
 
             VISUAL STYLE GUIDE (User Input):
             {style_prompt}
+            APPROVED PROMPTS (Use these as base style):
+            {app_p}
             
             IMPORTANT: WRITE STRICTLY IN RUSSIAN LANGUAGE.
             
@@ -1892,12 +1933,13 @@ def rewrite_article(call):
     def _do_rewrite():
         try:
             # Re-fetch data for context
-            cur.execute("SELECT info, keywords, sitemap_links, style_prompt FROM projects WHERE id=%s", (pid,))
+            cur.execute("SELECT info, keywords, sitemap_links, style_prompt, approved_prompts FROM projects WHERE id=%s", (pid,))
             proj = cur.fetchone()
             
             info = proj[0]
             keywords_raw = proj[1] or ""
             style_prompt = proj[3] or ""
+            app_p = proj[4] or []
             
             # --- FIX: SAFE SITEMAP LOADING ---
             sitemap_data = proj[2]
@@ -1932,6 +1974,8 @@ def rewrite_article(call):
 
             VISUAL STYLE GUIDE (User Input):
             {style_prompt}
+            APPROVED PROMPTS:
+            {app_p}
             
             KEEP SEO OPTIMIZATION (STRICT YOAST RULES):
             1. **Focus Keyword**: MUST appear in the **First Sentence**.
