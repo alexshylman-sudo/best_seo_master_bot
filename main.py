@@ -779,13 +779,45 @@ def kb_gen_new_prompt(call):
     bot.send_message(call.message.chat.id, "⏳ Анализирую ваши фото и придумываю стиль...")
     
     try:
-        # Simple text fallback if vision not available in this env
-        context = f"Niche: {info.get('survey_step1')}. Audience: {info.get('survey_step2')}."
-        text_prompt = f"Based on this context: {context}, write a highly detailed, photorealistic image generation prompt (in English) for a header image. Focus on lighting, texture, and professional look. Output JUST the prompt."
-        prompt_text = get_gemini_response(text_prompt)
+        # --- FIXED VISION LOGIC ---
+        content_parts = []
+        
+        instruction = f"""
+        Роль: Эксперт по генерации изображений (Prompt Engineer) и Дизайну.
+        Контекст проекта: {info.get('survey_step1', 'Не указан')}.
+        
+        ЗАДАЧА:
+        1. Внимательно рассмотри прикрепленные изображения.
+        2. Проанализируй их визуальный стиль: освещение, цветовую палитру (яркие цвета, неон, и т.д.), композицию, одежду людей, настроение.
+        3. Напиши детальный ТЕКСТОВЫЙ ПРОМПТ, который позволит сгенерировать НОВЫЕ изображения в точно таком же стиле.
+        
+        ВАЖНО:
+        - Промпт должен быть на РУССКОМ языке.
+        - Описывай именно СТИЛЬ (например: "Яркая фэшн фотография, оранжевые тона, неоновый свет"), а не просто то, что происходит на фото.
+        - Сделай описание богатым и вдохновляющим.
+        """
+        content_parts.append(instruction)
+
+        # Decode up to 4 images to avoid payload limits
+        for b64_str in images_b64[:4]:
+            try:
+                img_bytes = base64.b64decode(b64_str)
+                # Using genai_types.Part.from_bytes for the V2 SDK
+                image_part = genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+                content_parts.append(image_part)
+            except Exception as inner_e:
+                print(f"Image decode error: {inner_e}")
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[genai_types.Content(parts=content_parts)]
+        )
+        
+        prompt_text = response.text.strip()
+        
     except Exception as e:
-        print(f"Gen Error: {e}")
-        prompt_text = "Modern interior design, wall panels, cinematic lighting, 8k resolution, photorealistic."
+        print(f"Vision Generation Error: {e}")
+        prompt_text = "Ошибка анализа изображений. Попробуйте еще раз."
 
     bot.send_message(call.message.chat.id, f"🎨 Генерирую превью по промпту:\n\n`{prompt_text}`", parse_mode='Markdown')
     
