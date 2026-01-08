@@ -5,6 +5,7 @@ import requests
 import io
 import base64
 import random
+import threading
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
@@ -225,6 +226,7 @@ def deep_analyze_site(url):
         return result_text, []
     except Exception as e: return f"Error: {e}", []
 
+# --- IMAGE GENERATION & WP UPLOAD ---
 def generate_image_bytes(image_prompt, project_style="", negative_prompt=""):
     target_model = 'imagen-4.0-generate-001'
     base_negative = "exclude text, writing, letters, watermarks, signature, words, logo"
@@ -243,3 +245,23 @@ def generate_image_bytes(image_prompt, project_style="", negative_prompt=""):
     except Exception as e:
         print(f"Gen Error: {e}")
         return None
+
+def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
+    image_bytes = generate_image_bytes(image_prompt, project_style, negative_prompt)
+    if not image_bytes: return None, None, "❌ No bytes."
+    try:
+        api_url = api_url.rstrip('/')
+        creds = base64.b64encode(f"{login}:{pwd}".encode()).decode()
+        file_name = f"{slugify(seo_filename)}-{random.randint(10,99)}.png" if seo_filename else f"img-{slugify(alt_text[:20])}-{random.randint(100,999)}.png"
+        headers = {'Authorization': 'Basic ' + creds, 'Content-Disposition': f'attachment; filename="{file_name}"', 'Content-Type': 'image/png', 'User-Agent': 'Mozilla/5.0'}
+        r = requests.post(f"{api_url}/wp-json/wp/v2/media", headers=headers, data=image_bytes, timeout=60)
+        if r.status_code == 201:
+            res = r.json(); media_id = res.get('id'); source_url = res.get('source_url')
+            requests.post(f"{api_url}/wp-json/wp/v2/media/{media_id}", headers={'Authorization': 'Basic ' + creds}, json={'alt_text': alt_text, 'title': alt_text, 'caption': alt_text})
+            return media_id, source_url, f"✅ OK ({file_name})"
+        elif r.status_code == 401: return None, None, "❌ WP 401: Неверный пароль."
+        elif r.status_code == 403: return None, None, "❌ WP 403: Доступ запрещен."
+        else: return None, None, f"❌ WP Error {r.status_code}"
+    except Exception as e:
+        print(f"WP Upload Error: {e}")
+        return None, None, f"❌ WP Connection Error: {e}"
