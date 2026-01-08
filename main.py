@@ -191,16 +191,19 @@ def send_safe_message(chat_id, text, parse_mode='HTML', reply_markup=None):
             text = ""
             
     for i, part in enumerate(parts):
-        # Кнопки цепляем только к последнему сообщению
         is_last = (i == len(parts) - 1)
         current_markup = reply_markup if is_last else None
         
         try:
+            # Сначала пробуем отправить с форматированием (HTML)
             bot.send_message(chat_id, part, parse_mode=parse_mode, reply_markup=current_markup)
         except Exception as e:
-            # Если не вышло с HTML, пробуем без форматирования
+            # Если не вышло (ошибка в тегах), пробуем БЕЗ форматирования (текстом)
             try:
-                bot.send_message(chat_id, part, parse_mode=None, reply_markup=current_markup)
+                print(f"⚠️ Formatting error, sending raw text: {e}")
+                # Убираем теги для читаемости, если отправляем plain text
+                clean_part = re.sub(r'<[^>]+>', '', part) 
+                bot.send_message(chat_id, clean_part, parse_mode=None, reply_markup=current_markup)
             except Exception as e2:
                 print(f"❌ Failed to send message part: {e2}")
         
@@ -233,31 +236,24 @@ def parse_sitemap(url):
     try:
         sitemap_url = url.rstrip('/') + '/sitemap.xml'
         resp = requests.get(sitemap_url, timeout=10)
-        
         if resp.status_code == 200:
             try:
                 root = ET.fromstring(resp.content)
                 ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-                for url_tag in root.findall('.//s:loc', ns):
-                    links.append(url_tag.text)
+                for url_tag in root.findall('.//s:loc', ns): links.append(url_tag.text)
                 if not links:
-                    for url_tag in root.findall('.//loc'):
-                        links.append(url_tag.text)
+                    for url_tag in root.findall('.//loc'): links.append(url_tag.text)
             except: pass
-        
         if not links:
             resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             soup = BeautifulSoup(resp.text, 'html.parser')
             domain = urlparse(url).netloc
             for a in soup.find_all('a', href=True):
                 full_url = urljoin(url, a['href'])
-                if urlparse(full_url).netloc == domain:
-                    links.append(full_url)
-        
+                if urlparse(full_url).netloc == domain: links.append(full_url)
         clean_links = [l for l in list(set(links)) if not any(x in l for x in ['.jpg', '.png', 'wp-admin', 'feed'])]
         return clean_links[:100]
-    except:
-        return []
+    except: return []
 
 def deep_analyze_site(url):
     try:
@@ -311,25 +307,64 @@ def clean_and_parse_json(text):
     return None
 
 def format_html_for_chat(html_content):
-    text = str(html_content).replace('\\n', '\n')
-    if '"seo_title":' in text:
-        text = text.split('"seo_title":')[0].rsplit(',', 1)[0].rsplit('{', 1)[0]
+    # Агрессивная очистка от JSON-мусора
+    text = str(html_content).strip()
     
-    text = re.sub(r'\}\s*$', '', text)
-    text = re.sub(r'```json.*', '', text, flags=re.DOTALL)
+    # Если пришел JSON-объект в виде строки, пробуем его распарсить
+    if text.startswith('{') and '"html_content":' in text:
+        try:
+            data = json.loads(text)
+            text = data.get("html_content", text)
+        except:
+            # Если json битый, пробуем вырезать контент регуляркой
+            match = re.search(r'"html_content":\s*"(.*?)"', text, re.DOTALL)
+            if match:
+                text = match.group(1).replace(r'\n', '\n').replace(r'\"', '"')
+            else:
+                # Если регулярка не нашла, просто чистим от фигурных скобок по краям
+                text = text.replace('{', '').replace('}', '').replace('"html_content":', '')
+
+    text = text.replace('\\n', '\n')
+    
+    # Удаляем Markdown обертки кода
+    text = re.sub(r'```html', '', text)
     text = re.sub(r'```', '', text)
-    text = re.sub(r'\[IMG:.*?\]', '', text)
-    text = re.sub(r'<h[1-6]>(.*?)</h[1-6]>', r'\n\n<b>\1</b>\n', text)
-    text = re.sub(r'<li>(.*?)</li>', r'• \1\n', text)
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'<p>(.*?)</p>', r'\1\n\n', text)
-    
+
+    # Преобразуем HTML теги в чистый текст с форматированием для ТГ
     soup = BeautifulSoup(text, "html.parser")
-    for script in soup(["script", "style", "head", "title", "meta", "table", "style"]):
-        script.decompose()
     
-    clean_text = soup.get_text(separator="\n\n")
-    return re.sub(r'\n\s*\n', '\n\n', clean_text).strip()
+    # Удаляем скрипты и стили
+    for script in soup(["script", "style", "head", "meta", "title"]):
+        script.decompose()
+
+    # Заголовки делаем жирными
+    for header in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        new_tag = soup.new_tag("b")
+        new_tag.string = f"\n\n{header.get_text().strip()}\n"
+        header.replace_with(new_tag)
+
+    # Списки
+    for li in soup.find_all('li'):
+        li.string = f"• {li.get_text().strip()}\n"
+
+    # Абзацы
+    for p in soup.find_all('p'):
+        p.append('\n\n')
+
+    # Получаем текст, оставляя наши <b>
+    # Но так как get_text убивает теги, делаем хитрее:
+    # Просто конвертируем суп в строку и чистим лишние теги
+    clean_html = str(soup)
+    
+    # Разрешенные теги для Telegram: b, strong, i, em, u, ins, s, strike, del, a, code, pre
+    # Удаляем все остальные теги (div, span, body, html и т.д.)
+    clean_html = re.sub(r'<(?!\/?(b|strong|i|em|u|ins|s|strike|del|a|code|pre))[^>]*>', '', clean_html)
+    
+    # Декодируем HTML сущности (&nbsp; и т.д.)
+    import html
+    clean_html = html.unescape(clean_html)
+
+    return re.sub(r'\n\s*\n', '\n\n', clean_html).strip()
 
 # --- 4. IMAGE GENERATION (IMAGEN 4 STANDARD) ---
 def generate_and_upload_image(api_url, login, pwd, image_prompt, alt_text, seo_filename, project_style="", negative_prompt=""):
@@ -664,7 +699,6 @@ def kb_menu(call):
     except: pass
     pid = call.data.split("_")[2]
     conn = get_db_connection(); cur = conn.cursor()
-    # Запрашиваем также negative prompt
     cur.execute("SELECT style_prompt, style_images, style_negative_prompt FROM projects WHERE id=%s", (pid,))
     res = cur.fetchone()
     cur.close(); conn.close()
@@ -974,10 +1008,18 @@ def show_tariff_periods(user_id):
            "• 100 генераций\n"
            "• Год: 62999р")
     markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    # --- UPDATED GIF FOR TARIFFS ---
+    gif_url = "https://ecosteni.ru/wp-content/uploads/2026/01/202601080242.gif"
+    
     markup.add(types.InlineKeyboardButton("🏎 Тест-драйв (500р)", callback_data="period_test"))
     markup.add(types.InlineKeyboardButton("📅 На Месяц", callback_data="period_month"))
     markup.add(types.InlineKeyboardButton("📆 На Год (Выгодно)", callback_data="period_year"))
-    bot.send_message(user_id, txt, reply_markup=markup, parse_mode='Markdown')
+    
+    try:
+        bot.send_animation(user_id, gif_url, caption=txt, reply_markup=markup, parse_mode='Markdown')
+    except:
+        bot.send_message(user_id, txt, reply_markup=markup, parse_mode='Markdown')
 
 def show_admin_panel(uid):
     if uid != ADMIN_ID: return
@@ -1062,7 +1104,11 @@ def tariff_period_select(call):
 def back_to_periods(call):
     try: bot.answer_callback_query(call.id)
     except: pass
+    # Здесь тоже используем GIF, поэтому вызываем функцию show_tariff_periods
     show_tariff_periods(call.from_user.id)
+    # Удаляем старое текстовое сообщение, если оно было
+    try: bot.delete_message(call.message.chat.id, call.message.message_id)
+    except: pass
 
 def process_tariff_selection(call, name, price, code):
     markup = types.InlineKeyboardMarkup()
