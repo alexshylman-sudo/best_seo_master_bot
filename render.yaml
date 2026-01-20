@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: pinterest-oauth
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn oauth_server:app
+    envVars:
+      - key: PINTEREST_APP_ID
+        sync: false
+      - key: PINTEREST_APP_SECRET
+        sync: false
+      - key: PINTEREST_REDIRECT_URI
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASS
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
