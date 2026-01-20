@@ -1,9 +1,0 @@
-pyTelegramBotAPI
-google-genai
-psycopg2-binary
-flask
-python-dotenv
-schedule
-requests
-beautifulsoup4
-duckduckgo-search
